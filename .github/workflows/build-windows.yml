@@ -115,7 +115,9 @@ jobs:
         run: |
           $code = (Get-Content .\cpp-build.exitcode -Raw).Trim()
           if ($code -ne "0") {
-            Write-Error "C++ build failed with exit code $code. See cpp-build.log artifact."
+            $tail = (Get-Content .\cpp-build.log -Tail 80) -join "`n"
+            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=C++ build failed::Exit code $code%0A$escaped"
             $exitCode = [int]$code
             exit $exitCode
           }
