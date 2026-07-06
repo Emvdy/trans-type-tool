@@ -1,0 +1,10 @@
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.user
+*.spec
+build/
+dist/
+__pycache__/

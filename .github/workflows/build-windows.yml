@@ -1,0 +1,61 @@
+name: Build Windows exes
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python syntax check
+        shell: cmd
+        run: python -m py_compile trans_type.py
+
+      - name: Python dry run
+        shell: cmd
+        run: python trans_type.py --dry-run --ascii-only
+
+      - name: Build native WinAPI exe
+        shell: cmd
+        run: build.bat
+
+      - name: Build C++ wrapper exe
+        shell: cmd
+        run: build_cpp.bat
+
+      - name: Build Python exe
+        shell: cmd
+        run: build_python.bat
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trans_type-windows
+          path: |
+            trans_type.exe
+            trans_type_cpp.exe
+            trans_type_py.exe
+            README.md
+            trans.txt
+            trans_type.c
+            trans_type.cpp
+            trans_type.py
+            build.bat
+            build_cpp.bat
+            build_python.bat
+            build_all.bat
+            requirements-build.txt
+            MAC_BUILD.md
