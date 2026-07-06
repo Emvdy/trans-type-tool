@@ -24,7 +24,11 @@
 #endif
 
 #ifndef TRANS_TYPE_ENTRY
+#ifdef TRANS_TYPE_CPP_BUILD
+#define TRANS_TYPE_ENTRY trans_type_native_main
+#else
 #define TRANS_TYPE_ENTRY main
+#endif
 #endif
 
 enum ExitCode {
