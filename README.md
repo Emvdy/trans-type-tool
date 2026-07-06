@@ -99,6 +99,8 @@ trans_type.exe --ascii-only
 trans_type.exe --ascii-keys
 trans_type.exe --start-delay-sec 10
 trans_type.exe --no-focus-check
+trans_type.exe --self-test
+trans_type_cpp.exe --self-test
 trans_type_py.exe --self-test
 trans_type_py.exe --diagnose
 trans_type_py.exe --debug-input
@@ -118,7 +120,7 @@ trans_type_py.exe --delay-ms 50 --line-delay-ms 300
 - If the foreground window changes, typing pauses by default.
 - The tools refuse to type into their own console.
 - `--dry-run` parses `trans.txt`, reports encoding, line count, character count, non-ASCII count, and exits without typing.
-- Python-only `--self-test` verifies that Windows accepts a harmless `SendInput` Shift key event.
+- `--self-test` verifies that Windows accepts a harmless `SendInput` Shift key event.
 - Python-only `--diagnose` prints the focused target window and integrity levels without typing.
 - Python-only `--debug-input` runs visible ASCII and Unicode input tests against a safe target field.
 - Unsupported control characters are rejected. Tabs and newlines are allowed.

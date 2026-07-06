@@ -37,6 +37,7 @@ typedef struct Options {
     int ascii_keys;
     int no_focus_check;
     int dry_run;
+    int self_test;
     int enter_unicode;
     int max_bytes;
 } Options;
@@ -72,6 +73,7 @@ static void init_options(Options *opt) {
     opt->ascii_keys = 0;
     opt->no_focus_check = 0;
     opt->dry_run = 0;
+    opt->self_test = 0;
     opt->enter_unicode = 0;
     opt->max_bytes = DEFAULT_MAX_BYTES;
 }
@@ -93,6 +95,7 @@ static void print_usage(void) {
     puts("  --enter-mode unicode  Send Enter as Unicode carriage return");
     puts("  --no-focus-check      Do not pause when the foreground window changes");
     puts("  --dry-run             Parse and validate trans.txt without typing");
+    puts("  --self-test           Test whether SendInput accepts a harmless Shift key event");
     puts("  --help                Show this help");
     puts("");
     puts("Controls while running:");
@@ -212,6 +215,8 @@ static int parse_args(int argc, char **argv, Options *opt) {
             opt->no_focus_check = 1;
         } else if (strcmp(argv[i], "--dry-run") == 0) {
             opt->dry_run = 1;
+        } else if (strcmp(argv[i], "--self-test") == 0) {
+            opt->self_test = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             exit(EXIT_OK);
@@ -707,6 +712,34 @@ static int send_vk(WORD vk, const char *what) {
     return send_input_checked(inputs, 2, what);
 }
 
+static void send_legacy_vk(WORD vk) {
+    keybd_event((BYTE)vk, 0, 0, 0);
+    keybd_event((BYTE)vk, 0, KEYEVENTF_KEYUP, 0);
+}
+
+static int run_self_test(void) {
+    TargetWindow target;
+    int rc;
+
+    puts("Running native SendInput self-test with a harmless Shift key press.");
+    puts("This does not type visible text.");
+    printf("sizeof(INPUT): %u bytes\n", (unsigned int)sizeof(INPUT));
+    printf("sizeof(KEYBDINPUT): %u bytes\n", (unsigned int)sizeof(KEYBDINPUT));
+    capture_foreground_window(&target);
+    print_target_window(&target);
+
+    rc = send_vk(VK_SHIFT, "self-test Shift");
+    if (rc != EXIT_OK) {
+        puts("Trying legacy keybd_event Shift test. This API has no reliable success return value.");
+        send_legacy_vk(VK_SHIFT);
+        puts("Legacy keybd_event call completed. If it also has no effect, the system/session is blocking synthetic input.");
+        return rc;
+    }
+
+    puts("Self-test passed: SendInput accepted the Shift key events.");
+    return EXIT_OK;
+}
+
 static int send_unicode_unit(wchar_t ch, const char *what) {
     INPUT inputs[2];
 
@@ -920,6 +953,10 @@ int main(int argc, char **argv) {
         puts("");
         print_usage();
         return EXIT_ARGS;
+    }
+
+    if (opt.self_test) {
+        return run_self_test();
     }
 
     if (!build_trans_path(trans_path, (DWORD)(sizeof(trans_path) / sizeof(trans_path[0])))) {

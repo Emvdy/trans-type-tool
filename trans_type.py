@@ -362,6 +362,8 @@ class WinKeyboard:
 
         self.user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         self.user32.SendInput.restype = wintypes.UINT
+        self.user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
+        self.user32.keybd_event.restype = None
         self.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
         self.user32.GetAsyncKeyState.restype = ctypes.c_short
         self.user32.GetForegroundWindow.argtypes = []
@@ -408,6 +410,7 @@ class WinKeyboard:
     def send_inputs(self, inputs: list, what: str) -> None:
         array_type = self.INPUT * len(inputs)
         array = array_type(*inputs)
+        ctypes.set_last_error(0)
         sent = self.user32.SendInput(len(inputs), array, ctypes.sizeof(self.INPUT))
         if sent != len(inputs):
             err = ctypes.get_last_error()
@@ -419,6 +422,10 @@ class WinKeyboard:
                 "To run without Administrator, close the target window and reopen it normally, not with Run as administrator. "
                 "Otherwise run this tool as Administrator too."
             )
+
+    def legacy_vk(self, vk: int) -> None:
+        self.user32.keybd_event(vk, 0, 0, 0)
+        self.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
 
     def send_vk(self, vk: int, what: str) -> None:
         self.send_inputs(
@@ -685,11 +692,24 @@ def sleep_ms(ms: int) -> None:
 def self_test_sendinput(win: WinKeyboard) -> int:
     print("Running SendInput self-test with a harmless Shift key press.")
     print("This does not type visible text.")
+    print(f"Python: {sys.version.split()[0]} ({'64-bit' if ctypes.sizeof(ctypes.c_void_p) == 8 else '32-bit'})")
+    print(f"ctypes INPUT size: {ctypes.sizeof(win.INPUT)} bytes")
+    print(f"ctypes KEYBDINPUT size: {ctypes.sizeof(win.KEYBDINPUT)} bytes")
     print(f"Tool integrity: {win.current_integrity().label}")
+    target = win.foreground_window()
+    print_target(target)
+    if target.hwnd:
+        print_integrity_report(win, target)
     try:
         win.send_vk(VK_SHIFT, "self-test Shift")
     except RuntimeError as exc:
         print(f"Self-test failed: {exc}", file=sys.stderr)
+        print("Trying legacy keybd_event Shift test. This API has no reliable success return value.")
+        try:
+            win.legacy_vk(VK_SHIFT)
+            print("Legacy keybd_event call completed. If this also has no effect, the system/session is blocking synthetic input.")
+        except Exception as legacy_exc:
+            print(f"Legacy keybd_event call raised an exception: {legacy_exc}", file=sys.stderr)
         return EXIT_INPUT
     print("Self-test passed: SendInput accepted the Shift key events.")
     return EXIT_OK
@@ -707,10 +727,33 @@ def send_debug_unicode(win: WinKeyboard, text: str, delay_ms: int) -> None:
         sleep_ms(delay_ms)
 
 
+def send_debug_legacy_ascii(win: WinKeyboard, text: str, delay_ms: int) -> None:
+    for ch in text:
+        vk_scan = win.user32.VkKeyScanW(ch)
+        if vk_scan == -1:
+            raise RuntimeError(f"Cannot map ASCII character U+{ord(ch):04X} through the current keyboard layout.")
+        vk = vk_scan & 0xFF
+        shift_state = (vk_scan >> 8) & 0xFF
+        if shift_state & 1:
+            win.user32.keybd_event(VK_SHIFT, 0, 0, 0)
+        if shift_state & 2:
+            win.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        if shift_state & 4:
+            win.user32.keybd_event(VK_MENU, 0, 0, 0)
+        win.legacy_vk(vk)
+        if shift_state & 4:
+            win.user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        if shift_state & 2:
+            win.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        if shift_state & 1:
+            win.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+        sleep_ms(delay_ms)
+
+
 def debug_input(win: WinKeyboard, opt: Options) -> int:
     print("Input debug mode.")
     print("It will type this visible marker into the focused target:")
-    print("  TTDBG_ASCII TTDBG_UNICODE U+4E2D=中")
+    print("  TTDBG_ASCII TTDBG_UNICODE TTDBG_LEGACY U+4E2D=中")
     print("Open a safe text field, Notepad, or a scratch shell before the countdown ends.")
 
     rc, target = prepare_target_window(win, opt)
@@ -721,6 +764,7 @@ def debug_input(win: WinKeyboard, opt: Options) -> int:
         ("No-visible Shift key", lambda: win.send_vk(VK_SHIFT, "debug Shift")),
         ("ASCII virtual keys", lambda: send_debug_ascii(win, "TTDBG_ASCII ", opt.delay_ms)),
         ("Unicode ASCII", lambda: send_debug_unicode(win, "TTDBG_UNICODE ", opt.delay_ms)),
+        ("Legacy keybd_event ASCII", lambda: send_debug_legacy_ascii(win, "TTDBG_LEGACY ", opt.delay_ms)),
         ("Unicode Chinese", lambda: send_debug_unicode(win, "U+4E2D=中", opt.delay_ms)),
     ]
 
@@ -732,7 +776,7 @@ def debug_input(win: WinKeyboard, opt: Options) -> int:
         except RuntimeError as exc:
             failed = True
             print(f"FAILED: {name}: {exc}", file=sys.stderr)
-            break
+            continue
         print(f"OK: {name}")
         sleep_ms(max(opt.delay_ms, 30))
 
