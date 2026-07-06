@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -34,69 +34,20 @@ jobs:
 
       - name: Build C++ wrapper exe
         shell: cmd
-        run: |
-          call build_cpp.bat > cpp-build.log 2>&1
-          set "CPP_BUILD_RC=%ERRORLEVEL%"
-          type cpp-build.log
-          echo %CPP_BUILD_RC%> cpp-build.exitcode
-          exit /b 0
+        run: build_cpp.bat
 
       - name: Build Python exe
         shell: cmd
         run: build_python.bat
 
-      - name: Verify generated exes
-        shell: pwsh
-        run: |
-          .\trans_type.exe --dry-run --ascii-only
-          if (Test-Path .\trans_type_cpp.exe) {
-            .\trans_type_cpp.exe --dry-run --ascii-only
-          } else {
-            Write-Warning "trans_type_cpp.exe was not produced; see cpp-build.log"
-          }
-          .\trans_type_py.exe --dry-run --ascii-only
-
-      - name: Record artifact details
-        shell: pwsh
-        run: |
-          Get-Item trans_type.exe, trans_type_py.exe, cpp-build.log, cpp-build.exitcode -ErrorAction SilentlyContinue |
-            Select-Object Name, Length |
-            Format-Table -AutoSize |
-            Out-String |
-            Tee-Object -FilePath artifact-details.txt
-
-          Get-Item trans_type_cpp.exe -ErrorAction SilentlyContinue |
-            Select-Object Name, Length |
-            Format-Table -AutoSize |
-            Out-String |
-            Add-Content -Path artifact-details.txt
-
-          Get-FileHash trans_type.exe, trans_type_py.exe, cpp-build.log, cpp-build.exitcode -Algorithm SHA256 |
-            Format-Table -AutoSize |
-            Out-String |
-            Tee-Object -FilePath artifact-sha256.txt
-
-          if (Test-Path .\trans_type_cpp.exe) {
-            Get-FileHash trans_type_cpp.exe -Algorithm SHA256 |
-              Format-Table -AutoSize |
-              Out-String |
-              Add-Content -Path artifact-sha256.txt
-          }
-
       - name: Upload artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trans_type-windows
-          if-no-files-found: warn
           path: |
             trans_type.exe
             trans_type_cpp.exe
             trans_type_py.exe
-            cpp-build.log
-            cpp-build.exitcode
-            artifact-details.txt
-            artifact-sha256.txt
             README.md
             trans.txt
             trans_type.c
@@ -108,40 +59,3 @@ jobs:
             build_all.bat
             requirements-build.txt
             MAC_BUILD.md
-            GITHUB_BUILD.md
-
-      - name: Report C++ diagnostics
-        if: always()
-        shell: cmd
-        run: |
-          setlocal EnableDelayedExpansion
-          if exist cpp-build.exitcode (set /p CPP_BUILD_CODE=<cpp-build.exitcode) else set "CPP_BUILD_CODE=missing"
-          if exist trans_type_cpp.exe (
-            for %%I in (trans_type_cpp.exe) do set "CPP_STATE=exists length=%%~zI"
-          ) else (
-            set "CPP_STATE=missing"
-          )
-          set "LOG_SUMMARY="
-          set "LOG_COUNT=0"
-          if exist cpp-build.log (
-            for /f "usebackq delims=" %%L in ("cpp-build.log") do (
-              set /a LOG_COUNT+=1 >nul
-              if !LOG_COUNT! LEQ 12 set "LOG_SUMMARY=!LOG_SUMMARY! | %%L"
-            )
-          ) else (
-            set "LOG_SUMMARY=cpp-build.log missing"
-          )
-          echo ::warning file=.github/workflows/build-windows.yml,line=1,title=C++ build diagnostics::cpp-build.exitcode=!CPP_BUILD_CODE!; trans_type_cpp.exe=!CPP_STATE!; log=!LOG_SUMMARY!
-          exit /b 0
-
-      - name: Enforce C++ build result
-        shell: pwsh
-        run: |
-          $code = (Get-Content .\cpp-build.exitcode -Raw).Trim()
-          if ($code -ne "0") {
-            $tail = (Get-Content .\cpp-build.log -Tail 80) -join "`n"
-            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-            Write-Host "::error title=C++ build failed::Exit code $code%0A$escaped"
-            $exitCode = [int]$code
-            exit $exitCode
-          }

@@ -14,10 +14,8 @@
 GitHub Actions 会生成一个名为 `trans_type-windows` 的 artifact，里面包含：
 
 - `trans_type.exe`：原生 WinAPI C 版本，体积最小。
-- `trans_type_cpp.exe`：优先构建 C++ launcher，转发执行同目录的 `trans_type.exe`；如果 C++ 编译失败，CI 会退化为原生 exe 别名，保证 artifact 里仍有可运行文件。
+- `trans_type_cpp.exe`：C++ 包装版本，行为和原生版一致。
 - `trans_type_py.exe`：Python + PyInstaller 版本，体积较大，但源码更容易改。
-- `artifact-details.txt`：三个 exe 的文件大小。
-- `artifact-sha256.txt`：三个 exe 的 SHA256。
 - `README.md`、`trans.txt`、源码和构建脚本。
 
 ## 方法一：网页上传，最简单
@@ -68,7 +66,7 @@ Actions -> Build Windows exes -> Run workflow
 .github/workflows/build-windows.yml
 ```
 
-它会在 GitHub 的 `windows-2022` runner 上执行：
+它会在 `windows-latest` 上执行：
 
 ```bat
 python -m py_compile trans_type.py
@@ -76,9 +74,6 @@ python trans_type.py --dry-run --ascii-only
 build.bat
 build_cpp.bat
 build_python.bat
-trans_type.exe --dry-run --ascii-only
-trans_type_cpp.exe --dry-run --ascii-only
-trans_type_py.exe --dry-run --ascii-only
 ```
 
 其中 `build_python.bat` 会执行 PyInstaller：

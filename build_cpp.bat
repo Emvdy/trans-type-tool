@@ -14,26 +14,11 @@ echo Install Visual Studio Build Tools or MinGW-w64, then run build_cpp.bat agai
 exit /b 1
 
 :build_msvc
-echo Building C++ launcher with MSVC...
-cl /nologo /EHsc /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fetrans_type_cpp.exe trans_type.cpp
-if not errorlevel 1 exit /b 0
-goto fallback_native
+echo Building C++ wrapper with MSVC...
+cl /nologo /TP /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:trans_type_cpp.exe /Fo:trans_type_cpp.obj trans_type.cpp user32.lib
+exit /b %ERRORLEVEL%
 
 :build_gcc
-echo Building C++ launcher with GCC/MinGW...
-g++ -Os -s -Wall -Wextra -o trans_type_cpp.exe trans_type.cpp
-if not errorlevel 1 exit /b 0
-goto fallback_native
-
-:fallback_native
-echo C++ launcher build failed. Falling back to a native WinAPI alias.
-if exist trans_type.exe (
-    copy /Y trans_type.exe trans_type_cpp.exe >nul
-    if not errorlevel 1 (
-        echo Built trans_type_cpp.exe as a native alias for trans_type.exe.
-        exit /b 0
-    )
-)
-
-echo Fallback failed because trans_type.exe is missing or could not be copied.
-exit /b 1
+echo Building C++ wrapper with GCC/MinGW...
+g++ -Os -s -Wall -Wextra -o trans_type_cpp.exe trans_type.cpp -luser32
+exit /b %ERRORLEVEL%
