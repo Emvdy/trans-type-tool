@@ -35,6 +35,7 @@ typedef struct Options {
     int start_delay_sec;
     int ascii_only;
     int ascii_keys;
+    int legacy_keys;
     int no_focus_check;
     int dry_run;
     int self_test;
@@ -71,6 +72,7 @@ static void init_options(Options *opt) {
     opt->start_delay_sec = DEFAULT_START_DELAY_SEC;
     opt->ascii_only = 0;
     opt->ascii_keys = 0;
+    opt->legacy_keys = 1;
     opt->no_focus_check = 0;
     opt->dry_run = 0;
     opt->self_test = 0;
@@ -90,12 +92,14 @@ static void print_usage(void) {
     puts("  --start-delay-sec N   Countdown before typing. Default: 5");
     puts("  --max-bytes N         Maximum trans.txt size. Default: 1048576");
     puts("  --ascii-only          Refuse to type non-ASCII characters");
-    puts("  --ascii-keys          Type ASCII through virtual keys instead of Unicode input");
+    puts("  --ascii-keys          Type ASCII through SendInput virtual keys");
+    puts("  --legacy-keys         Type ASCII through legacy keybd_event. Default");
+    puts("  --sendinput           Use Unicode SendInput instead of default legacy keybd_event");
     puts("  --enter-mode key      Send Enter as VK_RETURN. Default");
     puts("  --enter-mode unicode  Send Enter as Unicode carriage return");
     puts("  --no-focus-check      Do not pause when the foreground window changes");
     puts("  --dry-run             Parse and validate trans.txt without typing");
-    puts("  --self-test           Test whether SendInput accepts a harmless Shift key event");
+    puts("  --self-test           Test whether the selected input mode can send a harmless Shift key event");
     puts("  --help                Show this help");
     puts("");
     puts("Controls while running:");
@@ -211,6 +215,13 @@ static int parse_args(int argc, char **argv, Options *opt) {
             opt->ascii_only = 1;
         } else if (strcmp(argv[i], "--ascii-keys") == 0) {
             opt->ascii_keys = 1;
+            opt->legacy_keys = 0;
+        } else if (strcmp(argv[i], "--legacy-keys") == 0) {
+            opt->legacy_keys = 1;
+            opt->ascii_keys = 0;
+        } else if (strcmp(argv[i], "--sendinput") == 0) {
+            opt->legacy_keys = 0;
+            opt->ascii_keys = 0;
         } else if (strcmp(argv[i], "--no-focus-check") == 0) {
             opt->no_focus_check = 1;
         } else if (strcmp(argv[i], "--dry-run") == 0) {
@@ -546,9 +557,10 @@ static int validate_text(const TextData *data, const TextStats *stats, const Opt
         return EXIT_CONTENT;
     }
 
-    if (opt->ascii_keys && stats->non_ascii_count > 0) {
+    if ((opt->ascii_keys || opt->legacy_keys) && stats->non_ascii_count > 0) {
         index_to_line_col(data->text, data->chars, stats->first_non_ascii, &line, &col);
-        fprintf(stderr, "--ascii-keys cannot type non-ASCII characters. First one at line %d, column %d.\n", line, col);
+        fprintf(stderr, "Legacy/ASCII key modes cannot type non-ASCII characters. First one at line %d, column %d.\n", line, col);
+        fprintf(stderr, "Use --sendinput for Unicode input if this Windows session allows SendInput.\n");
         return EXIT_CONTENT;
     }
 
@@ -564,8 +576,18 @@ static void print_summary(const wchar_t *path, const TextData *data, const TextS
     printf("Non-ASCII characters: %d\n", stats->non_ascii_count);
     printf("Delay: %d ms per character, %d ms per line\n", opt->delay_ms, opt->line_delay_ms);
     printf("Focus check: %s\n", opt->no_focus_check ? "off" : "on");
-    printf("Input mode: %s\n", opt->ascii_keys ? "ASCII virtual keys" : "Unicode SendInput");
-    printf("Enter mode: %s\n", opt->enter_unicode ? "Unicode CR" : "VK_RETURN");
+    if (opt->legacy_keys) {
+        printf("Input mode: Legacy keybd_event ASCII keys\n");
+    } else if (opt->ascii_keys) {
+        printf("Input mode: ASCII virtual keys\n");
+    } else {
+        printf("Input mode: Unicode SendInput\n");
+    }
+    if (opt->legacy_keys) {
+        printf("Enter mode: legacy VK_RETURN\n");
+    } else {
+        printf("Enter mode: %s\n", opt->enter_unicode ? "Unicode CR" : "VK_RETURN");
+    }
 }
 
 static int wait_for_console_enter_or_esc(const char *message) {
@@ -712,12 +734,13 @@ static int send_vk(WORD vk, const char *what) {
     return send_input_checked(inputs, 2, what);
 }
 
-static void send_legacy_vk(WORD vk) {
+static int send_legacy_vk(WORD vk) {
     keybd_event((BYTE)vk, 0, 0, 0);
     keybd_event((BYTE)vk, 0, KEYEVENTF_KEYUP, 0);
+    return EXIT_OK;
 }
 
-static int run_self_test(void) {
+static int run_sendinput_self_test(void) {
     TargetWindow target;
     int rc;
 
@@ -731,13 +754,33 @@ static int run_self_test(void) {
     rc = send_vk(VK_SHIFT, "self-test Shift");
     if (rc != EXIT_OK) {
         puts("Trying legacy keybd_event Shift test. This API has no reliable success return value.");
-        send_legacy_vk(VK_SHIFT);
+        (void)send_legacy_vk(VK_SHIFT);
         puts("Legacy keybd_event call completed. If it also has no effect, the system/session is blocking synthetic input.");
         return rc;
     }
 
     puts("Self-test passed: SendInput accepted the Shift key events.");
     return EXIT_OK;
+}
+
+static int run_legacy_self_test(void) {
+    TargetWindow target;
+
+    puts("Running legacy keybd_event self-test with a harmless Shift key press.");
+    puts("This does not type visible text.");
+    puts("Note: keybd_event does not report whether the target accepted the event.");
+    capture_foreground_window(&target);
+    print_target_window(&target);
+    (void)send_legacy_vk(VK_SHIFT);
+    puts("Legacy self-test completed. To verify visible typing, run the Python --debug-input mode against Notepad or the RDP target.");
+    return EXIT_OK;
+}
+
+static int run_self_test(const Options *opt) {
+    if (opt->legacy_keys) {
+        return run_legacy_self_test();
+    }
+    return run_sendinput_self_test();
 }
 
 static int send_unicode_unit(wchar_t ch, const char *what) {
@@ -817,7 +860,49 @@ static int send_ascii_char(wchar_t ch) {
     return send_input_checked(inputs, count, "ASCII character");
 }
 
+static int send_legacy_ascii_char(wchar_t ch) {
+    SHORT vk_scan;
+    BYTE vk;
+    BYTE shift_state;
+
+    vk_scan = VkKeyScanW(ch);
+    if (vk_scan == -1) {
+        fprintf(stderr, "Cannot map ASCII character U+%04X through the current keyboard layout.\n", (unsigned int)ch);
+        return EXIT_INPUT;
+    }
+
+    vk = (BYTE)(vk_scan & 0xFF);
+    shift_state = (BYTE)((vk_scan >> 8) & 0xFF);
+
+    if (shift_state & 1) {
+        keybd_event(VK_SHIFT, 0, 0, 0);
+    }
+    if (shift_state & 2) {
+        keybd_event(VK_CONTROL, 0, 0, 0);
+    }
+    if (shift_state & 4) {
+        keybd_event(VK_MENU, 0, 0, 0);
+    }
+
+    (void)send_legacy_vk(vk);
+
+    if (shift_state & 4) {
+        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    }
+    if (shift_state & 2) {
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    }
+    if (shift_state & 1) {
+        keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
+    }
+
+    return EXIT_OK;
+}
+
 static int send_enter(const Options *opt) {
+    if (opt->legacy_keys) {
+        return send_legacy_vk(VK_RETURN);
+    }
     if (opt->enter_unicode) {
         return send_unicode_unit(L'\r', "Enter");
     }
@@ -913,7 +998,13 @@ static int type_text(const TextData *data, const TextStats *stats, const Options
         }
 
         if (ch == L'\t') {
-            rc = send_vk(VK_TAB, "Tab");
+            if (opt->legacy_keys) {
+                rc = send_legacy_vk(VK_TAB);
+            } else {
+                rc = send_vk(VK_TAB, "Tab");
+            }
+        } else if (opt->legacy_keys) {
+            rc = send_legacy_ascii_char(ch);
         } else if (opt->ascii_keys) {
             rc = send_ascii_char(ch);
         } else {
@@ -956,7 +1047,7 @@ int main(int argc, char **argv) {
     }
 
     if (opt.self_test) {
-        return run_self_test();
+        return run_self_test(&opt);
     }
 
     if (!build_trans_path(trans_path, (DWORD)(sizeof(trans_path) / sizeof(trans_path[0])))) {

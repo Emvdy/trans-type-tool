@@ -147,10 +147,12 @@ trans_type_py.exe --diagnose
 trans_type_py.exe --debug-input
 ```
 
-`--self-test` 不需要 `trans.txt`，只测试系统是否接受一个无可见字符的 Shift 输入事件。`--debug-input` 会让你把光标放到一个安全输入框，然后测试 ASCII virtual-key、Unicode ASCII 和 Unicode 中文输入。建议先对本地 Notepad 测，再对 RDP 窗口测；如果 Notepad 成功但 RDP 失败，问题就在 RDP 会话或目标窗口。
+`--self-test` 不需要 `trans.txt`，默认测试 legacy `keybd_event` 的无可见字符 Shift 输入事件；如果要复测 SendInput，用 `--sendinput --self-test`。`--debug-input` 会让你把光标放到一个安全输入框，然后测试 legacy ASCII、SendInput ASCII、Unicode ASCII 和 Unicode 中文输入。建议先对本地 Notepad 测，再对 RDP 窗口测；如果 Notepad 成功但 RDP 失败，问题就在 RDP 会话或目标窗口。
 
+- 默认模式现在使用 legacy `keybd_event`，适合 ASCII 文本；这是因为你的环境里 `SendInput` 被拦截，但 legacy 可用。
 - `--ascii-only` 只是检查 `trans.txt` 是否全是 ASCII，不会改变输入方式。
-- `--ascii-keys` 才会改成虚拟按键输入，只适合 ASCII 文本。
+- `--ascii-keys` 会改成 SendInput 虚拟按键输入，只适合 ASCII 文本，主要用于对比测试。
+- 如果必须输入中文或其他非 ASCII，使用 `--sendinput`，但前提是当前 Windows 会话允许 SendInput。
 - 高延迟环境使用更慢参数：
 
 ```bat

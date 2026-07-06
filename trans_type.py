@@ -47,6 +47,8 @@ class Options:
     max_bytes: int
     ascii_only: bool
     ascii_keys: bool
+    legacy_keys: bool
+    sendinput: bool
     no_focus_check: bool
     dry_run: bool
     diagnose: bool
@@ -112,10 +114,12 @@ def parse_args(argv: list[str]) -> Options:
     parser.add_argument("--max-bytes", type=bounded_int("--max-bytes", 1, ABSOLUTE_MAX_BYTES), default=DEFAULT_MAX_BYTES)
     parser.add_argument("--ascii-only", action="store_true")
     parser.add_argument("--ascii-keys", action="store_true")
+    parser.add_argument("--legacy-keys", action="store_true", help="Type ASCII through legacy keybd_event instead of SendInput")
+    parser.add_argument("--sendinput", action="store_true", help="Use the original SendInput Unicode mode instead of default legacy keybd_event")
     parser.add_argument("--no-focus-check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--diagnose", action="store_true", help="Report the focused target window and integrity levels without typing")
-    parser.add_argument("--self-test", action="store_true", help="Test whether SendInput can inject a harmless Shift key event")
+    parser.add_argument("--self-test", action="store_true", help="Test whether the selected input mode can send a harmless Shift key event")
     parser.add_argument("--debug-input", action="store_true", help="Run visible SendInput diagnostics against the focused target window")
     parser.add_argument("--enter-mode", choices=("key", "unicode"), default="key")
     args = parser.parse_args(argv)
@@ -126,6 +130,8 @@ def parse_args(argv: list[str]) -> Options:
         max_bytes=args.max_bytes,
         ascii_only=args.ascii_only,
         ascii_keys=args.ascii_keys,
+        legacy_keys=(args.legacy_keys or not args.sendinput) and not args.ascii_keys,
+        sendinput=args.sendinput,
         no_focus_check=args.no_focus_check,
         dry_run=args.dry_run,
         diagnose=args.diagnose,
@@ -278,10 +284,11 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
             f"--ascii-only is enabled, but trans.txt has non-ASCII characters. "
             f"First one at line {line}, column {col}."
         )
-    if opt.ascii_keys and stats.non_ascii_count:
+    if (opt.ascii_keys or opt.legacy_keys) and stats.non_ascii_count:
         line, col = line_col(data.text, stats.first_non_ascii)
         raise RuntimeError(
-            f"--ascii-keys cannot type non-ASCII characters. First one at line {line}, column {col}."
+            f"Legacy/ASCII key modes cannot type non-ASCII characters. First one at line {line}, column {col}. "
+            "Use --sendinput for Unicode input if this Windows session allows SendInput."
         )
 
 
@@ -294,8 +301,18 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
     print(f"Non-ASCII characters: {stats.non_ascii_count}")
     print(f"Delay: {opt.delay_ms} ms per character, {opt.line_delay_ms} ms per line")
     print(f"Focus check: {'off' if opt.no_focus_check else 'on'}")
-    print(f"Input mode: {'ASCII virtual keys' if opt.ascii_keys else 'Unicode SendInput'}")
-    print(f"Enter mode: {'Unicode CR' if opt.enter_mode == 'unicode' else 'VK_RETURN'}")
+    if opt.legacy_keys:
+        input_mode = "Legacy keybd_event ASCII keys"
+    elif opt.ascii_keys:
+        input_mode = "ASCII virtual keys"
+    else:
+        input_mode = "Unicode SendInput"
+    print(f"Input mode: {input_mode}")
+    if opt.legacy_keys:
+        enter_mode = "legacy VK_RETURN"
+    else:
+        enter_mode = "Unicode CR" if opt.enter_mode == "unicode" else "VK_RETURN"
+    print(f"Enter mode: {enter_mode}")
 
 
 class WinKeyboard:
@@ -426,6 +443,30 @@ class WinKeyboard:
     def legacy_vk(self, vk: int) -> None:
         self.user32.keybd_event(vk, 0, 0, 0)
         self.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+    def legacy_ascii_char(self, ch: str) -> None:
+        vk_scan = self.user32.VkKeyScanW(ch)
+        if vk_scan == -1:
+            raise RuntimeError(f"Cannot map ASCII character U+{ord(ch):04X} through the current keyboard layout.")
+
+        vk = vk_scan & 0xFF
+        shift_state = (vk_scan >> 8) & 0xFF
+
+        if shift_state & 1:
+            self.user32.keybd_event(VK_SHIFT, 0, 0, 0)
+        if shift_state & 2:
+            self.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        if shift_state & 4:
+            self.user32.keybd_event(VK_MENU, 0, 0, 0)
+
+        self.legacy_vk(vk)
+
+        if shift_state & 4:
+            self.user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        if shift_state & 2:
+            self.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        if shift_state & 1:
+            self.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
 
     def send_vk(self, vk: int, what: str) -> None:
         self.send_inputs(
@@ -715,6 +756,31 @@ def self_test_sendinput(win: WinKeyboard) -> int:
     return EXIT_OK
 
 
+def self_test_legacy(win: WinKeyboard) -> int:
+    print("Running legacy keybd_event self-test with a harmless Shift key press.")
+    print("This does not type visible text.")
+    print("Note: keybd_event does not report whether the target accepted the event.")
+    print(f"Python: {sys.version.split()[0]} ({'64-bit' if ctypes.sizeof(ctypes.c_void_p) == 8 else '32-bit'})")
+    print(f"Tool integrity: {win.current_integrity().label}")
+    target = win.foreground_window()
+    print_target(target)
+    if target.hwnd:
+        print_integrity_report(win, target)
+    try:
+        win.legacy_vk(VK_SHIFT)
+    except Exception as exc:
+        print(f"Legacy self-test failed: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+    print("Legacy self-test completed. To verify visible typing, run --debug-input against Notepad or the RDP target.")
+    return EXIT_OK
+
+
+def self_test_input(win: WinKeyboard, opt: Options) -> int:
+    if opt.legacy_keys:
+        return self_test_legacy(win)
+    return self_test_sendinput(win)
+
+
 def send_debug_ascii(win: WinKeyboard, text: str, delay_ms: int) -> None:
     for ch in text:
         win.send_ascii_char(ch)
@@ -729,31 +795,14 @@ def send_debug_unicode(win: WinKeyboard, text: str, delay_ms: int) -> None:
 
 def send_debug_legacy_ascii(win: WinKeyboard, text: str, delay_ms: int) -> None:
     for ch in text:
-        vk_scan = win.user32.VkKeyScanW(ch)
-        if vk_scan == -1:
-            raise RuntimeError(f"Cannot map ASCII character U+{ord(ch):04X} through the current keyboard layout.")
-        vk = vk_scan & 0xFF
-        shift_state = (vk_scan >> 8) & 0xFF
-        if shift_state & 1:
-            win.user32.keybd_event(VK_SHIFT, 0, 0, 0)
-        if shift_state & 2:
-            win.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-        if shift_state & 4:
-            win.user32.keybd_event(VK_MENU, 0, 0, 0)
-        win.legacy_vk(vk)
-        if shift_state & 4:
-            win.user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-        if shift_state & 2:
-            win.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        if shift_state & 1:
-            win.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+        win.legacy_ascii_char(ch)
         sleep_ms(delay_ms)
 
 
 def debug_input(win: WinKeyboard, opt: Options) -> int:
     print("Input debug mode.")
     print("It will type this visible marker into the focused target:")
-    print("  TTDBG_ASCII TTDBG_UNICODE TTDBG_LEGACY U+4E2D=中")
+    print("  TTDBG_LEGACY TTDBG_ASCII TTDBG_UNICODE U+4E2D=中")
     print("Open a safe text field, Notepad, or a scratch shell before the countdown ends.")
 
     rc, target = prepare_target_window(win, opt)
@@ -761,10 +810,10 @@ def debug_input(win: WinKeyboard, opt: Options) -> int:
         return rc
 
     tests = [
-        ("No-visible Shift key", lambda: win.send_vk(VK_SHIFT, "debug Shift")),
+        ("Legacy keybd_event ASCII", lambda: send_debug_legacy_ascii(win, "TTDBG_LEGACY ", opt.delay_ms)),
+        ("SendInput no-visible Shift key", lambda: win.send_vk(VK_SHIFT, "debug Shift")),
         ("ASCII virtual keys", lambda: send_debug_ascii(win, "TTDBG_ASCII ", opt.delay_ms)),
         ("Unicode ASCII", lambda: send_debug_unicode(win, "TTDBG_UNICODE ", opt.delay_ms)),
-        ("Legacy keybd_event ASCII", lambda: send_debug_legacy_ascii(win, "TTDBG_LEGACY ", opt.delay_ms)),
         ("Unicode Chinese", lambda: send_debug_unicode(win, "U+4E2D=中", opt.delay_ms)),
     ]
 
@@ -790,11 +839,11 @@ def debug_input(win: WinKeyboard, opt: Options) -> int:
             print("Diagnosis: integrity levels do not prove an admin mismatch.")
             print("Possible causes: secure desktop, RDP/input policy, minimized or disconnected RDP session,")
             print("endpoint security blocking synthetic input, or target app rejecting injected events.")
-        print("Next test: run --debug-input against local Notepad. If Notepad passes but RDP fails, the issue is RDP/session/target-specific.")
+        print("Next test: run --debug-input against local Notepad. If only legacy succeeds, use the default mode and avoid --sendinput/--ascii-keys.")
         return EXIT_INPUT
 
-    print("Debug input completed. If the marker is visible in the target, SendInput works in this session.")
-    print("If the command reported OK but no marker appeared, the target had focus/acceptance issues rather than SendInput failure.")
+    print("Debug input completed. If all markers are visible in the target, all input modes work in this session.")
+    print("If only TTDBG_LEGACY appears, use the default mode and keep trans.txt ASCII.")
     return EXIT_OK
 
 
@@ -822,7 +871,9 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
             if ch == "\r":
                 if i + 1 < len(data.text) and data.text[i + 1] == "\n":
                     i += 1
-                if opt.enter_mode == "unicode":
+                if opt.legacy_keys:
+                    win.legacy_vk(VK_RETURN)
+                elif opt.enter_mode == "unicode":
                     win.send_unicode_unit(ord("\r"), "Enter")
                 else:
                     win.send_vk(VK_RETURN, "Enter")
@@ -832,7 +883,9 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
                 print(f"\rProgress: line {min(line, stats.lines)}/{stats.lines}", end="", flush=True)
                 sleep_ms(opt.line_delay_ms)
             elif ch == "\n":
-                if opt.enter_mode == "unicode":
+                if opt.legacy_keys:
+                    win.legacy_vk(VK_RETURN)
+                elif opt.enter_mode == "unicode":
                     win.send_unicode_unit(ord("\r"), "Enter")
                 else:
                     win.send_vk(VK_RETURN, "Enter")
@@ -842,7 +895,15 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
                 print(f"\rProgress: line {min(line, stats.lines)}/{stats.lines}", end="", flush=True)
                 sleep_ms(opt.line_delay_ms)
             elif ch == "\t":
-                win.send_vk(VK_TAB, "Tab")
+                if opt.legacy_keys:
+                    win.legacy_vk(VK_TAB)
+                else:
+                    win.send_vk(VK_TAB, "Tab")
+                col += 1
+                typed_units += 1
+                sleep_ms(opt.delay_ms)
+            elif opt.legacy_keys:
+                win.legacy_ascii_char(ch)
                 col += 1
                 typed_units += 1
                 sleep_ms(opt.delay_ms)
@@ -879,7 +940,7 @@ def run(argv: list[str]) -> int:
             return EXIT_INPUT
         win = WinKeyboard()
         if opt.self_test:
-            rc = self_test_sendinput(win)
+            rc = self_test_input(win, opt)
             if rc != EXIT_OK or not (opt.diagnose or opt.debug_input):
                 return rc
         if opt.debug_input:

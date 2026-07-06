@@ -97,6 +97,7 @@ trans_type.exe --dry-run
 trans_type.exe --delay-ms 50 --line-delay-ms 300
 trans_type.exe --ascii-only
 trans_type.exe --ascii-keys
+trans_type.exe --sendinput
 trans_type.exe --start-delay-sec 10
 trans_type.exe --no-focus-check
 trans_type.exe --self-test
@@ -120,7 +121,7 @@ trans_type_py.exe --delay-ms 50 --line-delay-ms 300
 - If the foreground window changes, typing pauses by default.
 - The tools refuse to type into their own console.
 - `--dry-run` parses `trans.txt`, reports encoding, line count, character count, non-ASCII count, and exits without typing.
-- `--self-test` verifies that Windows accepts a harmless `SendInput` Shift key event.
+- `--self-test` checks the selected input mode. By default it calls legacy `keybd_event`; use `--sendinput --self-test` to retest `SendInput`.
 - Python-only `--diagnose` prints the focused target window and integrity levels without typing.
 - Python-only `--debug-input` runs visible ASCII and Unicode input tests against a safe target field.
 - Unsupported control characters are rejected. Tabs and newlines are allowed.
@@ -136,20 +137,22 @@ Supported inputs:
 - UTF-16 BE with BOM
 - Windows ANSI code page fallback
 
-For scripts, ASCII text is the safest. If `trans.txt` contains Chinese or other non-ASCII characters, the default Unicode input mode may work through RDP, but some target applications or consoles may reject it.
+For scripts, ASCII text is the safest. The default mode is legacy ASCII key input because some locked-down Windows environments block `SendInput`. If `trans.txt` contains Chinese or other non-ASCII characters, use `--sendinput`; that mode depends on the Windows session allowing `SendInput`.
 
 ## Input Modes
 
-Default mode uses `SendInput` with `KEYEVENTF_UNICODE` for normal characters. This avoids local keyboard layout problems for symbols such as quotes, backslashes, and braces.
+Default mode uses legacy `keybd_event` and supports ASCII text only. It works in some environments where `SendInput` is blocked, but it depends on the local keyboard layout.
 
 `--ascii-only` only validates that `trans.txt` contains ASCII. It does not change the input method.
 
-`--ascii-keys` switches to virtual-key input for ASCII characters. Use it only if the target does not accept Unicode input. This mode depends on the local keyboard layout.
+`--ascii-keys` switches to virtual-key input through `SendInput` for ASCII characters. Use it only for comparison/debugging.
 
-Enter is sent as `VK_RETURN` by default. If a target behaves better with Unicode carriage return, use:
+`--sendinput` switches to Unicode `SendInput`. Use it for non-ASCII text if the Windows session allows `SendInput`.
+
+Enter is sent as `VK_RETURN` by default. If `--sendinput` is enabled and a target behaves better with Unicode carriage return, use:
 
 ```bat
-trans_type.exe --enter-mode unicode
+trans_type.exe --sendinput --enter-mode unicode
 ```
 
 ## Exit Codes
