@@ -26,7 +26,7 @@ C++ wrapper version:
 build_cpp.bat
 ```
 
-`build_cpp.bat` compiles a small C++ launcher and outputs `trans_type_cpp.exe`. Keep it in the same directory as `trans_type.exe`.
+`build_cpp.bat` compiles a small C++ launcher and outputs `trans_type_cpp.exe`. Keep it in the same directory as `trans_type.exe`. In CI, if the launcher compile fails, the script falls back to copying the already-built native exe so the artifact still contains a working `trans_type_cpp.exe` alias.
 
 Python/PyInstaller version:
 
