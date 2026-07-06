@@ -112,15 +112,27 @@ jobs:
 
       - name: Report C++ diagnostics
         if: always()
-        shell: pwsh
+        shell: cmd
         run: |
-          $code = if (Test-Path .\cpp-build.exitcode) { (Get-Content .\cpp-build.exitcode -Raw).Trim() } else { "missing" }
-          $cpp = Get-Item .\trans_type_cpp.exe -ErrorAction SilentlyContinue
-          $cppState = if ($cpp) { "exists length=$($cpp.Length)" } else { "missing" }
-          $logTail = if (Test-Path .\cpp-build.log) { (Get-Content .\cpp-build.log -Tail 30) -join " | " } else { "cpp-build.log missing" }
-          $message = "cpp-build.exitcode=$code; trans_type_cpp.exe=$cppState; log_tail=$logTail"
-          $message = $message.Replace('%', '%25').Replace("`r", ' ').Replace("`n", ' ')
-          Write-Output "::warning file=.github/workflows/build-windows.yml,line=1,title=C++ build diagnostics::$message"
+          setlocal EnableDelayedExpansion
+          if exist cpp-build.exitcode (set /p CPP_BUILD_CODE=<cpp-build.exitcode) else set "CPP_BUILD_CODE=missing"
+          if exist trans_type_cpp.exe (
+            for %%I in (trans_type_cpp.exe) do set "CPP_STATE=exists length=%%~zI"
+          ) else (
+            set "CPP_STATE=missing"
+          )
+          set "LOG_SUMMARY="
+          set "LOG_COUNT=0"
+          if exist cpp-build.log (
+            for /f "usebackq delims=" %%L in ("cpp-build.log") do (
+              set /a LOG_COUNT+=1 >nul
+              if !LOG_COUNT! LEQ 12 set "LOG_SUMMARY=!LOG_SUMMARY! | %%L"
+            )
+          ) else (
+            set "LOG_SUMMARY=cpp-build.log missing"
+          )
+          echo ::warning file=.github/workflows/build-windows.yml,line=1,title=C++ build diagnostics::cpp-build.exitcode=!CPP_BUILD_CODE!; trans_type_cpp.exe=!CPP_STATE!; log=!LOG_SUMMARY!
+          exit /b 0
 
       - name: Enforce C++ build result
         shell: pwsh
