@@ -16,7 +16,15 @@
 #define ABSOLUTE_MAX_BYTES (100 * 1024 * 1024)
 
 #ifndef PROGRAM_NAME
+#ifdef TRANS_TYPE_CPP_BUILD
+#define PROGRAM_NAME "trans_type_cpp.exe"
+#else
 #define PROGRAM_NAME "trans_type.exe"
+#endif
+#endif
+
+#ifndef TRANS_TYPE_ENTRY
+#define TRANS_TYPE_ENTRY main
 #endif
 
 enum ExitCode {
@@ -896,7 +904,7 @@ static int type_text(const TextData *data, const TextStats *stats, const Options
     return EXIT_OK;
 }
 
-int main(int argc, char **argv) {
+int TRANS_TYPE_ENTRY(int argc, char **argv) {
     Options opt;
     TextData data;
     TextStats stats;

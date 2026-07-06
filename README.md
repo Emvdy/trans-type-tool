@@ -26,7 +26,7 @@ C++ wrapper version:
 build_cpp.bat
 ```
 
-`build_cpp.bat` compiles `trans_type.cpp`, which reuses the native WinAPI implementation and outputs `trans_type_cpp.exe`.
+`build_cpp.bat` compiles the native implementation as a C object, links it through a C++ entrypoint, and outputs standalone `trans_type_cpp.exe`.
 
 Python/PyInstaller version:
 

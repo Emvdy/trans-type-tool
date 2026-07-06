@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
@@ -40,6 +40,27 @@ jobs:
         shell: cmd
         run: build_python.bat
 
+      - name: Verify generated exes
+        shell: pwsh
+        run: |
+          .\trans_type.exe --dry-run --ascii-only
+          .\trans_type_cpp.exe --dry-run --ascii-only
+          .\trans_type_py.exe --dry-run --ascii-only
+
+      - name: Record artifact details
+        shell: pwsh
+        run: |
+          Get-Item trans_type.exe, trans_type_cpp.exe, trans_type_py.exe |
+            Select-Object Name, Length |
+            Format-Table -AutoSize |
+            Out-String |
+            Tee-Object -FilePath artifact-details.txt
+
+          Get-FileHash trans_type.exe, trans_type_cpp.exe, trans_type_py.exe -Algorithm SHA256 |
+            Format-Table -AutoSize |
+            Out-String |
+            Tee-Object -FilePath artifact-sha256.txt
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -48,6 +69,8 @@ jobs:
             trans_type.exe
             trans_type_cpp.exe
             trans_type_py.exe
+            artifact-details.txt
+            artifact-sha256.txt
             README.md
             trans.txt
             trans_type.c
@@ -59,3 +82,4 @@ jobs:
             build_all.bat
             requirements-build.txt
             MAC_BUILD.md
+            GITHUB_BUILD.md
