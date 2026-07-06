@@ -3,7 +3,7 @@
 This project provides three Windows 10 tools with the same behavior:
 
 - `trans_type.exe`: native Win32 C/C++-style implementation. Smallest exe.
-- `trans_type_cpp.exe`: C++ build wrapper for the same native implementation.
+- `trans_type_cpp.exe`: small C++ launcher that forwards to `trans_type.exe` in the same directory.
 - `trans_type_py.exe`: Python implementation packaged by PyInstaller. Easier to edit, but much larger.
 
 All three tools read `trans.txt` from the same directory as the executable and type it into the current foreground Windows window through simulated keyboard input. They are designed for Windows 10 + RDP cases where the target server has no network access and clipboard transfer is disabled.
@@ -26,7 +26,7 @@ C++ wrapper version:
 build_cpp.bat
 ```
 
-`build_cpp.bat` compiles the native implementation as a C object, links it through a C++ entrypoint, and outputs standalone `trans_type_cpp.exe`.
+`build_cpp.bat` compiles a small C++ launcher and outputs `trans_type_cpp.exe`. Keep it in the same directory as `trans_type.exe`.
 
 Python/PyInstaller version:
 
@@ -68,7 +68,7 @@ Expected size difference:
 
 ## Basic Use
 
-1. Put one of `trans_type.exe`, `trans_type_cpp.exe`, or `trans_type_py.exe` and `trans.txt` in the same directory.
+1. Put one of `trans_type.exe` or `trans_type_py.exe` and `trans.txt` in the same directory. If you use `trans_type_cpp.exe`, keep `trans_type.exe` in that same directory too.
 2. Open the RDP session and place the cursor in the target editor, shell, or input box.
 3. Run:
 
