@@ -74,6 +74,9 @@ python trans_type.py --dry-run --ascii-only
 build.bat
 build_cpp.bat
 build_python.bat
+trans_type.exe --dry-run --ascii-only
+trans_type_cpp.exe --dry-run --ascii-only
+trans_type_py.exe --dry-run --ascii-only
 ```
 
 其中 `build_python.bat` 会执行 PyInstaller：

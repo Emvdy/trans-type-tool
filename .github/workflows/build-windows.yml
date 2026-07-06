@@ -66,3 +66,4 @@ jobs:
             build_all.bat
             requirements-build.txt
             MAC_BUILD.md
+            GITHUB_BUILD.md
