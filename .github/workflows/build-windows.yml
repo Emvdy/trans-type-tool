@@ -110,6 +110,18 @@ jobs:
             MAC_BUILD.md
             GITHUB_BUILD.md
 
+      - name: Report C++ diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $code = if (Test-Path .\cpp-build.exitcode) { (Get-Content .\cpp-build.exitcode -Raw).Trim() } else { "missing" }
+          $cpp = Get-Item .\trans_type_cpp.exe -ErrorAction SilentlyContinue
+          $cppState = if ($cpp) { "exists length=$($cpp.Length)" } else { "missing" }
+          $logTail = if (Test-Path .\cpp-build.log) { (Get-Content .\cpp-build.log -Tail 30) -join " | " } else { "cpp-build.log missing" }
+          $message = "cpp-build.exitcode=$code; trans_type_cpp.exe=$cppState; log_tail=$logTail"
+          $message = $message.Replace('%', '%25').Replace("`r", ' ').Replace("`n", ' ')
+          Write-Output "::warning file=.github/workflows/build-windows.yml,line=1,title=C++ build diagnostics::$message"
+
       - name: Enforce C++ build result
         shell: pwsh
         run: |
