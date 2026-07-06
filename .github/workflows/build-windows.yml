@@ -34,7 +34,12 @@ jobs:
 
       - name: Build C++ wrapper exe
         shell: cmd
-        run: build_cpp.bat
+        run: |
+          call build_cpp.bat > cpp-build.log 2>&1
+          set "CPP_BUILD_RC=%ERRORLEVEL%"
+          type cpp-build.log
+          echo %CPP_BUILD_RC%> cpp-build.exitcode
+          exit /b 0
 
       - name: Build Python exe
         shell: cmd
@@ -44,31 +49,52 @@ jobs:
         shell: pwsh
         run: |
           .\trans_type.exe --dry-run --ascii-only
-          .\trans_type_cpp.exe --dry-run --ascii-only
+          if (Test-Path .\trans_type_cpp.exe) {
+            .\trans_type_cpp.exe --dry-run --ascii-only
+          } else {
+            Write-Warning "trans_type_cpp.exe was not produced; see cpp-build.log"
+          }
           .\trans_type_py.exe --dry-run --ascii-only
 
       - name: Record artifact details
         shell: pwsh
         run: |
-          Get-Item trans_type.exe, trans_type_cpp.exe, trans_type_py.exe |
+          Get-Item trans_type.exe, trans_type_py.exe, cpp-build.log, cpp-build.exitcode -ErrorAction SilentlyContinue |
             Select-Object Name, Length |
             Format-Table -AutoSize |
             Out-String |
             Tee-Object -FilePath artifact-details.txt
 
-          Get-FileHash trans_type.exe, trans_type_cpp.exe, trans_type_py.exe -Algorithm SHA256 |
+          Get-Item trans_type_cpp.exe -ErrorAction SilentlyContinue |
+            Select-Object Name, Length |
+            Format-Table -AutoSize |
+            Out-String |
+            Add-Content -Path artifact-details.txt
+
+          Get-FileHash trans_type.exe, trans_type_py.exe, cpp-build.log, cpp-build.exitcode -Algorithm SHA256 |
             Format-Table -AutoSize |
             Out-String |
             Tee-Object -FilePath artifact-sha256.txt
 
+          if (Test-Path .\trans_type_cpp.exe) {
+            Get-FileHash trans_type_cpp.exe -Algorithm SHA256 |
+              Format-Table -AutoSize |
+              Out-String |
+              Add-Content -Path artifact-sha256.txt
+          }
+
       - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trans_type-windows
+          if-no-files-found: warn
           path: |
             trans_type.exe
             trans_type_cpp.exe
             trans_type_py.exe
+            cpp-build.log
+            cpp-build.exitcode
             artifact-details.txt
             artifact-sha256.txt
             README.md
@@ -83,3 +109,13 @@ jobs:
             requirements-build.txt
             MAC_BUILD.md
             GITHUB_BUILD.md
+
+      - name: Enforce C++ build result
+        shell: pwsh
+        run: |
+          $code = (Get-Content .\cpp-build.exitcode -Raw).Trim()
+          if ($code -ne "0") {
+            Write-Error "C++ build failed with exit code $code. See cpp-build.log artifact."
+            $exitCode = [int]$code
+            exit $exitCode
+          }
