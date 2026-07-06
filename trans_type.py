@@ -34,6 +34,10 @@ VK_MENU = 0x12
 VK_PAUSE = 0x13
 VK_ESCAPE = 0x1B
 
+TOKEN_QUERY = 0x0008
+TOKEN_INTEGRITY_LEVEL = 25
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
 
 @dataclass
 class Options:
@@ -45,6 +49,9 @@ class Options:
     ascii_keys: bool
     no_focus_check: bool
     dry_run: bool
+    diagnose: bool
+    self_test: bool
+    debug_input: bool
     enter_mode: str
 
 
@@ -74,6 +81,13 @@ class TargetWindow:
     title: str
 
 
+@dataclass
+class IntegrityInfo:
+    rid: int | None
+    label: str
+    error: str | None = None
+
+
 def bounded_int(name: str, minimum: int, maximum: int):
     def parse(value: str) -> int:
         try:
@@ -100,6 +114,9 @@ def parse_args(argv: list[str]) -> Options:
     parser.add_argument("--ascii-keys", action="store_true")
     parser.add_argument("--no-focus-check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--diagnose", action="store_true", help="Report the focused target window and integrity levels without typing")
+    parser.add_argument("--self-test", action="store_true", help="Test whether SendInput can inject a harmless Shift key event")
+    parser.add_argument("--debug-input", action="store_true", help="Run visible SendInput diagnostics against the focused target window")
     parser.add_argument("--enter-mode", choices=("key", "unicode"), default="key")
     args = parser.parse_args(argv)
     return Options(
@@ -111,6 +128,9 @@ def parse_args(argv: list[str]) -> Options:
         ascii_keys=args.ascii_keys,
         no_focus_check=args.no_focus_check,
         dry_run=args.dry_run,
+        diagnose=args.diagnose,
+        self_test=args.self_test,
+        debug_input=args.debug_input,
         enter_mode=args.enter_mode,
     )
 
@@ -288,6 +308,7 @@ class WinKeyboard:
         self.wintypes = wintypes
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
         class MOUSEINPUT(ctypes.Structure):
             _fields_ = [
@@ -326,8 +347,18 @@ class WinKeyboard:
             _anonymous_ = ("u",)
             _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
 
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [
+                ("Sid", wintypes.LPVOID),
+                ("Attributes", wintypes.DWORD),
+            ]
+
+        class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+            _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
         self.KEYBDINPUT = KEYBDINPUT
         self.INPUT = INPUT
+        self.TOKEN_MANDATORY_LABEL = TOKEN_MANDATORY_LABEL
 
         self.user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         self.user32.SendInput.restype = wintypes.UINT
@@ -343,6 +374,26 @@ class WinKeyboard:
         self.user32.VkKeyScanW.restype = ctypes.c_short
         self.kernel32.GetCurrentProcessId.argtypes = []
         self.kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+        self.kernel32.GetCurrentProcess.argtypes = []
+        self.kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.kernel32.OpenProcess.restype = wintypes.HANDLE
+        self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        self.advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        self.advapi32.OpenProcessToken.restype = wintypes.BOOL
+        self.advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self.advapi32.GetTokenInformation.restype = wintypes.BOOL
+        self.advapi32.GetSidSubAuthorityCount.argtypes = [wintypes.LPVOID]
+        self.advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        self.advapi32.GetSidSubAuthority.argtypes = [wintypes.LPVOID, wintypes.DWORD]
+        self.advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
 
     def key_input(self, vk: int = 0, scan: int = 0, flags: int = 0):
         item = self.INPUT()
@@ -364,7 +415,9 @@ class WinKeyboard:
                 raise RuntimeError(f"SendInput failed while typing {what}. Sent {sent}/{len(inputs)} events. Windows error {err}.")
             raise RuntimeError(
                 f"SendInput failed while typing {what}. Sent {sent}/{len(inputs)} events. "
-                "The target may run at a higher integrity level; try running this tool as Administrator."
+                "Windows likely blocked the input because the target window has a higher integrity level. "
+                "To run without Administrator, close the target window and reopen it normally, not with Run as administrator. "
+                "Otherwise run this tool as Administrator too."
             )
 
     def send_vk(self, vk: int, what: str) -> None:
@@ -435,6 +488,75 @@ class WinKeyboard:
     def current_pid(self) -> int:
         return int(self.kernel32.GetCurrentProcessId())
 
+    @staticmethod
+    def integrity_label(rid: int | None) -> str:
+        if rid is None:
+            return "unknown"
+        if rid < 0x1000:
+            return "untrusted"
+        if rid < 0x2000:
+            return "low"
+        if rid < 0x3000:
+            return "medium"
+        if rid < 0x4000:
+            return "high / administrator"
+        if rid < 0x5000:
+            return "system"
+        return "protected"
+
+    def token_integrity(self, token) -> IntegrityInfo:
+        needed = self.wintypes.DWORD(0)
+        self.advapi32.GetTokenInformation(token, TOKEN_INTEGRITY_LEVEL, None, 0, ctypes.byref(needed))
+        if needed.value == 0:
+            return IntegrityInfo(None, "unknown", f"GetTokenInformation size failed: {ctypes.get_last_error()}")
+
+        buffer = ctypes.create_string_buffer(needed.value)
+        ok = self.advapi32.GetTokenInformation(
+            token,
+            TOKEN_INTEGRITY_LEVEL,
+            buffer,
+            needed.value,
+            ctypes.byref(needed),
+        )
+        if not ok:
+            return IntegrityInfo(None, "unknown", f"GetTokenInformation failed: {ctypes.get_last_error()}")
+
+        label = ctypes.cast(buffer, ctypes.POINTER(self.TOKEN_MANDATORY_LABEL)).contents
+        sid = label.Label.Sid
+        count_ptr = self.advapi32.GetSidSubAuthorityCount(sid)
+        if not count_ptr:
+            return IntegrityInfo(None, "unknown", f"GetSidSubAuthorityCount failed: {ctypes.get_last_error()}")
+        count = count_ptr.contents.value
+        rid_ptr = self.advapi32.GetSidSubAuthority(sid, count - 1)
+        if not rid_ptr:
+            return IntegrityInfo(None, "unknown", f"GetSidSubAuthority failed: {ctypes.get_last_error()}")
+        rid = int(rid_ptr.contents.value)
+        return IntegrityInfo(rid, self.integrity_label(rid))
+
+    def current_integrity(self) -> IntegrityInfo:
+        token = self.wintypes.HANDLE()
+        if not self.advapi32.OpenProcessToken(self.kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+            return IntegrityInfo(None, "unknown", f"OpenProcessToken failed: {ctypes.get_last_error()}")
+        try:
+            return self.token_integrity(token)
+        finally:
+            self.kernel32.CloseHandle(token)
+
+    def process_integrity(self, pid: int) -> IntegrityInfo:
+        process = self.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            return IntegrityInfo(None, "unknown", f"OpenProcess failed: {ctypes.get_last_error()}")
+        try:
+            token = self.wintypes.HANDLE()
+            if not self.advapi32.OpenProcessToken(process, TOKEN_QUERY, ctypes.byref(token)):
+                return IntegrityInfo(None, "unknown", f"OpenProcessToken failed: {ctypes.get_last_error()}")
+            try:
+                return self.token_integrity(token)
+            finally:
+                self.kernel32.CloseHandle(token)
+        finally:
+            self.kernel32.CloseHandle(process)
+
 
 def wait_for_console_enter_or_esc(message: str) -> int:
     import msvcrt
@@ -455,10 +577,13 @@ def countdown(win: WinKeyboard, seconds: int) -> int:
 
     print()
     print("Focus the target window now.")
-    print("Esc aborts. Enter starts immediately.")
+    print("Esc aborts. Press Enter during the countdown to start immediately.")
     win.get_async_key_state(VK_RETURN)
     win.get_async_key_state(VK_ESCAPE)
-    time.sleep(0.15)
+    while win.get_async_key_state(VK_RETURN) & 0x8000:
+        time.sleep(0.02)
+    win.get_async_key_state(VK_RETURN)
+    win.get_async_key_state(VK_ESCAPE)
 
     for remaining in range(seconds, 0, -1):
         print(f"\rStarting in {remaining} second(s)... ", end="", flush=True)
@@ -484,6 +609,25 @@ def print_target(target: TargetWindow) -> None:
         print(f"Target window: <untitled> (pid {target.pid})")
 
 
+def print_integrity_report(win: WinKeyboard, target: TargetWindow) -> None:
+    tool = win.current_integrity()
+    target_info = win.process_integrity(target.pid)
+    print(f"Tool integrity: {tool.label}")
+    print(f"Target integrity: {target_info.label}")
+
+    if tool.error:
+        print(f"Tool integrity detail: {tool.error}")
+    if target_info.error:
+        print(f"Target integrity detail: {target_info.error}")
+
+    if tool.rid is not None and target_info.rid is not None and target_info.rid > tool.rid:
+        print()
+        print("Warning: the target window has a higher integrity level than this tool.")
+        print("Windows blocks SendInput from lower-integrity processes to higher-integrity windows.")
+        print("No-admin fix: close the target window and reopen it normally, not with Run as administrator.")
+        print("For RDP, start mstsc from Win+R or a normal PowerShell/CMD, then run this tool normally.")
+
+
 def prepare_target_window(win: WinKeyboard, opt: Options) -> tuple[int, TargetWindow | None]:
     self_pid = win.current_pid()
     while True:
@@ -506,6 +650,7 @@ def prepare_target_window(win: WinKeyboard, opt: Options) -> tuple[int, TargetWi
                 return rc, None
             continue
 
+        print_integrity_report(win, target)
         return EXIT_OK, target
 
 
@@ -535,6 +680,78 @@ def check_runtime_controls(win: WinKeyboard, opt: Options, target: TargetWindow)
 def sleep_ms(ms: int) -> None:
     if ms > 0:
         time.sleep(ms / 1000.0)
+
+
+def self_test_sendinput(win: WinKeyboard) -> int:
+    print("Running SendInput self-test with a harmless Shift key press.")
+    print("This does not type visible text.")
+    print(f"Tool integrity: {win.current_integrity().label}")
+    try:
+        win.send_vk(VK_SHIFT, "self-test Shift")
+    except RuntimeError as exc:
+        print(f"Self-test failed: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+    print("Self-test passed: SendInput accepted the Shift key events.")
+    return EXIT_OK
+
+
+def send_debug_ascii(win: WinKeyboard, text: str, delay_ms: int) -> None:
+    for ch in text:
+        win.send_ascii_char(ch)
+        sleep_ms(delay_ms)
+
+
+def send_debug_unicode(win: WinKeyboard, text: str, delay_ms: int) -> None:
+    for ch in text:
+        win.send_unicode_char(ch)
+        sleep_ms(delay_ms)
+
+
+def debug_input(win: WinKeyboard, opt: Options) -> int:
+    print("Input debug mode.")
+    print("It will type this visible marker into the focused target:")
+    print("  TTDBG_ASCII TTDBG_UNICODE U+4E2D=中")
+    print("Open a safe text field, Notepad, or a scratch shell before the countdown ends.")
+
+    rc, target = prepare_target_window(win, opt)
+    if rc != EXIT_OK or target is None:
+        return rc
+
+    tests = [
+        ("No-visible Shift key", lambda: win.send_vk(VK_SHIFT, "debug Shift")),
+        ("ASCII virtual keys", lambda: send_debug_ascii(win, "TTDBG_ASCII ", opt.delay_ms)),
+        ("Unicode ASCII", lambda: send_debug_unicode(win, "TTDBG_UNICODE ", opt.delay_ms)),
+        ("Unicode Chinese", lambda: send_debug_unicode(win, "U+4E2D=中", opt.delay_ms)),
+    ]
+
+    failed = False
+    for name, fn in tests:
+        print(f"Testing: {name}")
+        try:
+            fn()
+        except RuntimeError as exc:
+            failed = True
+            print(f"FAILED: {name}: {exc}", file=sys.stderr)
+            break
+        print(f"OK: {name}")
+        sleep_ms(max(opt.delay_ms, 30))
+
+    print()
+    if failed:
+        tool = win.current_integrity()
+        target_info = win.process_integrity(target.pid)
+        if tool.rid is not None and target_info.rid is not None and target_info.rid > tool.rid:
+            print("Diagnosis: target integrity is higher than the tool. Windows UIPI can block SendInput.")
+        else:
+            print("Diagnosis: integrity levels do not prove an admin mismatch.")
+            print("Possible causes: secure desktop, RDP/input policy, minimized or disconnected RDP session,")
+            print("endpoint security blocking synthetic input, or target app rejecting injected events.")
+        print("Next test: run --debug-input against local Notepad. If Notepad passes but RDP fails, the issue is RDP/session/target-specific.")
+        return EXIT_INPUT
+
+    print("Debug input completed. If the marker is visible in the target, SendInput works in this session.")
+    print("If the command reported OK but no marker appeared, the target had focus/acceptance issues rather than SendInput failure.")
+    return EXIT_OK
 
 
 def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, target: TargetWindow) -> int:
@@ -611,6 +828,21 @@ def run(argv: list[str]) -> int:
         opt = parse_args(argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else EXIT_ARGS
+
+    if opt.self_test or opt.diagnose or opt.debug_input:
+        if os.name != "nt":
+            print("Keyboard input diagnostics are only supported on Windows.", file=sys.stderr)
+            return EXIT_INPUT
+        win = WinKeyboard()
+        if opt.self_test:
+            rc = self_test_sendinput(win)
+            if rc != EXIT_OK or not (opt.diagnose or opt.debug_input):
+                return rc
+        if opt.debug_input:
+            return debug_input(win, opt)
+        if opt.diagnose:
+            rc, _target = prepare_target_window(win, opt)
+            return rc
 
     try:
         data = read_trans_file(trans_path(), opt)

@@ -588,7 +588,15 @@ static int run_countdown(int seconds) {
 
     puts("");
     puts("Focus the target window now.");
-    puts("Esc aborts. Enter starts immediately.");
+    puts("Esc aborts. Press Enter during the countdown to start immediately.");
+
+    GetAsyncKeyState(VK_ESCAPE);
+    GetAsyncKeyState(VK_RETURN);
+    while (GetAsyncKeyState(VK_RETURN) & 0x8000) {
+        Sleep(20);
+    }
+    GetAsyncKeyState(VK_ESCAPE);
+    GetAsyncKeyState(VK_RETURN);
 
     for (remaining = seconds; remaining > 0; --remaining) {
         int ticks;
@@ -599,7 +607,7 @@ static int run_countdown(int seconds) {
                 printf("\n");
                 return EXIT_ABORTED;
             }
-            if (GetAsyncKeyState(VK_RETURN) & 0x0001) {
+            if (GetAsyncKeyState(VK_RETURN) & 0x8000) {
                 printf("\n");
                 return EXIT_OK;
             }

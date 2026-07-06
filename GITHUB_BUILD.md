@@ -137,6 +137,18 @@ trans_type_py.exe
 
 - 倒计时结束前必须让 RDP 目标窗口获得焦点。
 - 如果目标程序是管理员权限运行，工具也可能需要用管理员权限运行。
+- 如果你不确定是不是权限、RDP 会话、输入法或 Unicode 问题，先用 Python 版跑诊断：
+
+```bat
+trans_type_py.exe --self-test
+trans_type_py.exe --diagnose
+trans_type_py.exe --debug-input
+```
+
+`--debug-input` 会让你把光标放到一个安全输入框，然后测试 ASCII virtual-key、Unicode ASCII 和 Unicode 中文输入。建议先对本地 Notepad 测，再对 RDP 窗口测；如果 Notepad 成功但 RDP 失败，问题就在 RDP 会话或目标窗口。
+
+- `--ascii-only` 只是检查 `trans.txt` 是否全是 ASCII，不会改变输入方式。
+- `--ascii-keys` 才会改成虚拟按键输入，只适合 ASCII 文本。
 - 高延迟环境使用更慢参数：
 
 ```bat

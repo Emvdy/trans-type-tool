@@ -99,6 +99,9 @@ trans_type.exe --ascii-only
 trans_type.exe --ascii-keys
 trans_type.exe --start-delay-sec 10
 trans_type.exe --no-focus-check
+trans_type_py.exe --self-test
+trans_type_py.exe --diagnose
+trans_type_py.exe --debug-input
 ```
 
 The Python exe accepts the same options:
@@ -115,6 +118,9 @@ trans_type_py.exe --delay-ms 50 --line-delay-ms 300
 - If the foreground window changes, typing pauses by default.
 - The tools refuse to type into their own console.
 - `--dry-run` parses `trans.txt`, reports encoding, line count, character count, non-ASCII count, and exits without typing.
+- Python-only `--self-test` verifies that Windows accepts a harmless `SendInput` Shift key event.
+- Python-only `--diagnose` prints the focused target window and integrity levels without typing.
+- Python-only `--debug-input` runs visible ASCII and Unicode input tests against a safe target field.
 - Unsupported control characters are rejected. Tabs and newlines are allowed.
 - Default maximum file size is 1 MiB. Use `--max-bytes N` only when you intentionally need more.
 
@@ -133,6 +139,8 @@ For scripts, ASCII text is the safest. If `trans.txt` contains Chinese or other 
 ## Input Modes
 
 Default mode uses `SendInput` with `KEYEVENTF_UNICODE` for normal characters. This avoids local keyboard layout problems for symbols such as quotes, backslashes, and braces.
+
+`--ascii-only` only validates that `trans.txt` contains ASCII. It does not change the input method.
 
 `--ascii-keys` switches to virtual-key input for ASCII characters. Use it only if the target does not accept Unicode input. This mode depends on the local keyboard layout.
 
