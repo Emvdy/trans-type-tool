@@ -15,11 +15,11 @@ goto build_gcc
 
 :build_msvc
 echo Building C implementation object for C++ wrapper with MSVC...
-cl /nologo /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /DTRANS_TYPE_ENTRY=trans_type_native_main /DTRANS_TYPE_CPP_BUILD /c /Fo:trans_type_cpp_native.obj trans_type.c
+cl /nologo /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /DTRANS_TYPE_ENTRY=trans_type_native_main /DTRANS_TYPE_CPP_BUILD /c /Fotrans_type_cpp_native.obj trans_type.c
 if errorlevel 1 exit /b %ERRORLEVEL%
 
 echo Linking C++ wrapper with MSVC...
-cl /nologo /TP /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:trans_type_cpp.exe /Fo:trans_type_cpp.obj trans_type.cpp trans_type_cpp_native.obj user32.lib
+cl /nologo /TP /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fetrans_type_cpp.exe /Fotrans_type_cpp.obj trans_type.cpp trans_type_cpp_native.obj user32.lib
 exit /b %ERRORLEVEL%
 
 :build_gcc
