@@ -15,7 +15,7 @@ exit /b 1
 
 :build_msvc
 echo Building C++ wrapper with MSVC...
-cl /nologo /TP /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:trans_type_cpp.exe /Fo:trans_type_cpp.obj trans_type.cpp user32.lib
+cl /nologo /TP /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:trans_type_cpp.exe /Fo:trans_type_cpp.obj trans_type.cpp /link user32.lib
 exit /b %ERRORLEVEL%
 
 :build_gcc

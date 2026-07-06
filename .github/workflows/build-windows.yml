@@ -40,6 +40,13 @@ jobs:
         shell: cmd
         run: build_python.bat
 
+      - name: Verify generated exes
+        shell: cmd
+        run: |
+          trans_type.exe --dry-run --ascii-only
+          trans_type_cpp.exe --dry-run --ascii-only
+          trans_type_py.exe --dry-run --ascii-only
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
