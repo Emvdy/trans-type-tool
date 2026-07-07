@@ -5,6 +5,7 @@
 *.ilk
 *.user
 *.spec
+trans_type_mac
 build/
 dist/
 __pycache__/

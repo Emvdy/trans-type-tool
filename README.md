@@ -8,7 +8,13 @@ This project provides three Windows 10 tools with the same behavior:
 
 All three tools read `trans.txt` from the same directory as the executable and type it into the current foreground Windows window through simulated keyboard input. They are designed for Windows 10 + RDP cases where the target server has no network access and clipboard transfer is disabled.
 
-The tools do not use the clipboard, network, remote files, or any injection into the remote host. They only behave like a local keyboard typing into the focused window.
+The Windows tools do not use the clipboard, network, remote files, or any injection into the remote host. They only behave like a local keyboard typing into the focused window.
+
+It also includes a macOS command-line tool:
+
+- `trans_type_mac`: native Objective-C++/C++ macOS build. It reads the clipboard by default and types through Unicode `CGEvent` keyboard input.
+
+The macOS tool reads the local clipboard as an input source, but it does not paste into the target. It still types characters through simulated keyboard events.
 
 ## Build On Windows
 
@@ -66,7 +72,37 @@ Expected size difference:
 - Native WinAPI exe: usually tens to hundreds of KB.
 - Python/PyInstaller exe: usually several MB to tens of MB because it embeds Python.
 
-## Basic Use
+Native macOS tool:
+
+```sh
+./build_mac.sh
+```
+
+This creates `trans_type_mac` for the current Mac architecture.
+
+## Basic Use On macOS
+
+The macOS tool defaults to clipboard input and Unicode keyboard events:
+
+```sh
+./trans_type_mac
+```
+
+Useful macOS options:
+
+```sh
+./trans_type_mac --dry-run
+./trans_type_mac --delay-ms 50 --line-delay-ms 300
+./trans_type_mac --source file
+./trans_type_mac --file /path/to/input.txt
+./trans_type_mac --diagnose
+./trans_type_mac --self-test
+./trans_type_mac --debug-input
+```
+
+For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in **System Settings > Privacy & Security > Accessibility**. Use `--request-accessibility` if you want macOS to show the permission prompt.
+
+## Basic Use On Windows
 
 1. Put one of `trans_type.exe`, `trans_type_cpp.exe`, or `trans_type_py.exe` and `trans.txt` in the same directory.
 2. Open the RDP session and place the cursor in the target editor, shell, or input box.
