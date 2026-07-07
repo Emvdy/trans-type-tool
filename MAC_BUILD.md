@@ -20,7 +20,24 @@ Default behavior:
 ./trans_type_mac
 ```
 
-By default, `trans_type_mac` reads the macOS clipboard and types it through Unicode `CGEvent` keyboard input. This is the macOS equivalent of Unicode SendInput-style typing.
+By default, `trans_type_mac` reads the macOS clipboard and uses `--input-mode auto`.
+
+In auto mode:
+
+- ASCII text is typed as real virtual key presses. Use this path for RDP.
+- Non-ASCII text is typed through Unicode `CGEvent` payloads. This is useful for local macOS apps, but some RDP clients ignore the Unicode payload and forward only the underlying keycode, which can appear remotely as repeated `a`.
+
+For RDP, keep the input ASCII and use:
+
+```sh
+./trans_type_mac --input-mode keys
+```
+
+For local Unicode testing in TextEdit:
+
+```sh
+./trans_type_mac --input-mode unicode
+```
 
 Useful checks that do not type:
 
@@ -28,6 +45,8 @@ Useful checks that do not type:
 ./trans_type_mac --dry-run
 ./trans_type_mac --dry-run --source file
 ./trans_type_mac --diagnose
+./trans_type_mac --input-mode keys --dry-run
+./trans_type_mac --input-mode unicode --dry-run
 ```
 
 Use `trans.txt` instead of the clipboard:

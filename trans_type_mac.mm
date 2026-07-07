@@ -41,6 +41,12 @@ enum class EnterMode {
     Unicode,
 };
 
+enum class InputMode {
+    Auto,
+    Keys,
+    Unicode,
+};
+
 struct Options {
     int delay_ms = DEFAULT_DELAY_MS;
     int line_delay_ms = DEFAULT_LINE_DELAY_MS;
@@ -55,6 +61,7 @@ struct Options {
     bool request_accessibility = false;
     SourceKind source = SourceKind::Clipboard;
     EnterMode enter_mode = EnterMode::Key;
+    InputMode input_mode = InputMode::Auto;
     std::filesystem::path file_path;
 };
 
@@ -88,12 +95,16 @@ static void print_usage() {
     puts("  " PROGRAM_NAME " [options]");
     puts("");
     puts("Default behavior:");
-    puts("  Reads the macOS clipboard and types it through Unicode CGEvent keyboard input.");
+    puts("  Reads the macOS clipboard. ASCII text uses real virtual keys for RDP;");
+    puts("  non-ASCII text uses Unicode CGEvent payloads for local macOS apps.");
     puts("");
     puts("Options:");
     puts("  --source clipboard    Read text from the macOS clipboard. Default");
     puts("  --source file         Read text from trans.txt next to this binary");
     puts("  --file PATH           Read text from PATH. Implies --source file");
+    puts("  --input-mode auto     ASCII virtual keys when possible, Unicode otherwise. Default");
+    puts("  --input-mode keys     Type ASCII through real virtual keys. Best for RDP");
+    puts("  --input-mode unicode  Type through Unicode CGEvent payloads. Best for local macOS apps");
     puts("  --delay-ms N          Delay after each character. Default: 20");
     puts("  --line-delay-ms N     Delay after each line. Default: 100");
     puts("  --start-delay-sec N   Countdown before typing. Default: 5");
@@ -107,7 +118,7 @@ static void print_usage() {
     puts("  --dry-run             Parse and validate input without typing");
     puts("  --diagnose            Show source, focused app, and permission status without typing");
     puts("  --self-test           Check permission and send a harmless Shift key event");
-    puts("  --debug-input         Type a visible Unicode test marker into the focused target");
+    puts("  --debug-input         Type visible keys and Unicode test markers into the focused target");
     puts("  --help                Show this help");
     puts("");
     puts("Controls while running:");
@@ -231,6 +242,24 @@ static bool parse_args(int argc, char **argv, Options *opt) {
                 opt->enter_mode = EnterMode::Unicode;
             } else {
                 fprintf(stderr, "Invalid --enter-mode value: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--input-mode", &value);
+        if (matched == 1) {
+            if (strcmp(value, "auto") == 0) {
+                opt->input_mode = InputMode::Auto;
+            } else if (strcmp(value, "keys") == 0) {
+                opt->input_mode = InputMode::Keys;
+            } else if (strcmp(value, "unicode") == 0) {
+                opt->input_mode = InputMode::Unicode;
+            } else {
+                fprintf(stderr, "Invalid --input-mode value: %s\n", value);
                 return false;
             }
             continue;
@@ -543,7 +572,34 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         fprintf(stderr, "--ascii-only is enabled, but input has non-ASCII characters. First one at line %zu, column %zu.\n", line, col);
         return EXIT_CONTENT;
     }
+    if (opt.input_mode == InputMode::Keys && stats.non_ascii_count > 0) {
+        size_t line = 0;
+        size_t col = 0;
+        line_col_for_index(data.text, stats.first_non_ascii, &line, &col);
+        fprintf(stderr, "--input-mode keys can only type ASCII. First non-ASCII character is at line %zu, column %zu.\n", line, col);
+        fprintf(stderr, "Use --input-mode unicode for local macOS apps that accept Unicode CGEvent payloads.\n");
+        return EXIT_CONTENT;
+    }
     return EXIT_OK;
+}
+
+static InputMode effective_input_mode(const Options &opt, const TextStats &stats) {
+    if (opt.input_mode != InputMode::Auto) {
+        return opt.input_mode;
+    }
+    return stats.non_ascii_count == 0 ? InputMode::Keys : InputMode::Unicode;
+}
+
+static const char *input_mode_name(InputMode mode) {
+    switch (mode) {
+        case InputMode::Auto:
+            return "Auto";
+        case InputMode::Keys:
+            return "ASCII virtual keys";
+        case InputMode::Unicode:
+            return "Unicode CGEvent payloads";
+    }
+    return "Unknown";
 }
 
 static FrontApp frontmost_app() {
@@ -573,6 +629,7 @@ static bool accessibility_trusted(bool prompt) {
 }
 
 static void print_summary(const TextData &data, const TextStats &stats, const Options &opt) {
+    InputMode mode = effective_input_mode(opt, stats);
     printf("Source: %s\n", data.source_label.c_str());
     printf("Encoding: %s\n", data.encoding.c_str());
     printf("Bytes: %zu\n", data.byte_count);
@@ -581,7 +638,14 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     printf("Lines: %zu\n", stats.lines);
     printf("Non-ASCII characters: %zu\n", stats.non_ascii_count);
     printf("Delay: %d ms per character, %d ms per line\n", opt.delay_ms, opt.line_delay_ms);
-    printf("Input mode: Unicode CGEvent keyboard input\n");
+    if (opt.input_mode == InputMode::Auto) {
+        printf("Input mode: Auto -> %s\n", input_mode_name(mode));
+    } else {
+        printf("Input mode: %s\n", input_mode_name(mode));
+    }
+    if (mode == InputMode::Unicode) {
+        printf("RDP note: some RDP clients ignore Unicode CGEvent payloads and may type repeated 'a'. Use --input-mode keys for ASCII text.\n");
+    }
     printf("Enter mode: %s\n", opt.enter_mode == EnterMode::Unicode ? "Unicode CR" : "Return key");
     printf("Focus check: %s\n", opt.no_focus_check ? "off" : "on");
     printf("Accessibility check: required before typing\n");
@@ -590,6 +654,80 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
 static void sleep_ms(int ms) {
     if (ms > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+}
+
+struct KeyStroke {
+    CGKeyCode keycode = 0;
+    bool shift = false;
+};
+
+static bool ascii_keystroke(char16_t ch, KeyStroke *stroke) {
+    if (ch >= 'a' && ch <= 'z') {
+        static const CGKeyCode keys[] = {
+            kVK_ANSI_A, kVK_ANSI_B, kVK_ANSI_C, kVK_ANSI_D, kVK_ANSI_E, kVK_ANSI_F,
+            kVK_ANSI_G, kVK_ANSI_H, kVK_ANSI_I, kVK_ANSI_J, kVK_ANSI_K, kVK_ANSI_L,
+            kVK_ANSI_M, kVK_ANSI_N, kVK_ANSI_O, kVK_ANSI_P, kVK_ANSI_Q, kVK_ANSI_R,
+            kVK_ANSI_S, kVK_ANSI_T, kVK_ANSI_U, kVK_ANSI_V, kVK_ANSI_W, kVK_ANSI_X,
+            kVK_ANSI_Y, kVK_ANSI_Z,
+        };
+        stroke->keycode = keys[ch - 'a'];
+        stroke->shift = false;
+        return true;
+    }
+    if (ch >= 'A' && ch <= 'Z') {
+        if (!ascii_keystroke(static_cast<char16_t>(ch - 'A' + 'a'), stroke)) {
+            return false;
+        }
+        stroke->shift = true;
+        return true;
+    }
+    if (ch >= '0' && ch <= '9') {
+        static const CGKeyCode keys[] = {
+            kVK_ANSI_0, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4,
+            kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9,
+        };
+        stroke->keycode = keys[ch - '0'];
+        stroke->shift = false;
+        return true;
+    }
+
+    switch (ch) {
+        case ' ': stroke->keycode = kVK_Space; stroke->shift = false; return true;
+        case '`': stroke->keycode = kVK_ANSI_Grave; stroke->shift = false; return true;
+        case '~': stroke->keycode = kVK_ANSI_Grave; stroke->shift = true; return true;
+        case '!': stroke->keycode = kVK_ANSI_1; stroke->shift = true; return true;
+        case '@': stroke->keycode = kVK_ANSI_2; stroke->shift = true; return true;
+        case '#': stroke->keycode = kVK_ANSI_3; stroke->shift = true; return true;
+        case '$': stroke->keycode = kVK_ANSI_4; stroke->shift = true; return true;
+        case '%': stroke->keycode = kVK_ANSI_5; stroke->shift = true; return true;
+        case '^': stroke->keycode = kVK_ANSI_6; stroke->shift = true; return true;
+        case '&': stroke->keycode = kVK_ANSI_7; stroke->shift = true; return true;
+        case '*': stroke->keycode = kVK_ANSI_8; stroke->shift = true; return true;
+        case '(': stroke->keycode = kVK_ANSI_9; stroke->shift = true; return true;
+        case ')': stroke->keycode = kVK_ANSI_0; stroke->shift = true; return true;
+        case '-': stroke->keycode = kVK_ANSI_Minus; stroke->shift = false; return true;
+        case '_': stroke->keycode = kVK_ANSI_Minus; stroke->shift = true; return true;
+        case '=': stroke->keycode = kVK_ANSI_Equal; stroke->shift = false; return true;
+        case '+': stroke->keycode = kVK_ANSI_Equal; stroke->shift = true; return true;
+        case '[': stroke->keycode = kVK_ANSI_LeftBracket; stroke->shift = false; return true;
+        case '{': stroke->keycode = kVK_ANSI_LeftBracket; stroke->shift = true; return true;
+        case ']': stroke->keycode = kVK_ANSI_RightBracket; stroke->shift = false; return true;
+        case '}': stroke->keycode = kVK_ANSI_RightBracket; stroke->shift = true; return true;
+        case '\\': stroke->keycode = kVK_ANSI_Backslash; stroke->shift = false; return true;
+        case '|': stroke->keycode = kVK_ANSI_Backslash; stroke->shift = true; return true;
+        case ';': stroke->keycode = kVK_ANSI_Semicolon; stroke->shift = false; return true;
+        case ':': stroke->keycode = kVK_ANSI_Semicolon; stroke->shift = true; return true;
+        case '\'': stroke->keycode = kVK_ANSI_Quote; stroke->shift = false; return true;
+        case '"': stroke->keycode = kVK_ANSI_Quote; stroke->shift = true; return true;
+        case ',': stroke->keycode = kVK_ANSI_Comma; stroke->shift = false; return true;
+        case '<': stroke->keycode = kVK_ANSI_Comma; stroke->shift = true; return true;
+        case '.': stroke->keycode = kVK_ANSI_Period; stroke->shift = false; return true;
+        case '>': stroke->keycode = kVK_ANSI_Period; stroke->shift = true; return true;
+        case '/': stroke->keycode = kVK_ANSI_Slash; stroke->shift = false; return true;
+        case '?': stroke->keycode = kVK_ANSI_Slash; stroke->shift = true; return true;
+        default:
+            return false;
     }
 }
 
@@ -617,12 +755,37 @@ public:
     }
 
     bool send_key(CGKeyCode keycode) {
+        return send_key_with_shift(keycode, false);
+    }
+
+    bool send_key_with_shift(CGKeyCode keycode, bool shift) {
         if (!source_) {
             return false;
+        }
+        CGEventRef shift_down = nullptr;
+        CGEventRef shift_up = nullptr;
+        if (shift) {
+            shift_down = CGEventCreateKeyboardEvent(source_, kVK_Shift, true);
+            shift_up = CGEventCreateKeyboardEvent(source_, kVK_Shift, false);
+            if (!shift_down || !shift_up) {
+                if (shift_down) {
+                    CFRelease(shift_down);
+                }
+                if (shift_up) {
+                    CFRelease(shift_up);
+                }
+                return false;
+            }
         }
         CGEventRef down = CGEventCreateKeyboardEvent(source_, keycode, true);
         CGEventRef up = CGEventCreateKeyboardEvent(source_, keycode, false);
         if (!down || !up) {
+            if (shift_down) {
+                CFRelease(shift_down);
+            }
+            if (shift_up) {
+                CFRelease(shift_up);
+            }
             if (down) {
                 CFRelease(down);
             }
@@ -631,11 +794,31 @@ public:
             }
             return false;
         }
+        if (shift_down) {
+            CGEventPost(kCGHIDEventTap, shift_down);
+        }
         CGEventPost(kCGHIDEventTap, down);
         CGEventPost(kCGHIDEventTap, up);
+        if (shift_up) {
+            CGEventPost(kCGHIDEventTap, shift_up);
+        }
+        if (shift_down) {
+            CFRelease(shift_down);
+        }
+        if (shift_up) {
+            CFRelease(shift_up);
+        }
         CFRelease(down);
         CFRelease(up);
         return true;
+    }
+
+    bool send_ascii_char(char16_t ch) {
+        KeyStroke stroke;
+        if (!ascii_keystroke(ch, &stroke)) {
+            return false;
+        }
+        return send_key_with_shift(stroke.keycode, stroke.shift);
     }
 
     bool send_unicode_units(const char16_t *units, size_t len) {
@@ -710,6 +893,7 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
     size_t col = 1;
     size_t typed = 0;
     FrontApp target = initial_target;
+    InputMode mode = effective_input_mode(opt, stats);
 
     puts("");
     puts("Typing started. Ctrl-C aborts. Esc aborts before the next character.");
@@ -762,8 +946,16 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
             printf("\rProgress: line %zu/%zu", line <= stats.lines ? line : stats.lines, stats.lines);
             fflush(stdout);
             sleep_ms(opt.line_delay_ms);
+        } else if (scalar == '\t') {
+            ok = keyboard.send_key(kVK_Tab);
+            ++col;
+            sleep_ms(opt.delay_ms);
         } else {
-            ok = keyboard.send_unicode_units(&data.text[i], units);
+            if (mode == InputMode::Keys) {
+                ok = keyboard.send_ascii_char(data.text[i]);
+            } else {
+                ok = keyboard.send_unicode_units(&data.text[i], units);
+            }
             ++col;
             sleep_ms(opt.delay_ms);
         }
@@ -804,31 +996,53 @@ static int run_self_test(const Options &opt) {
 }
 
 static int run_debug_input(const Options &opt) {
-    TextData data;
-    NSString *marker = @"TTDBG_MAC Unicode=中 emoji=✓\n";
-    data.text = nsstring_to_u16(marker);
-    data.byte_count = [[marker dataUsingEncoding:NSUTF8StringEncoding] length];
-    data.encoding = "built-in Unicode debug marker";
-    data.source_label = "Debug marker";
-    TextStats stats = analyze_text(data.text);
-    print_summary(data, stats, opt);
-
-    int rc = validate_text(data, stats, opt);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-
     MacKeyboard keyboard;
     if (!keyboard.ok()) {
         fprintf(stderr, "Cannot create CGEventSource.\n");
         return EXIT_INPUT;
     }
     FrontApp target;
-    rc = prepare_target(opt, &target);
+    int rc = prepare_target(opt, &target);
     if (rc != EXIT_OK) {
         return rc;
     }
-    return type_text(keyboard, data, stats, opt, target);
+
+    TextData keys_data;
+    NSString *keys_marker = @"TTDBG_MAC_KEYS abcXYZ 0123 \\ / : ; ' \" []{} () !@#$%^&*\n";
+    keys_data.text = nsstring_to_u16(keys_marker);
+    keys_data.byte_count = [[keys_marker dataUsingEncoding:NSUTF8StringEncoding] length];
+    keys_data.encoding = "built-in ASCII debug marker";
+    keys_data.source_label = "Debug marker: ASCII keys";
+    TextStats keys_stats = analyze_text(keys_data.text);
+
+    Options keys_opt = opt;
+    keys_opt.input_mode = InputMode::Keys;
+    print_summary(keys_data, keys_stats, keys_opt);
+    rc = validate_text(keys_data, keys_stats, keys_opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+    rc = type_text(keyboard, keys_data, keys_stats, keys_opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    TextData unicode_data;
+    NSString *unicode_marker = @"TTDBG_MAC_UNICODE Unicode=中 emoji=✓\n";
+    unicode_data.text = nsstring_to_u16(unicode_marker);
+    unicode_data.byte_count = [[unicode_marker dataUsingEncoding:NSUTF8StringEncoding] length];
+    unicode_data.encoding = "built-in Unicode debug marker";
+    unicode_data.source_label = "Debug marker: Unicode payload";
+    TextStats unicode_stats = analyze_text(unicode_data.text);
+
+    Options unicode_opt = opt;
+    unicode_opt.input_mode = InputMode::Unicode;
+    print_summary(unicode_data, unicode_stats, unicode_opt);
+    rc = validate_text(unicode_data, unicode_stats, unicode_opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+    return type_text(keyboard, unicode_data, unicode_stats, unicode_opt, target);
 }
 
 static int run_diagnose(const Options &opt) {

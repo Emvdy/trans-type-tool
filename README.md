@@ -12,7 +12,7 @@ The Windows tools do not use the clipboard, network, remote files, or any inject
 
 It also includes a macOS command-line tool:
 
-- `trans_type_mac`: native Objective-C++/C++ macOS build. It reads the clipboard by default and types through Unicode `CGEvent` keyboard input.
+- `trans_type_mac`: native Objective-C++/C++ macOS build. It reads the clipboard by default and types through macOS `CGEvent` keyboard input.
 
 The macOS tool reads the local clipboard as an input source, but it does not paste into the target. It still types characters through simulated keyboard events.
 
@@ -82,10 +82,22 @@ This creates `trans_type_mac` for the current Mac architecture.
 
 ## Basic Use On macOS
 
-The macOS tool defaults to clipboard input and Unicode keyboard events:
+The macOS tool defaults to clipboard input and `--input-mode auto`:
 
 ```sh
 ./trans_type_mac
+```
+
+In auto mode, ASCII text is typed as real virtual key presses, which is the mode to use with RDP. If the input contains non-ASCII characters, the tool switches to Unicode `CGEvent` payloads. Some RDP clients ignore those Unicode payloads and forward only the underlying keycode; that makes the remote side see repeated `a`. For RDP, keep the clipboard/input ASCII and use:
+
+```sh
+./trans_type_mac --input-mode keys
+```
+
+For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
+
+```sh
+./trans_type_mac --input-mode unicode
 ```
 
 Useful macOS options:
@@ -93,6 +105,8 @@ Useful macOS options:
 ```sh
 ./trans_type_mac --dry-run
 ./trans_type_mac --delay-ms 50 --line-delay-ms 300
+./trans_type_mac --input-mode keys
+./trans_type_mac --input-mode unicode
 ./trans_type_mac --source file
 ./trans_type_mac --file /path/to/input.txt
 ./trans_type_mac --diagnose
