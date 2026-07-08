@@ -1412,7 +1412,7 @@ static int run_windows_hex_transfer(const TextData &data, const Options &opt) {
     std::string remote_output = lowercase_ascii(opt.windows_hex_output);
     printf("Remote output: %s\n", remote_output.c_str());
     printf("UTF-8 bytes to transfer: %zu\n", bytes.size());
-    printf("This mode types only cmd-safe text plus Ctrl-Z, then runs certutil -decodehex.\n");
+    printf("This mode types only cmd-safe text plus F6/EOF, then runs certutil -decodehex.\n");
     printf("Open a remote cmd.exe or PowerShell prompt. PowerShell is OK; the tool types 'cmd /q /d' first.\n");
     fflush(stdout);
 
@@ -1447,13 +1447,13 @@ static int run_windows_hex_transfer(const TextData &data, const Options &opt) {
         return rc;
     }
 
-    if (!keyboard.send_control_key(kVK_ANSI_Z)) {
-        fprintf(stderr, "Input failed while sending Ctrl-Z to finish copy con.\n");
+    if (!keyboard.send_key(kVK_F6)) {
+        fprintf(stderr, "Input failed while sending F6/EOF to finish copy con.\n");
         return EXIT_INPUT;
     }
     sleep_ms(opt.line_delay_ms);
     if (!keyboard.send_key(kVK_Return)) {
-        fprintf(stderr, "Input failed while sending Enter after Ctrl-Z.\n");
+        fprintf(stderr, "Input failed while sending Enter after F6/EOF.\n");
         return EXIT_INPUT;
     }
     sleep_ms(opt.line_delay_ms);

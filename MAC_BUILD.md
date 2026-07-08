@@ -45,7 +45,7 @@ If both shifted keys and Alt-code fail in RDP, use the file-transfer fallback:
 ./trans_type_mac --windows-hex-output trans.bat
 ```
 
-This types a `cmd /q /d`, `copy con tt.hex`, lowercase hex payload, Ctrl-Z, and `certutil -f -decodehex tt.hex trans.bat` sequence. It relies on remote Windows `certutil`, and creates the file without running it.
+This types a `cmd /q /d`, `copy con tt.hex`, lowercase hex payload, F6/EOF, and `certutil -f -decodehex tt.hex trans.bat` sequence. It relies on remote Windows `certutil`, and creates the file without running it.
 
 For local Unicode testing in TextEdit:
 
