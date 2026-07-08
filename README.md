@@ -88,25 +88,11 @@ The macOS tool defaults to clipboard input and `--input-mode auto`:
 ./trans_type_mac
 ```
 
-In auto mode, ASCII text is typed as real virtual key presses, which is the mode to use with RDP. If the input contains non-ASCII characters, the tool switches to Unicode `CGEvent` payloads. Some RDP clients ignore those Unicode payloads and forward only the underlying keycode; that makes the remote side see repeated `a`. For RDP, keep the clipboard/input ASCII and use:
+In auto mode, simple ASCII text is typed as real virtual key presses, which is the mode to use with RDP. If the input contains non-ASCII characters, the tool switches to Unicode `CGEvent` payloads. Some RDP clients ignore those Unicode payloads and forward only the underlying keycode; that makes the remote side see repeated `a`. For RDP, keep the clipboard/input to ASCII text without the excluded symbols, then use:
 
 ```sh
 ./trans_type_mac --input-mode keys
 ```
-
-If shifted symbols such as `@`, `%`, `^`, `&`, or `|` still arrive as `2`, `5`, `6`, `7`, or `\`, use the slower Windows Alt-code fallback:
-
-```sh
-./trans_type_mac --input-mode altcode
-```
-
-If modifier keys are unreliable too, use the Windows hex transfer mode. It does not type the original symbols directly; it types a lowercase hex payload plus safe `cmd` commands, then asks Windows `certutil` to recreate the file:
-
-```sh
-./trans_type_mac --windows-hex-output trans.bat
-```
-
-Run it while focused in a remote `cmd.exe` or PowerShell prompt. It creates the file but does not run it.
 
 For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
 
@@ -114,28 +100,20 @@ For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
 ./trans_type_mac --input-mode unicode
 ```
 
+The simplified macOS RDP key mode intentionally does not handle `@`, `#`, `%`, or currency symbols. `--dry-run` reports the first unsupported character before typing starts.
+
 Useful macOS options:
 
 ```sh
 ./trans_type_mac --dry-run
 ./trans_type_mac --delay-ms 50 --line-delay-ms 300
 ./trans_type_mac --input-mode keys
-./trans_type_mac --input-mode altcode
 ./trans_type_mac --input-mode unicode
 ./trans_type_mac --source file
 ./trans_type_mac --file /path/to/input.txt
 ./trans_type_mac --diagnose
 ./trans_type_mac --self-test
 ./trans_type_mac --debug-input
-./trans_type_mac --debug-shift
-```
-
-Use `--debug-input` against a safe editor such as Notepad/TextEdit to compare the expected marker printed in the terminal with what appears in the target. It tests common batch/shell symbols including `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, slashes, and shifted number-row symbols through both `keys` and `altcode` modes. If `lower=abc` appears as `LOWER=ABC` and `upper=XYZ` appears as `upper=xyz`, Caps Lock is active in the local or remote session. If letters and digits are correct but symbols differ, the RDP/Windows keyboard layout is not matching the US ANSI key map; set the remote Windows input layout to English (US), or use `--input-mode altcode`.
-
-Use `--debug-shift` to test whether slower Shift timing helps. It types several `SHIFTDBG` markers with different `modifier-delay/key-hold` values. For manual testing, start with:
-
-```sh
-./trans_type_mac --debug-shift --modifier-delay-ms 100 --key-hold-ms 50
 ```
 
 For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in **System Settings > Privacy & Security > Accessibility**. Use `--request-accessibility` if you want macOS to show the permission prompt.
