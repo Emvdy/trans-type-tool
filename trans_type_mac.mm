@@ -49,6 +49,11 @@ enum class InputMode {
     Unicode,
 };
 
+enum class TransferMode {
+    Direct,
+    WindowsHex,
+};
+
 struct Options {
     int delay_ms = DEFAULT_DELAY_MS;
     int line_delay_ms = DEFAULT_LINE_DELAY_MS;
@@ -65,7 +70,9 @@ struct Options {
     SourceKind source = SourceKind::Clipboard;
     EnterMode enter_mode = EnterMode::Key;
     InputMode input_mode = InputMode::Auto;
+    TransferMode transfer_mode = TransferMode::Direct;
     std::filesystem::path file_path;
+    std::string windows_hex_output = "trans.out.txt";
 };
 
 struct TextData {
@@ -109,6 +116,8 @@ static void print_usage() {
     puts("  --input-mode keys     Type ASCII through real virtual keys. Best for RDP");
     puts("  --input-mode altcode  Type ASCII through Windows Alt+numpad codes. Slow fallback");
     puts("  --input-mode unicode  Type through Unicode CGEvent payloads. Best for local macOS apps");
+    puts("  --windows-hex-output PATH");
+    puts("                         Type a cmd/certutil hex transfer that creates PATH");
     puts("  --delay-ms N          Delay after each character. Default: 20");
     puts("  --line-delay-ms N     Delay after each line. Default: 100");
     puts("  --modifier-delay-ms N Delay around Shift/Alt modifier sequences. Default: 8");
@@ -287,6 +296,16 @@ static bool parse_args(int argc, char **argv, Options *opt) {
             return false;
         }
 
+        matched = get_option_value(&i, argc, argv, "--windows-hex-output", &value);
+        if (matched == 1) {
+            opt->transfer_mode = TransferMode::WindowsHex;
+            opt->windows_hex_output = value;
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
         if (strcmp(argv[i], "--ascii-only") == 0) {
             opt->ascii_only = true;
         } else if (strcmp(argv[i], "--dry-run") == 0) {
@@ -344,6 +363,32 @@ static std::u16string nsstring_to_u16(NSString *value) {
 static std::string nsstring_to_utf8(NSString *value) {
     const char *utf8 = [value UTF8String];
     return utf8 ? std::string(utf8) : std::string();
+}
+
+static bool is_safe_remote_path(const std::string &path) {
+    if (path.empty()) {
+        return false;
+    }
+    for (unsigned char ch : path) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+            continue;
+        }
+        if (ch == '.' || ch == '_' || ch == '-' || ch == '/' || ch == '\\') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static std::string lowercase_ascii(const std::string &value) {
+    std::string out = value;
+    for (char &ch : out) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return out;
 }
 
 static void strip_bom(std::u16string *text) {
@@ -456,6 +501,30 @@ static bool read_text_source(const Options &opt, TextData *out, std::string *err
         return read_clipboard_source(opt, out, error);
     }
     return read_file_source(opt, out, error);
+}
+
+static std::vector<unsigned char> text_to_utf8_bytes(const std::u16string &text) {
+    NSString *value = [[NSString alloc] initWithCharacters:reinterpret_cast<const unichar *>(text.data()) length:text.size()];
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    std::vector<unsigned char> out([data length]);
+    if (!out.empty()) {
+        memcpy(out.data(), [data bytes], out.size());
+    }
+    return out;
+}
+
+static std::string bytes_to_certutil_hex(const std::vector<unsigned char> &bytes) {
+    std::string out;
+    char chunk[4];
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        snprintf(chunk, sizeof(chunk), "%02x", static_cast<unsigned int>(bytes[i]));
+        out += chunk;
+        if (i + 1 < bytes.size()) {
+            out += ((i + 1) % 24 == 0) ? '\n' : ' ';
+        }
+    }
+    out += '\n';
+    return out;
 }
 
 static bool is_high_surrogate(char16_t ch) {
@@ -660,17 +729,23 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     printf("Non-ASCII characters: %zu\n", stats.non_ascii_count);
     printf("Delay: %d ms per character, %d ms per line\n", opt.delay_ms, opt.line_delay_ms);
     printf("Modifier delay: %d ms\n", opt.modifier_delay_ms);
-    if (opt.input_mode == InputMode::Auto) {
+    if (opt.transfer_mode == TransferMode::WindowsHex) {
+        printf("Input mode: generated cmd/certutil stream through ASCII virtual keys\n");
+    } else if (opt.input_mode == InputMode::Auto) {
         printf("Input mode: Auto -> %s\n", input_mode_name(mode));
     } else {
         printf("Input mode: %s\n", input_mode_name(mode));
     }
-    if (mode == InputMode::Unicode) {
+    if (opt.transfer_mode == TransferMode::Direct && mode == InputMode::Unicode) {
         printf("RDP note: some RDP clients ignore Unicode CGEvent payloads and may type repeated 'a'. Use --input-mode keys for ASCII text.\n");
     }
     printf("Enter mode: %s\n", opt.enter_mode == EnterMode::Unicode ? "Unicode CR" : "Return key");
     printf("Focus check: %s\n", opt.no_focus_check ? "off" : "on");
     printf("Accessibility check: required before typing\n");
+    if (opt.transfer_mode == TransferMode::WindowsHex) {
+        printf("Transfer mode: Windows cmd/certutil hex file\n");
+        printf("Remote output: %s\n", lowercase_ascii(opt.windows_hex_output).c_str());
+    }
 }
 
 static void sleep_ms(int ms) {
@@ -794,6 +869,46 @@ public:
 
     bool send_key(CGKeyCode keycode) {
         return send_key_with_shift(keycode, false);
+    }
+
+    bool send_control_key(CGKeyCode keycode) {
+        if (!source_) {
+            return false;
+        }
+        CGEventRef ctrl_down = CGEventCreateKeyboardEvent(source_, kVK_Control, true);
+        CGEventRef ctrl_up = CGEventCreateKeyboardEvent(source_, kVK_Control, false);
+        CGEventRef down = CGEventCreateKeyboardEvent(source_, keycode, true);
+        CGEventRef up = CGEventCreateKeyboardEvent(source_, keycode, false);
+        if (!ctrl_down || !ctrl_up || !down || !up) {
+            if (ctrl_down) {
+                CFRelease(ctrl_down);
+            }
+            if (ctrl_up) {
+                CFRelease(ctrl_up);
+            }
+            if (down) {
+                CFRelease(down);
+            }
+            if (up) {
+                CFRelease(up);
+            }
+            return false;
+        }
+
+        CGEventSetFlags(ctrl_down, kCGEventFlagMaskControl);
+        CGEventSetFlags(down, kCGEventFlagMaskControl);
+        CGEventSetFlags(up, kCGEventFlagMaskControl);
+        CGEventPost(kCGHIDEventTap, ctrl_down);
+        sleep_ms(modifier_delay_ms_);
+        CGEventPost(kCGHIDEventTap, down);
+        CGEventPost(kCGHIDEventTap, up);
+        sleep_ms(modifier_delay_ms_);
+        CGEventPost(kCGHIDEventTap, ctrl_up);
+        CFRelease(ctrl_down);
+        CFRelease(ctrl_up);
+        CFRelease(down);
+        CFRelease(up);
+        return true;
     }
 
     bool send_key_with_shift(CGKeyCode keycode, bool shift) {
@@ -1176,6 +1291,105 @@ static int run_debug_input(const Options &opt) {
     return type_text(keyboard, unicode_data, unicode_stats, unicode_opt, target);
 }
 
+static TextData text_data_from_ascii(const std::string &text, const std::string &label) {
+    TextData data;
+    data.text.reserve(text.size());
+    for (unsigned char ch : text) {
+        data.text.push_back(static_cast<char16_t>(ch));
+    }
+    data.byte_count = text.size();
+    data.encoding = "generated ASCII command stream";
+    data.source_label = label;
+    return data;
+}
+
+static int type_generated_ascii(MacKeyboard &keyboard, const std::string &text, const std::string &label, const Options &base_opt, const FrontApp &target) {
+    TextData data = text_data_from_ascii(text, label);
+    TextStats stats = analyze_text(data.text);
+    Options opt = base_opt;
+    opt.input_mode = InputMode::Keys;
+    int rc = validate_text(data, stats, opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+    return type_text(keyboard, data, stats, opt, target);
+}
+
+static int run_windows_hex_transfer(const TextData &data, const Options &opt) {
+    if (!is_safe_remote_path(opt.windows_hex_output)) {
+        fprintf(stderr, "--windows-hex-output must use only letters, digits, '.', '_', '-', '/', or '\\'.\n");
+        fprintf(stderr, "Use a simple relative name such as trans.txt or trans.bat.\n");
+        return EXIT_ARGS;
+    }
+
+    std::vector<unsigned char> bytes = text_to_utf8_bytes(data.text);
+    if (bytes.empty()) {
+        fprintf(stderr, "Input text encoded to empty UTF-8 data.\n");
+        return EXIT_CONTENT;
+    }
+
+    std::string hex_text = bytes_to_certutil_hex(bytes);
+    printf("Windows hex transfer mode.\n");
+    std::string remote_output = lowercase_ascii(opt.windows_hex_output);
+    printf("Remote output: %s\n", remote_output.c_str());
+    printf("UTF-8 bytes to transfer: %zu\n", bytes.size());
+    printf("This mode types only cmd-safe text plus Ctrl-Z, then runs certutil -decodehex.\n");
+    printf("Open a remote cmd.exe or PowerShell prompt. PowerShell is OK; the tool types 'cmd /q /d' first.\n");
+    fflush(stdout);
+
+    if (opt.dry_run) {
+        puts("Dry run passed. No typing was performed.");
+        return EXIT_OK;
+    }
+
+    MacKeyboard keyboard(opt.modifier_delay_ms);
+    if (!keyboard.ok()) {
+        fprintf(stderr, "Cannot create CGEventSource.\n");
+        return EXIT_INPUT;
+    }
+
+    FrontApp target;
+    int rc = prepare_target(opt, &target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    Options keys_opt = opt;
+    keys_opt.input_mode = InputMode::Keys;
+    const std::string hex_name = "tt.hex";
+
+    rc = type_generated_ascii(keyboard, "cmd /q /d\ncopy con " + hex_name + "\n", "Windows hex setup commands", keys_opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    rc = type_generated_ascii(keyboard, hex_text, "Windows hex payload", keys_opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    if (!keyboard.send_control_key(kVK_ANSI_Z)) {
+        fprintf(stderr, "Input failed while sending Ctrl-Z to finish copy con.\n");
+        return EXIT_INPUT;
+    }
+    sleep_ms(opt.line_delay_ms);
+    if (!keyboard.send_key(kVK_Return)) {
+        fprintf(stderr, "Input failed while sending Enter after Ctrl-Z.\n");
+        return EXIT_INPUT;
+    }
+    sleep_ms(opt.line_delay_ms);
+
+    std::string decode = "certutil -f -decodehex " + hex_name + " " + remote_output + "\n";
+    decode += "del " + hex_name + "\n";
+    rc = type_generated_ascii(keyboard, decode, "Windows hex decode commands", keys_opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    puts("Windows hex transfer typing completed. Check the remote output file before running it.");
+    return EXIT_OK;
+}
+
 static int run_diagnose(const Options &opt) {
     printf("Accessibility trusted: %s\n", accessibility_trusted(opt.request_accessibility) ? "yes" : "no");
     print_front_app(frontmost_app());
@@ -1226,6 +1440,10 @@ int main(int argc, char **argv) {
         int rc = validate_text(data, stats, opt);
         if (rc != EXIT_OK) {
             return rc;
+        }
+
+        if (opt.transfer_mode == TransferMode::WindowsHex) {
+            return run_windows_hex_transfer(data, opt);
         }
 
         if (opt.dry_run) {

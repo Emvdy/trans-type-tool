@@ -39,6 +39,14 @@ If shifted symbols such as `@`, `%`, `^`, `&`, or `|` arrive as unshifted keys, 
 ./trans_type_mac --input-mode altcode
 ```
 
+If both shifted keys and Alt-code fail in RDP, use the file-transfer fallback:
+
+```sh
+./trans_type_mac --windows-hex-output trans.bat
+```
+
+This types a `cmd /q /d`, `copy con tt.hex`, lowercase hex payload, Ctrl-Z, and `certutil -f -decodehex tt.hex trans.bat` sequence. It relies on remote Windows `certutil`, and creates the file without running it.
+
 For local Unicode testing in TextEdit:
 
 ```sh
@@ -54,6 +62,7 @@ Useful checks that do not type:
 ./trans_type_mac --input-mode keys --dry-run
 ./trans_type_mac --input-mode altcode --dry-run
 ./trans_type_mac --input-mode unicode --dry-run
+./trans_type_mac --windows-hex-output trans.txt --dry-run
 ```
 
 Use `trans.txt` instead of the clipboard:

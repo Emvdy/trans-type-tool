@@ -100,6 +100,14 @@ If shifted symbols such as `@`, `%`, `^`, `&`, or `|` still arrive as `2`, `5`, 
 ./trans_type_mac --input-mode altcode
 ```
 
+If modifier keys are unreliable too, use the Windows hex transfer mode. It does not type the original symbols directly; it types a lowercase hex payload plus safe `cmd` commands, then asks Windows `certutil` to recreate the file:
+
+```sh
+./trans_type_mac --windows-hex-output trans.bat
+```
+
+Run it while focused in a remote `cmd.exe` or PowerShell prompt. It creates the file but does not run it.
+
 For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
 
 ```sh
