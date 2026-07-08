@@ -28,7 +28,8 @@ static constexpr int EXIT_INPUT = 7;
 static constexpr int DEFAULT_DELAY_MS = 20;
 static constexpr int DEFAULT_LINE_DELAY_MS = 100;
 static constexpr int DEFAULT_START_DELAY_SEC = 5;
-static constexpr int DEFAULT_MODIFIER_DELAY_MS = 8;
+static constexpr int DEFAULT_MODIFIER_DELAY_MS = 50;
+static constexpr int DEFAULT_KEY_HOLD_MS = 20;
 static constexpr int DEFAULT_MAX_BYTES = 1024 * 1024;
 static constexpr int ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024;
 
@@ -59,12 +60,14 @@ struct Options {
     int line_delay_ms = DEFAULT_LINE_DELAY_MS;
     int start_delay_sec = DEFAULT_START_DELAY_SEC;
     int modifier_delay_ms = DEFAULT_MODIFIER_DELAY_MS;
+    int key_hold_ms = DEFAULT_KEY_HOLD_MS;
     int max_bytes = DEFAULT_MAX_BYTES;
     bool ascii_only = false;
     bool dry_run = false;
     bool diagnose = false;
     bool self_test = false;
     bool debug_input = false;
+    bool debug_shift = false;
     bool no_focus_check = false;
     bool request_accessibility = false;
     SourceKind source = SourceKind::Clipboard;
@@ -120,7 +123,8 @@ static void print_usage() {
     puts("                         Type a cmd/certutil hex transfer that creates PATH");
     puts("  --delay-ms N          Delay after each character. Default: 20");
     puts("  --line-delay-ms N     Delay after each line. Default: 100");
-    puts("  --modifier-delay-ms N Delay around Shift/Alt modifier sequences. Default: 8");
+    puts("  --modifier-delay-ms N Delay around Shift/Alt modifier sequences. Default: 50");
+    puts("  --key-hold-ms N       Delay between key down and key up. Default: 20");
     puts("  --start-delay-sec N   Countdown before typing. Default: 5");
     puts("  --max-bytes N         Maximum input size. Default: 1048576");
     puts("  --ascii-only          Refuse to type non-ASCII characters");
@@ -133,6 +137,7 @@ static void print_usage() {
     puts("  --diagnose            Show source, focused app, and permission status without typing");
     puts("  --self-test           Check permission and send a harmless Shift key event");
     puts("  --debug-input         Type visible keys and Unicode test markers into the focused target");
+    puts("  --debug-shift         Type a short Shift-combination marker for RDP timing tests");
     puts("  --help                Show this help");
     puts("");
     puts("Controls while running:");
@@ -214,6 +219,18 @@ static bool parse_args(int argc, char **argv, Options *opt) {
         if (matched == 1) {
             if (!parse_int_range(value, 0, 500, &opt->modifier_delay_ms)) {
                 fprintf(stderr, "Invalid --modifier-delay-ms value: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--key-hold-ms", &value);
+        if (matched == 1) {
+            if (!parse_int_range(value, 0, 500, &opt->key_hold_ms)) {
+                fprintf(stderr, "Invalid --key-hold-ms value: %s\n", value);
                 return false;
             }
             continue;
@@ -316,6 +333,8 @@ static bool parse_args(int argc, char **argv, Options *opt) {
             opt->self_test = true;
         } else if (strcmp(argv[i], "--debug-input") == 0) {
             opt->debug_input = true;
+        } else if (strcmp(argv[i], "--debug-shift") == 0) {
+            opt->debug_shift = true;
         } else if (strcmp(argv[i], "--no-focus-check") == 0) {
             opt->no_focus_check = true;
         } else if (strcmp(argv[i], "--request-accessibility") == 0) {
@@ -729,6 +748,7 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     printf("Non-ASCII characters: %zu\n", stats.non_ascii_count);
     printf("Delay: %d ms per character, %d ms per line\n", opt.delay_ms, opt.line_delay_ms);
     printf("Modifier delay: %d ms\n", opt.modifier_delay_ms);
+    printf("Key hold: %d ms\n", opt.key_hold_ms);
     if (opt.transfer_mode == TransferMode::WindowsHex) {
         printf("Input mode: generated cmd/certutil stream through ASCII virtual keys\n");
     } else if (opt.input_mode == InputMode::Auto) {
@@ -850,7 +870,7 @@ static bool escape_pressed() {
 
 class MacKeyboard {
 public:
-    explicit MacKeyboard(int modifier_delay_ms) : modifier_delay_ms_(modifier_delay_ms) {
+    MacKeyboard(int modifier_delay_ms, int key_hold_ms) : modifier_delay_ms_(modifier_delay_ms), key_hold_ms_(key_hold_ms) {
         source_ = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
         if (source_) {
             CGEventSourceSetLocalEventsSuppressionInterval(source_, 0);
@@ -901,6 +921,7 @@ public:
         CGEventPost(kCGHIDEventTap, ctrl_down);
         sleep_ms(modifier_delay_ms_);
         CGEventPost(kCGHIDEventTap, down);
+        sleep_ms(key_hold_ms_);
         CGEventPost(kCGHIDEventTap, up);
         sleep_ms(modifier_delay_ms_);
         CGEventPost(kCGHIDEventTap, ctrl_up);
@@ -957,6 +978,7 @@ public:
             sleep_ms(modifier_delay_ms_);
         }
         CGEventPost(kCGHIDEventTap, down);
+        sleep_ms(key_hold_ms_);
         CGEventPost(kCGHIDEventTap, up);
         if (shift_up) {
             sleep_ms(modifier_delay_ms_);
@@ -1026,6 +1048,7 @@ public:
             CGEventSetFlags(down, kCGEventFlagMaskAlternate);
             CGEventSetFlags(up, kCGEventFlagMaskAlternate);
             CGEventPost(kCGHIDEventTap, down);
+            sleep_ms(key_hold_ms_);
             CGEventPost(kCGHIDEventTap, up);
             CFRelease(down);
             CFRelease(up);
@@ -1056,6 +1079,7 @@ public:
         CGEventKeyboardSetUnicodeString(down, static_cast<UniCharCount>(len), reinterpret_cast<const UniChar *>(units));
         CGEventKeyboardSetUnicodeString(up, static_cast<UniCharCount>(len), reinterpret_cast<const UniChar *>(units));
         CGEventPost(kCGHIDEventTap, down);
+        sleep_ms(key_hold_ms_);
         CGEventPost(kCGHIDEventTap, up);
         CFRelease(down);
         CFRelease(up);
@@ -1065,6 +1089,7 @@ public:
 private:
     CGEventSourceRef source_ = nullptr;
     int modifier_delay_ms_ = DEFAULT_MODIFIER_DELAY_MS;
+    int key_hold_ms_ = DEFAULT_KEY_HOLD_MS;
 };
 
 static int run_countdown(int seconds) {
@@ -1201,7 +1226,7 @@ static int run_self_test(const Options &opt) {
         fprintf(stderr, "Self-test failed before input: Accessibility permission is not enabled.\n");
         return EXIT_INPUT;
     }
-    MacKeyboard keyboard(opt.modifier_delay_ms);
+    MacKeyboard keyboard(opt.modifier_delay_ms, opt.key_hold_ms);
     if (!keyboard.ok()) {
         fprintf(stderr, "Self-test failed: cannot create CGEventSource.\n");
         return EXIT_INPUT;
@@ -1269,7 +1294,7 @@ static int run_debug_input(const Options &opt) {
     printf("Expected Unicode payload marker:\n%s\n", nsstring_to_utf8(unicode_marker).c_str());
     fflush(stdout);
 
-    MacKeyboard keyboard(opt.modifier_delay_ms);
+    MacKeyboard keyboard(opt.modifier_delay_ms, opt.key_hold_ms);
     if (!keyboard.ok()) {
         fprintf(stderr, "Cannot create CGEventSource.\n");
         return EXIT_INPUT;
@@ -1315,6 +1340,60 @@ static int type_generated_ascii(MacKeyboard &keyboard, const std::string &text, 
     return type_text(keyboard, data, stats, opt, target);
 }
 
+static int run_debug_shift(const Options &opt) {
+    struct Timing {
+        int modifier_delay_ms;
+        int key_hold_ms;
+    };
+
+    Timing timings[] = {
+        {opt.modifier_delay_ms, opt.key_hold_ms},
+        {80, 40},
+        {150, 80},
+        {300, 120},
+    };
+
+    puts("Shift timing debug mode.");
+    puts("Run this against a safe editor such as remote Notepad, not an active shell.");
+    puts("Expected markers:");
+    for (const Timing &timing : timings) {
+        printf("SHIFTDBG_M%03d_H%03d lower=abc upper=XYZ shifted=!@#$%%^&*()_+ braces={} pipe=| quotes='\" slash=\\/ END\n",
+               timing.modifier_delay_ms, timing.key_hold_ms);
+    }
+    fflush(stdout);
+
+    FrontApp target;
+    int rc = prepare_target(opt, &target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    for (const Timing &timing : timings) {
+        Options timing_opt = opt;
+        timing_opt.input_mode = InputMode::Keys;
+        timing_opt.modifier_delay_ms = timing.modifier_delay_ms;
+        timing_opt.key_hold_ms = timing.key_hold_ms;
+
+        MacKeyboard keyboard(timing_opt.modifier_delay_ms, timing_opt.key_hold_ms);
+        if (!keyboard.ok()) {
+            fprintf(stderr, "Cannot create CGEventSource.\n");
+            return EXIT_INPUT;
+        }
+
+        char marker[256];
+        snprintf(marker, sizeof(marker),
+                 "SHIFTDBG_M%03d_H%03d lower=abc upper=XYZ shifted=!@#$%%^&*()_+ braces={} pipe=| quotes='\" slash=\\/ END ",
+                 timing.modifier_delay_ms, timing.key_hold_ms);
+        rc = type_generated_ascii(keyboard, marker, "Shift timing debug marker", timing_opt, target);
+        if (rc != EXIT_OK) {
+            return rc;
+        }
+    }
+
+    puts("Shift timing debug completed. Compare each SHIFTDBG line with the expected marker printed above.");
+    return EXIT_OK;
+}
+
 static int run_windows_hex_transfer(const TextData &data, const Options &opt) {
     if (!is_safe_remote_path(opt.windows_hex_output)) {
         fprintf(stderr, "--windows-hex-output must use only letters, digits, '.', '_', '-', '/', or '\\'.\n");
@@ -1342,7 +1421,7 @@ static int run_windows_hex_transfer(const TextData &data, const Options &opt) {
         return EXIT_OK;
     }
 
-    MacKeyboard keyboard(opt.modifier_delay_ms);
+    MacKeyboard keyboard(opt.modifier_delay_ms, opt.key_hold_ms);
     if (!keyboard.ok()) {
         fprintf(stderr, "Cannot create CGEventSource.\n");
         return EXIT_INPUT;
@@ -1423,6 +1502,10 @@ int main(int argc, char **argv) {
             return run_debug_input(opt);
         }
 
+        if (opt.debug_shift) {
+            return run_debug_shift(opt);
+        }
+
         if (opt.diagnose) {
             return run_diagnose(opt);
         }
@@ -1451,7 +1534,7 @@ int main(int argc, char **argv) {
             return EXIT_OK;
         }
 
-        MacKeyboard keyboard(opt.modifier_delay_ms);
+        MacKeyboard keyboard(opt.modifier_delay_ms, opt.key_hold_ms);
         if (!keyboard.ok()) {
             fprintf(stderr, "Cannot create CGEventSource.\n");
             return EXIT_INPUT;

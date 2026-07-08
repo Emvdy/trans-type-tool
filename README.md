@@ -127,9 +127,16 @@ Useful macOS options:
 ./trans_type_mac --diagnose
 ./trans_type_mac --self-test
 ./trans_type_mac --debug-input
+./trans_type_mac --debug-shift
 ```
 
 Use `--debug-input` against a safe editor such as Notepad/TextEdit to compare the expected marker printed in the terminal with what appears in the target. It tests common batch/shell symbols including `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, slashes, and shifted number-row symbols through both `keys` and `altcode` modes. If `lower=abc` appears as `LOWER=ABC` and `upper=XYZ` appears as `upper=xyz`, Caps Lock is active in the local or remote session. If letters and digits are correct but symbols differ, the RDP/Windows keyboard layout is not matching the US ANSI key map; set the remote Windows input layout to English (US), or use `--input-mode altcode`.
+
+Use `--debug-shift` to test whether slower Shift timing helps. It types several `SHIFTDBG` markers with different `modifier-delay/key-hold` values. For manual testing, start with:
+
+```sh
+./trans_type_mac --debug-shift --modifier-delay-ms 100 --key-hold-ms 50
+```
 
 For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in **System Settings > Privacy & Security > Accessibility**. Use `--request-accessibility` if you want macOS to show the permission prompt.
 

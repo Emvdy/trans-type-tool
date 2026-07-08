@@ -88,11 +88,18 @@ Visible input debug:
 
 ```sh
 ./trans_type_mac --debug-input
+./trans_type_mac --debug-shift
 ```
 
 Run this against a safe target such as Notepad inside RDP or local TextEdit. The tool prints the expected debug marker before the countdown, then types an ASCII-keys marker, a Windows Alt-code marker, and a Unicode-payload marker. The ASCII markers include common batch/shell symbols such as `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, and slashes.
 
 If `lower=abc` appears as `LOWER=ABC` and `upper=XYZ` appears as `upper=xyz`, Caps Lock is active in the local or remote session. If letters and digits are correct but symbols differ, the issue is keyboard layout translation in the RDP/remote Windows session. Use English (US) on the remote Windows side for this tool's `--input-mode keys` path, or use `--input-mode altcode`.
+
+Use `--debug-shift` when you suspect timing. It prints and types several `SHIFTDBG` markers with progressively slower Shift timing. A targeted manual run is:
+
+```sh
+./trans_type_mac --debug-shift --modifier-delay-ms 100 --key-hold-ms 50
+```
 
 If `--self-test` reports `Accessibility trusted: no`, enable Accessibility permission before expecting typing to work.
 
