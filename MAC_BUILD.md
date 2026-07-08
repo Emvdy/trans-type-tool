@@ -33,6 +33,12 @@ For RDP, keep the input ASCII and use:
 ./trans_type_mac --input-mode keys
 ```
 
+If shifted symbols such as `@`, `%`, `^`, `&`, or `|` arrive as unshifted keys, use the slower Windows Alt-code fallback:
+
+```sh
+./trans_type_mac --input-mode altcode
+```
+
 For local Unicode testing in TextEdit:
 
 ```sh
@@ -46,6 +52,7 @@ Useful checks that do not type:
 ./trans_type_mac --dry-run --source file
 ./trans_type_mac --diagnose
 ./trans_type_mac --input-mode keys --dry-run
+./trans_type_mac --input-mode altcode --dry-run
 ./trans_type_mac --input-mode unicode --dry-run
 ```
 
@@ -74,9 +81,9 @@ Visible input debug:
 ./trans_type_mac --debug-input
 ```
 
-Run this against a safe target such as Notepad inside RDP or local TextEdit. The tool prints the expected debug marker before the countdown, then types an ASCII-keys marker and a Unicode-payload marker. The ASCII marker includes common batch/shell symbols such as `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, and slashes.
+Run this against a safe target such as Notepad inside RDP or local TextEdit. The tool prints the expected debug marker before the countdown, then types an ASCII-keys marker, a Windows Alt-code marker, and a Unicode-payload marker. The ASCII markers include common batch/shell symbols such as `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, and slashes.
 
-If letters and digits are correct but symbols differ, the issue is keyboard layout translation in the RDP/remote Windows session. Use English (US) on the remote Windows side for this tool's `--input-mode keys` path, or avoid fragile symbols by sending encoded ASCII and decoding it remotely.
+If `lower=abc` appears as `LOWER=ABC` and `upper=XYZ` appears as `upper=xyz`, Caps Lock is active in the local or remote session. If letters and digits are correct but symbols differ, the issue is keyboard layout translation in the RDP/remote Windows session. Use English (US) on the remote Windows side for this tool's `--input-mode keys` path, or use `--input-mode altcode`.
 
 If `--self-test` reports `Accessibility trusted: no`, enable Accessibility permission before expecting typing to work.
 

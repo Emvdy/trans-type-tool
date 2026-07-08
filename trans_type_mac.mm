@@ -28,6 +28,7 @@ static constexpr int EXIT_INPUT = 7;
 static constexpr int DEFAULT_DELAY_MS = 20;
 static constexpr int DEFAULT_LINE_DELAY_MS = 100;
 static constexpr int DEFAULT_START_DELAY_SEC = 5;
+static constexpr int DEFAULT_MODIFIER_DELAY_MS = 8;
 static constexpr int DEFAULT_MAX_BYTES = 1024 * 1024;
 static constexpr int ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024;
 
@@ -44,6 +45,7 @@ enum class EnterMode {
 enum class InputMode {
     Auto,
     Keys,
+    AltCode,
     Unicode,
 };
 
@@ -51,6 +53,7 @@ struct Options {
     int delay_ms = DEFAULT_DELAY_MS;
     int line_delay_ms = DEFAULT_LINE_DELAY_MS;
     int start_delay_sec = DEFAULT_START_DELAY_SEC;
+    int modifier_delay_ms = DEFAULT_MODIFIER_DELAY_MS;
     int max_bytes = DEFAULT_MAX_BYTES;
     bool ascii_only = false;
     bool dry_run = false;
@@ -104,9 +107,11 @@ static void print_usage() {
     puts("  --file PATH           Read text from PATH. Implies --source file");
     puts("  --input-mode auto     ASCII virtual keys when possible, Unicode otherwise. Default");
     puts("  --input-mode keys     Type ASCII through real virtual keys. Best for RDP");
+    puts("  --input-mode altcode  Type ASCII through Windows Alt+numpad codes. Slow fallback");
     puts("  --input-mode unicode  Type through Unicode CGEvent payloads. Best for local macOS apps");
     puts("  --delay-ms N          Delay after each character. Default: 20");
     puts("  --line-delay-ms N     Delay after each line. Default: 100");
+    puts("  --modifier-delay-ms N Delay around Shift/Alt modifier sequences. Default: 8");
     puts("  --start-delay-sec N   Countdown before typing. Default: 5");
     puts("  --max-bytes N         Maximum input size. Default: 1048576");
     puts("  --ascii-only          Refuse to type non-ASCII characters");
@@ -196,6 +201,18 @@ static bool parse_args(int argc, char **argv, Options *opt) {
             return false;
         }
 
+        matched = get_option_value(&i, argc, argv, "--modifier-delay-ms", &value);
+        if (matched == 1) {
+            if (!parse_int_range(value, 0, 500, &opt->modifier_delay_ms)) {
+                fprintf(stderr, "Invalid --modifier-delay-ms value: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
         matched = get_option_value(&i, argc, argv, "--max-bytes", &value);
         if (matched == 1) {
             if (!parse_int_range(value, 1, ABSOLUTE_MAX_BYTES, &opt->max_bytes)) {
@@ -256,6 +273,8 @@ static bool parse_args(int argc, char **argv, Options *opt) {
                 opt->input_mode = InputMode::Auto;
             } else if (strcmp(value, "keys") == 0) {
                 opt->input_mode = InputMode::Keys;
+            } else if (strcmp(value, "altcode") == 0) {
+                opt->input_mode = InputMode::AltCode;
             } else if (strcmp(value, "unicode") == 0) {
                 opt->input_mode = InputMode::Unicode;
             } else {
@@ -572,11 +591,11 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         fprintf(stderr, "--ascii-only is enabled, but input has non-ASCII characters. First one at line %zu, column %zu.\n", line, col);
         return EXIT_CONTENT;
     }
-    if (opt.input_mode == InputMode::Keys && stats.non_ascii_count > 0) {
+    if ((opt.input_mode == InputMode::Keys || opt.input_mode == InputMode::AltCode) && stats.non_ascii_count > 0) {
         size_t line = 0;
         size_t col = 0;
         line_col_for_index(data.text, stats.first_non_ascii, &line, &col);
-        fprintf(stderr, "--input-mode keys can only type ASCII. First non-ASCII character is at line %zu, column %zu.\n", line, col);
+        fprintf(stderr, "The selected ASCII input mode can only type ASCII. First non-ASCII character is at line %zu, column %zu.\n", line, col);
         fprintf(stderr, "Use --input-mode unicode for local macOS apps that accept Unicode CGEvent payloads.\n");
         return EXIT_CONTENT;
     }
@@ -596,6 +615,8 @@ static const char *input_mode_name(InputMode mode) {
             return "Auto";
         case InputMode::Keys:
             return "ASCII virtual keys";
+        case InputMode::AltCode:
+            return "Windows Alt-code keypad ASCII";
         case InputMode::Unicode:
             return "Unicode CGEvent payloads";
     }
@@ -638,6 +659,7 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     printf("Lines: %zu\n", stats.lines);
     printf("Non-ASCII characters: %zu\n", stats.non_ascii_count);
     printf("Delay: %d ms per character, %d ms per line\n", opt.delay_ms, opt.line_delay_ms);
+    printf("Modifier delay: %d ms\n", opt.modifier_delay_ms);
     if (opt.input_mode == InputMode::Auto) {
         printf("Input mode: Auto -> %s\n", input_mode_name(mode));
     } else {
@@ -731,13 +753,29 @@ static bool ascii_keystroke(char16_t ch, KeyStroke *stroke) {
     }
 }
 
+static bool keypad_digit_key(char digit, CGKeyCode *keycode) {
+    switch (digit) {
+        case '0': *keycode = kVK_ANSI_Keypad0; return true;
+        case '1': *keycode = kVK_ANSI_Keypad1; return true;
+        case '2': *keycode = kVK_ANSI_Keypad2; return true;
+        case '3': *keycode = kVK_ANSI_Keypad3; return true;
+        case '4': *keycode = kVK_ANSI_Keypad4; return true;
+        case '5': *keycode = kVK_ANSI_Keypad5; return true;
+        case '6': *keycode = kVK_ANSI_Keypad6; return true;
+        case '7': *keycode = kVK_ANSI_Keypad7; return true;
+        case '8': *keycode = kVK_ANSI_Keypad8; return true;
+        case '9': *keycode = kVK_ANSI_Keypad9; return true;
+        default: return false;
+    }
+}
+
 static bool escape_pressed() {
     return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, kVK_Escape);
 }
 
 class MacKeyboard {
 public:
-    MacKeyboard() {
+    explicit MacKeyboard(int modifier_delay_ms) : modifier_delay_ms_(modifier_delay_ms) {
         source_ = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
         if (source_) {
             CGEventSourceSetLocalEventsSuppressionInterval(source_, 0);
@@ -801,10 +839,12 @@ public:
         }
         if (shift_down) {
             CGEventPost(kCGHIDEventTap, shift_down);
+            sleep_ms(modifier_delay_ms_);
         }
         CGEventPost(kCGHIDEventTap, down);
         CGEventPost(kCGHIDEventTap, up);
         if (shift_up) {
+            sleep_ms(modifier_delay_ms_);
             CGEventPost(kCGHIDEventTap, shift_up);
         }
         if (shift_down) {
@@ -824,6 +864,63 @@ public:
             return false;
         }
         return send_key_with_shift(stroke.keycode, stroke.shift);
+    }
+
+    bool send_alt_code(char16_t ch) {
+        if (!source_ || ch > 0x7F) {
+            return false;
+        }
+
+        CGEventRef alt_down = CGEventCreateKeyboardEvent(source_, kVK_Option, true);
+        CGEventRef alt_up = CGEventCreateKeyboardEvent(source_, kVK_Option, false);
+        if (!alt_down || !alt_up) {
+            if (alt_down) {
+                CFRelease(alt_down);
+            }
+            if (alt_up) {
+                CFRelease(alt_up);
+            }
+            return false;
+        }
+
+        CGEventSetFlags(alt_down, kCGEventFlagMaskAlternate);
+        CGEventPost(kCGHIDEventTap, alt_down);
+        sleep_ms(modifier_delay_ms_);
+
+        std::string digits = std::to_string(static_cast<unsigned int>(ch));
+        for (char digit : digits) {
+            CGKeyCode keycode = 0;
+            if (!keypad_digit_key(digit, &keycode)) {
+                CFRelease(alt_down);
+                CFRelease(alt_up);
+                return false;
+            }
+            CGEventRef down = CGEventCreateKeyboardEvent(source_, keycode, true);
+            CGEventRef up = CGEventCreateKeyboardEvent(source_, keycode, false);
+            if (!down || !up) {
+                if (down) {
+                    CFRelease(down);
+                }
+                if (up) {
+                    CFRelease(up);
+                }
+                CFRelease(alt_down);
+                CFRelease(alt_up);
+                return false;
+            }
+            CGEventSetFlags(down, kCGEventFlagMaskAlternate);
+            CGEventSetFlags(up, kCGEventFlagMaskAlternate);
+            CGEventPost(kCGHIDEventTap, down);
+            CGEventPost(kCGHIDEventTap, up);
+            CFRelease(down);
+            CFRelease(up);
+            sleep_ms(modifier_delay_ms_);
+        }
+
+        CGEventPost(kCGHIDEventTap, alt_up);
+        CFRelease(alt_down);
+        CFRelease(alt_up);
+        return true;
     }
 
     bool send_unicode_units(const char16_t *units, size_t len) {
@@ -852,6 +949,7 @@ public:
 
 private:
     CGEventSourceRef source_ = nullptr;
+    int modifier_delay_ms_ = DEFAULT_MODIFIER_DELAY_MS;
 };
 
 static int run_countdown(int seconds) {
@@ -958,6 +1056,8 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
         } else {
             if (mode == InputMode::Keys) {
                 ok = keyboard.send_ascii_char(data.text[i]);
+            } else if (mode == InputMode::AltCode) {
+                ok = keyboard.send_alt_code(data.text[i]);
             } else {
                 ok = keyboard.send_unicode_units(&data.text[i], units);
             }
@@ -986,7 +1086,7 @@ static int run_self_test(const Options &opt) {
         fprintf(stderr, "Self-test failed before input: Accessibility permission is not enabled.\n");
         return EXIT_INPUT;
     }
-    MacKeyboard keyboard;
+    MacKeyboard keyboard(opt.modifier_delay_ms);
     if (!keyboard.ok()) {
         fprintf(stderr, "Self-test failed: cannot create CGEventSource.\n");
         return EXIT_INPUT;
@@ -1017,6 +1117,22 @@ static int run_debug_input(const Options &opt) {
         return rc;
     }
 
+    TextData altcode_data;
+    NSString *altcode_marker = @" TTDBG_ALTCODE_BEGIN email=a@b.com symbols=!@#$%^&*()_+[]{}|;:'\"<>,.?/\\ END ";
+    altcode_data.text = nsstring_to_u16(altcode_marker);
+    altcode_data.byte_count = [[altcode_marker dataUsingEncoding:NSUTF8StringEncoding] length];
+    altcode_data.encoding = "built-in ASCII Alt-code debug marker";
+    altcode_data.source_label = "Debug marker: Windows Alt-code ASCII";
+    TextStats altcode_stats = analyze_text(altcode_data.text);
+
+    Options altcode_opt = opt;
+    altcode_opt.input_mode = InputMode::AltCode;
+    print_summary(altcode_data, altcode_stats, altcode_opt);
+    rc = validate_text(altcode_data, altcode_stats, altcode_opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
     TextData unicode_data;
     NSString *unicode_marker = @" TTDBG_UNICODE_BEGIN Unicode=中 check=✓ END ";
     unicode_data.text = nsstring_to_u16(unicode_marker);
@@ -1034,10 +1150,11 @@ static int run_debug_input(const Options &opt) {
     }
 
     printf("Expected ASCII keys marker:\n%s\n", nsstring_to_utf8(keys_marker).c_str());
+    printf("Expected Windows Alt-code marker:\n%s\n", nsstring_to_utf8(altcode_marker).c_str());
     printf("Expected Unicode payload marker:\n%s\n", nsstring_to_utf8(unicode_marker).c_str());
     fflush(stdout);
 
-    MacKeyboard keyboard;
+    MacKeyboard keyboard(opt.modifier_delay_ms);
     if (!keyboard.ok()) {
         fprintf(stderr, "Cannot create CGEventSource.\n");
         return EXIT_INPUT;
@@ -1049,6 +1166,10 @@ static int run_debug_input(const Options &opt) {
     }
 
     rc = type_text(keyboard, keys_data, keys_stats, keys_opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+    rc = type_text(keyboard, altcode_data, altcode_stats, altcode_opt, target);
     if (rc != EXIT_OK) {
         return rc;
     }
@@ -1112,7 +1233,7 @@ int main(int argc, char **argv) {
             return EXIT_OK;
         }
 
-        MacKeyboard keyboard;
+        MacKeyboard keyboard(opt.modifier_delay_ms);
         if (!keyboard.ok()) {
             fprintf(stderr, "Cannot create CGEventSource.\n");
             return EXIT_INPUT;

@@ -94,6 +94,12 @@ In auto mode, ASCII text is typed as real virtual key presses, which is the mode
 ./trans_type_mac --input-mode keys
 ```
 
+If shifted symbols such as `@`, `%`, `^`, `&`, or `|` still arrive as `2`, `5`, `6`, `7`, or `\`, use the slower Windows Alt-code fallback:
+
+```sh
+./trans_type_mac --input-mode altcode
+```
+
 For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
 
 ```sh
@@ -106,6 +112,7 @@ Useful macOS options:
 ./trans_type_mac --dry-run
 ./trans_type_mac --delay-ms 50 --line-delay-ms 300
 ./trans_type_mac --input-mode keys
+./trans_type_mac --input-mode altcode
 ./trans_type_mac --input-mode unicode
 ./trans_type_mac --source file
 ./trans_type_mac --file /path/to/input.txt
@@ -114,7 +121,7 @@ Useful macOS options:
 ./trans_type_mac --debug-input
 ```
 
-Use `--debug-input` against a safe editor such as Notepad/TextEdit to compare the expected marker printed in the terminal with what appears in the target. It tests common batch/shell symbols including `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, slashes, and shifted number-row symbols. If letters and digits are correct but symbols differ, the RDP/Windows keyboard layout is not matching the US ANSI key map; set the remote Windows input layout to English (US), or keep scripts encoded in safer ASCII forms that avoid those symbols.
+Use `--debug-input` against a safe editor such as Notepad/TextEdit to compare the expected marker printed in the terminal with what appears in the target. It tests common batch/shell symbols including `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, slashes, and shifted number-row symbols through both `keys` and `altcode` modes. If `lower=abc` appears as `LOWER=ABC` and `upper=XYZ` appears as `upper=xyz`, Caps Lock is active in the local or remote session. If letters and digits are correct but symbols differ, the RDP/Windows keyboard layout is not matching the US ANSI key map; set the remote Windows input layout to English (US), or use `--input-mode altcode`.
 
 For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in **System Settings > Privacy & Security > Accessibility**. Use `--request-accessibility` if you want macOS to show the permission prompt.
 
