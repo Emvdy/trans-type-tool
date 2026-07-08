@@ -74,7 +74,11 @@ Visible input debug:
 ./trans_type_mac --debug-input
 ```
 
-Run this against a safe target such as TextEdit first. If `--self-test` reports `Accessibility trusted: no`, enable Accessibility permission before expecting typing to work.
+Run this against a safe target such as Notepad inside RDP or local TextEdit. The tool prints the expected debug marker before the countdown, then types an ASCII-keys marker and a Unicode-payload marker. The ASCII marker includes common batch/shell symbols such as `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, and slashes.
+
+If letters and digits are correct but symbols differ, the issue is keyboard layout translation in the RDP/remote Windows session. Use English (US) on the remote Windows side for this tool's `--input-mode keys` path, or avoid fragile symbols by sending encoded ASCII and decoding it remotely.
+
+If `--self-test` reports `Accessibility trusted: no`, enable Accessibility permission before expecting typing to work.
 
 ## Recommended path: GitHub Actions
 

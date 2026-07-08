@@ -114,6 +114,8 @@ Useful macOS options:
 ./trans_type_mac --debug-input
 ```
 
+Use `--debug-input` against a safe editor such as Notepad/TextEdit to compare the expected marker printed in the terminal with what appears in the target. It tests common batch/shell symbols including `@`, `%`, `^`, `&`, `|`, quotes, brackets, braces, slashes, and shifted number-row symbols. If letters and digits are correct but symbols differ, the RDP/Windows keyboard layout is not matching the US ANSI key map; set the remote Windows input layout to English (US), or keep scripts encoded in safer ASCII forms that avoid those symbols.
+
 For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in **System Settings > Privacy & Security > Accessibility**. Use `--request-accessibility` if you want macOS to show the permission prompt.
 
 ## Basic Use On Windows

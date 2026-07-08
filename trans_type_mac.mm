@@ -776,6 +776,7 @@ public:
                 }
                 return false;
             }
+            CGEventSetFlags(shift_down, kCGEventFlagMaskShift);
         }
         CGEventRef down = CGEventCreateKeyboardEvent(source_, keycode, true);
         CGEventRef up = CGEventCreateKeyboardEvent(source_, keycode, false);
@@ -793,6 +794,10 @@ public:
                 CFRelease(up);
             }
             return false;
+        }
+        if (shift) {
+            CGEventSetFlags(down, kCGEventFlagMaskShift);
+            CGEventSetFlags(up, kCGEventFlagMaskShift);
         }
         if (shift_down) {
             CGEventPost(kCGHIDEventTap, shift_down);
@@ -996,19 +1001,8 @@ static int run_self_test(const Options &opt) {
 }
 
 static int run_debug_input(const Options &opt) {
-    MacKeyboard keyboard;
-    if (!keyboard.ok()) {
-        fprintf(stderr, "Cannot create CGEventSource.\n");
-        return EXIT_INPUT;
-    }
-    FrontApp target;
-    int rc = prepare_target(opt, &target);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-
     TextData keys_data;
-    NSString *keys_marker = @"TTDBG_MAC_KEYS abcXYZ 0123 \\ / : ; ' \" []{} () !@#$%^&*\n";
+    NSString *keys_marker = @"TTDBG_KEYS_BEGIN lower=abc upper=XYZ digits=0123456789 shifted=!@#$%^&*()_+ brackets=[]{} slash=\\/ pipe=| quotes='\" colon=:; angle=<> backtick=`~ email=a@b.com percent=% caret=^ amp=& END ";
     keys_data.text = nsstring_to_u16(keys_marker);
     keys_data.byte_count = [[keys_marker dataUsingEncoding:NSUTF8StringEncoding] length];
     keys_data.encoding = "built-in ASCII debug marker";
@@ -1018,17 +1012,13 @@ static int run_debug_input(const Options &opt) {
     Options keys_opt = opt;
     keys_opt.input_mode = InputMode::Keys;
     print_summary(keys_data, keys_stats, keys_opt);
-    rc = validate_text(keys_data, keys_stats, keys_opt);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-    rc = type_text(keyboard, keys_data, keys_stats, keys_opt, target);
+    int rc = validate_text(keys_data, keys_stats, keys_opt);
     if (rc != EXIT_OK) {
         return rc;
     }
 
     TextData unicode_data;
-    NSString *unicode_marker = @"TTDBG_MAC_UNICODE Unicode=中 emoji=✓\n";
+    NSString *unicode_marker = @" TTDBG_UNICODE_BEGIN Unicode=中 check=✓ END ";
     unicode_data.text = nsstring_to_u16(unicode_marker);
     unicode_data.byte_count = [[unicode_marker dataUsingEncoding:NSUTF8StringEncoding] length];
     unicode_data.encoding = "built-in Unicode debug marker";
@@ -1039,6 +1029,26 @@ static int run_debug_input(const Options &opt) {
     unicode_opt.input_mode = InputMode::Unicode;
     print_summary(unicode_data, unicode_stats, unicode_opt);
     rc = validate_text(unicode_data, unicode_stats, unicode_opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    printf("Expected ASCII keys marker:\n%s\n", nsstring_to_utf8(keys_marker).c_str());
+    printf("Expected Unicode payload marker:\n%s\n", nsstring_to_utf8(unicode_marker).c_str());
+    fflush(stdout);
+
+    MacKeyboard keyboard;
+    if (!keyboard.ok()) {
+        fprintf(stderr, "Cannot create CGEventSource.\n");
+        return EXIT_INPUT;
+    }
+    FrontApp target;
+    rc = prepare_target(opt, &target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    rc = type_text(keyboard, keys_data, keys_stats, keys_opt, target);
     if (rc != EXIT_OK) {
         return rc;
     }
