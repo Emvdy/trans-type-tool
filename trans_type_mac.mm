@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 #define PROGRAM_NAME "trans_type_mac"
 
@@ -30,6 +31,8 @@ static constexpr int DEFAULT_LINE_DELAY_MS = 100;
 static constexpr int DEFAULT_START_DELAY_SEC = 5;
 static constexpr int DEFAULT_MAX_BYTES = 1024 * 1024;
 static constexpr int ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024;
+static constexpr int DEFAULT_HEX_CHUNK_BYTES = 240;
+static constexpr int MAX_HEX_CHUNK_BYTES = 2048;
 
 enum class SourceKind {
     Clipboard,
@@ -50,6 +53,7 @@ enum class InputMode {
 enum class TransferMode {
     Simple,
     CmdHex,
+    ZipHex,
 };
 
 struct Options {
@@ -71,6 +75,8 @@ struct Options {
     std::filesystem::path file_path;
     std::string remote_output = "trans.txt";
     std::string remote_hex = "tt.hex";
+    std::string remote_zip = "tt.zip";
+    int hex_chunk_bytes = DEFAULT_HEX_CHUNK_BYTES;
 };
 
 struct TextData {
@@ -114,8 +120,10 @@ static void print_usage() {
     puts("  --file PATH           Read text from PATH. Implies --source file");
     puts("  --mode simple         Type the source text directly through keyboard events. Default");
     puts("  --mode cmd-hex        Type a cmd/certutil hex transfer to recreate the text file");
-    puts("  --remote-output PATH  Remote output file for --mode cmd-hex. Default: trans.txt");
-    puts("  --remote-hex PATH     Remote temporary hex file for --mode cmd-hex. Default: tt.hex");
+    puts("  --mode zip-hex        Type a zipped hex transfer, then expand it remotely");
+    puts("  --remote-output PATH  Remote output file for --mode cmd-hex/zip-hex. Default: trans.txt");
+    puts("  --remote-hex PATH     Remote temporary hex file for --mode cmd-hex/zip-hex. Default: tt.hex");
+    puts("  --remote-zip PATH     Remote temporary zip file for --mode zip-hex. Default: tt.zip");
     puts("  --input-mode auto     Simple ASCII virtual keys when possible, Unicode otherwise. Default");
     puts("  --input-mode keys     Type simple ASCII through real virtual keys. Best for RDP");
     puts("  --input-mode unicode  Type through Unicode CGEvent payloads. Best for local macOS apps");
@@ -123,6 +131,7 @@ static void print_usage() {
     puts("  --line-delay-ms N     Delay after each line. Default: 100");
     puts("  --start-delay-sec N   Countdown before typing. Default: 5");
     puts("  --max-bytes N         Maximum input size. Default: 1048576");
+    puts("  --hex-chunk-bytes N   Bytes per generated hex line. Default: 240");
     puts("  --ascii-only          Refuse to type non-ASCII characters");
     puts("  --enter-mode key      Send newlines as Return key. Default");
     puts("  --enter-mode unicode  Send newlines as Unicode carriage return");
@@ -222,6 +231,18 @@ static bool parse_args(int argc, char **argv, Options *opt) {
             return false;
         }
 
+        matched = get_option_value(&i, argc, argv, "--hex-chunk-bytes", &value);
+        if (matched == 1) {
+            if (!parse_int_range(value, 1, MAX_HEX_CHUNK_BYTES, &opt->hex_chunk_bytes)) {
+                fprintf(stderr, "Invalid --hex-chunk-bytes value: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
         matched = get_option_value(&i, argc, argv, "--source", &value);
         if (matched == 1) {
             if (strcmp(value, "clipboard") == 0) {
@@ -270,6 +291,8 @@ static bool parse_args(int argc, char **argv, Options *opt) {
                 opt->transfer_mode = TransferMode::Simple;
             } else if (strcmp(value, "cmd-hex") == 0 || strcmp(value, "complex") == 0 || strcmp(value, "cmd") == 0) {
                 opt->transfer_mode = TransferMode::CmdHex;
+            } else if (strcmp(value, "zip-hex") == 0 || strcmp(value, "zip") == 0) {
+                opt->transfer_mode = TransferMode::ZipHex;
             } else {
                 fprintf(stderr, "Invalid --mode value: %s\n", value);
                 return false;
@@ -282,7 +305,9 @@ static bool parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--remote-output", &value);
         if (matched == 1) {
-            opt->transfer_mode = TransferMode::CmdHex;
+            if (opt->transfer_mode == TransferMode::Simple) {
+                opt->transfer_mode = TransferMode::CmdHex;
+            }
             opt->remote_output = value;
             continue;
         }
@@ -292,8 +317,22 @@ static bool parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--remote-hex", &value);
         if (matched == 1) {
-            opt->transfer_mode = TransferMode::CmdHex;
+            if (opt->transfer_mode == TransferMode::Simple) {
+                opt->transfer_mode = TransferMode::CmdHex;
+            }
             opt->remote_hex = value;
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--remote-zip", &value);
+        if (matched == 1) {
+            if (opt->transfer_mode == TransferMode::Simple) {
+                opt->transfer_mode = TransferMode::ZipHex;
+            }
+            opt->remote_zip = value;
             continue;
         }
         if (matched == 0) {
@@ -490,8 +529,20 @@ static bool read_text_source(const Options &opt, TextData *out, std::string *err
 }
 
 static bool is_safe_cmd_hex_path(const std::string &path) {
-    if (path.empty()) {
+    if (path.empty() || path.front() == '/' || path.front() == '\\' || path.back() == '/' || path.back() == '\\') {
         return false;
+    }
+    size_t start = 0;
+    while (start <= path.size()) {
+        size_t end = path.find_first_of("/\\", start);
+        std::string part = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (part.empty() || part == "." || part == "..") {
+            return false;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
     }
     for (unsigned char ch : path) {
         if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
@@ -515,13 +566,13 @@ static std::vector<unsigned char> text_to_utf8_bytes(const std::u16string &text)
     return out;
 }
 
-static std::string bytes_to_plain_hex(const std::vector<unsigned char> &bytes) {
+static std::string bytes_to_plain_hex(const std::vector<unsigned char> &bytes, int chunk_bytes) {
     std::string out;
     char chunk[3];
     for (size_t i = 0; i < bytes.size(); ++i) {
         snprintf(chunk, sizeof(chunk), "%02x", static_cast<unsigned int>(bytes[i]));
         out += chunk;
-        if ((i + 1) % 24 == 0) {
+        if ((i + 1) % static_cast<size_t>(chunk_bytes) == 0) {
             out += '\n';
         }
     }
@@ -529,6 +580,164 @@ static std::string bytes_to_plain_hex(const std::vector<unsigned char> &bytes) {
         out += '\n';
     }
     return out;
+}
+
+static size_t count_hex_lines(const std::string &hex_text) {
+    size_t lines = 0;
+    bool has_data = false;
+    for (char ch : hex_text) {
+        if (ch == '\n') {
+            if (has_data) {
+                ++lines;
+                has_data = false;
+            }
+        } else {
+            has_data = true;
+        }
+    }
+    return lines + (has_data ? 1 : 0);
+}
+
+static std::string normalized_zip_entry_name(const std::string &remote_output) {
+    std::string out = remote_output;
+    for (char &ch : out) {
+        if (ch == '\\') {
+            ch = '/';
+        }
+    }
+    return out;
+}
+
+static std::filesystem::path create_temp_directory() {
+    const char *base = getenv("TMPDIR");
+    std::string templ = (base && *base) ? base : "/tmp";
+    if (!templ.empty() && templ.back() != '/') {
+        templ += '/';
+    }
+    templ += "trans-type-zip-XXXXXX";
+    std::vector<char> buffer(templ.begin(), templ.end());
+    buffer.push_back('\0');
+    char *made = mkdtemp(buffer.data());
+    if (made == nullptr) {
+        return {};
+    }
+    return std::filesystem::path(made);
+}
+
+static bool read_binary_file(const std::filesystem::path &path, std::vector<unsigned char> *out, std::string *error) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        *error = "Could not read generated zip file.";
+        return false;
+    }
+    input.seekg(0, std::ios::end);
+    std::streamoff size = input.tellg();
+    if (size < 0) {
+        *error = "Could not determine generated zip file size.";
+        return false;
+    }
+    input.seekg(0, std::ios::beg);
+    out->resize(static_cast<size_t>(size));
+    if (!out->empty()) {
+        input.read(reinterpret_cast<char *>(out->data()), static_cast<std::streamsize>(out->size()));
+        if (!input) {
+            *error = "Could not read all generated zip bytes.";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_zip_tool(const std::filesystem::path &cwd,
+                         const std::filesystem::path &zip_path,
+                         const std::string &entry_name,
+                         std::string *error) {
+    @autoreleasepool {
+        NSTask *task = [[NSTask alloc] init];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/zip"];
+        task.currentDirectoryURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:cwd.string().c_str()] isDirectory:YES];
+        task.arguments = @[
+            @"-q",
+            @"-r",
+            [NSString stringWithUTF8String:zip_path.string().c_str()],
+            [NSString stringWithUTF8String:entry_name.c_str()]
+        ];
+
+        NSPipe *pipe = [NSPipe pipe];
+        task.standardOutput = pipe;
+        task.standardError = pipe;
+
+        NSError *launch_error = nil;
+        if (![task launchAndReturnError:&launch_error]) {
+            NSString *message = launch_error ? [launch_error localizedDescription] : @"unknown launch error";
+            *error = std::string("/usr/bin/zip failed to start: ") + [message UTF8String];
+            return false;
+        }
+        [task waitUntilExit];
+        if (task.terminationStatus != 0) {
+            NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+            NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            std::string details = output ? [output UTF8String] : "";
+            *error = "/usr/bin/zip failed while creating the transfer archive.";
+            if (!details.empty()) {
+                *error += " ";
+                *error += details;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool make_zip_payload(const std::vector<unsigned char> &bytes,
+                             const std::string &remote_output,
+                             std::vector<unsigned char> *zip_bytes,
+                             std::string *error) {
+    std::filesystem::path temp_root;
+    try {
+        temp_root = create_temp_directory();
+        if (temp_root.empty()) {
+            *error = "Could not create a temporary directory for zip compression.";
+            return false;
+        }
+
+        std::string entry_name = normalized_zip_entry_name(remote_output);
+        std::filesystem::path entry_path = temp_root / std::filesystem::path(entry_name);
+        if (entry_path.has_parent_path()) {
+            std::filesystem::create_directories(entry_path.parent_path());
+        }
+
+        {
+            std::ofstream output(entry_path, std::ios::binary);
+            if (!output) {
+                *error = "Could not create temporary input file for zip compression.";
+                std::error_code ignored;
+                std::filesystem::remove_all(temp_root, ignored);
+                return false;
+            }
+            if (!bytes.empty()) {
+                output.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            }
+        }
+
+        std::filesystem::path zip_path = temp_root / "tt.zip";
+        if (!run_zip_tool(temp_root, zip_path, entry_name, error)) {
+            std::error_code ignored;
+            std::filesystem::remove_all(temp_root, ignored);
+            return false;
+        }
+        bool ok = read_binary_file(zip_path, zip_bytes, error);
+        std::error_code ignored;
+        std::filesystem::remove_all(temp_root, ignored);
+        return ok;
+    } catch (const std::exception &ex) {
+        if (!temp_root.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(temp_root, ignored);
+        }
+        *error = std::string("Zip compression failed: ") + ex.what();
+        return false;
+    }
 }
 
 static TextData text_data_from_ascii(const std::string &text, const std::string &label) {
@@ -543,7 +752,7 @@ static TextData text_data_from_ascii(const std::string &text, const std::string 
     return data;
 }
 
-static std::string build_cmd_hex_commands(const std::string &hex_text, const Options &opt) {
+static std::string build_hex_writer_commands(const std::string &hex_text, const std::string &remote_hex) {
     std::string commands = "powershell -nop\n";
 
     size_t start = 0;
@@ -556,7 +765,7 @@ static std::string build_cmd_hex_commands(const std::string &hex_text, const Opt
         if (end > start) {
             commands += first_line ? "set-content" : "add-content";
             commands += " -encoding ascii ";
-            commands += opt.remote_hex;
+            commands += remote_hex;
             commands += " ";
             commands.append(hex_text, start, end - start);
             commands += "\n";
@@ -565,8 +774,23 @@ static std::string build_cmd_hex_commands(const std::string &hex_text, const Opt
         start = end + 1;
     }
 
+    return commands;
+}
+
+static std::string build_cmd_hex_commands(const std::string &hex_text, const Options &opt) {
+    std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
     commands += "certutil -f -decodehex " + opt.remote_hex + " " + opt.remote_output + "\n";
     commands += "del " + opt.remote_hex + "\n";
+    commands += "exit\n";
+    return commands;
+}
+
+static std::string build_zip_hex_commands(const std::string &hex_text, const Options &opt) {
+    std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
+    commands += "certutil -f -decodehex " + opt.remote_hex + " " + opt.remote_zip + "\n";
+    commands += "expand-archive -force " + opt.remote_zip + " .\n";
+    commands += "del " + opt.remote_hex + "\n";
+    commands += "del " + opt.remote_zip + "\n";
     commands += "exit\n";
     return commands;
 }
@@ -704,7 +928,7 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         fprintf(stderr, "--ascii-only is enabled, but input has non-ASCII characters. First one at line %zu, column %zu.\n", line, col);
         return EXIT_CONTENT;
     }
-    if (opt.transfer_mode == TransferMode::CmdHex) {
+    if (opt.transfer_mode == TransferMode::CmdHex || opt.transfer_mode == TransferMode::ZipHex) {
         if (!is_safe_cmd_hex_path(opt.remote_output)) {
             fprintf(stderr, "--remote-output must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
             fprintf(stderr, "Example: trans.txt\n");
@@ -715,7 +939,20 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
             fprintf(stderr, "Example: tt.hex\n");
             return EXIT_ARGS;
         }
-        if (opt.remote_output == opt.remote_hex) {
+        std::string output_path = normalized_zip_entry_name(opt.remote_output);
+        std::string hex_path = normalized_zip_entry_name(opt.remote_hex);
+        if (opt.transfer_mode == TransferMode::ZipHex) {
+            if (!is_safe_cmd_hex_path(opt.remote_zip)) {
+                fprintf(stderr, "--remote-zip must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
+                fprintf(stderr, "Example: tt.zip\n");
+                return EXIT_ARGS;
+            }
+            std::string zip_path = normalized_zip_entry_name(opt.remote_zip);
+            if (output_path == hex_path || output_path == zip_path || hex_path == zip_path) {
+                fprintf(stderr, "--remote-output, --remote-hex, and --remote-zip must be different files.\n");
+                return EXIT_ARGS;
+            }
+        } else if (output_path == hex_path) {
             fprintf(stderr, "--remote-output and --remote-hex must be different files.\n");
             return EXIT_ARGS;
         }
@@ -812,6 +1049,13 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
         printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
         printf("Remote output: %s\n", opt.remote_output.c_str());
         printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+        printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
+    } else if (opt.transfer_mode == TransferMode::ZipHex) {
+        printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
+        printf("Remote output: %s\n", opt.remote_output.c_str());
+        printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+        printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
+        printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
     } else if (opt.input_mode == InputMode::Auto) {
         printf("Input mode: Auto -> %s\n", input_mode_name(mode));
     } else {
@@ -1281,17 +1525,19 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
         return EXIT_CONTENT;
     }
 
-    std::string hex_text = bytes_to_plain_hex(bytes);
+    std::string hex_text = bytes_to_plain_hex(bytes, opt.hex_chunk_bytes);
+    size_t hex_line_count = count_hex_lines(hex_text);
     printf("cmd-hex transfer mode.\n");
     printf("UTF-8 bytes to transfer: %zu\n", bytes.size());
     printf("Remote output: %s\n", opt.remote_output.c_str());
     printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+    printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.\n");
     fflush(stdout);
 
     std::string commands = build_cmd_hex_commands(hex_text, opt);
     if (opt.dry_run) {
-        printf("Generated hex characters: %zu\n", hex_text.size());
+        printf("Generated hex characters: %zu\n", hex_text.size() - hex_line_count);
         printf("Generated command characters: %zu\n", commands.size());
         puts("Dry run passed. No typing was performed.");
         return EXIT_OK;
@@ -1315,6 +1561,62 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
     }
 
     puts("cmd-hex transfer typing completed. Verify the remote output file before running it.");
+    return EXIT_OK;
+}
+
+static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
+    std::vector<unsigned char> bytes = text_to_utf8_bytes(data.text);
+    if (bytes.empty()) {
+        fprintf(stderr, "Input text encoded to empty UTF-8 data.\n");
+        return EXIT_CONTENT;
+    }
+
+    std::vector<unsigned char> zip_bytes;
+    std::string error;
+    if (!make_zip_payload(bytes, opt.remote_output, &zip_bytes, &error)) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return EXIT_FILE;
+    }
+
+    std::string hex_text = bytes_to_plain_hex(zip_bytes, opt.hex_chunk_bytes);
+    size_t hex_line_count = count_hex_lines(hex_text);
+    double ratio = bytes.empty() ? 0.0 : (static_cast<double>(zip_bytes.size()) / static_cast<double>(bytes.size())) * 100.0;
+    printf("zip-hex transfer mode.\n");
+    printf("UTF-8 bytes before zip: %zu\n", bytes.size());
+    printf("Zip bytes to transfer: %zu (%.2f%% of UTF-8 size)\n", zip_bytes.size(), ratio);
+    printf("Remote output: %s\n", opt.remote_output.c_str());
+    printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+    printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
+    printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
+    printf("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.\n");
+    fflush(stdout);
+
+    std::string commands = build_zip_hex_commands(hex_text, opt);
+    if (opt.dry_run) {
+        printf("Generated hex characters: %zu\n", hex_text.size() - hex_line_count);
+        printf("Generated command characters: %zu\n", commands.size());
+        puts("Dry run passed. No typing was performed.");
+        return EXIT_OK;
+    }
+
+    MacKeyboard keyboard;
+    if (!keyboard.ok()) {
+        fprintf(stderr, "Cannot create CGEventSource.\n");
+        return EXIT_INPUT;
+    }
+
+    FrontApp target;
+    int rc = prepare_target(opt, &target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    rc = type_generated_ascii(keyboard, commands, "zip-hex expand-archive commands", opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    puts("zip-hex transfer typing completed. Verify the remote output file before running it.");
     return EXIT_OK;
 }
 
@@ -1372,6 +1674,9 @@ int main(int argc, char **argv) {
 
         if (opt.transfer_mode == TransferMode::CmdHex) {
             return run_cmd_hex_transfer(data, opt);
+        }
+        if (opt.transfer_mode == TransferMode::ZipHex) {
+            return run_zip_hex_transfer(data, opt);
         }
 
         if (opt.dry_run) {

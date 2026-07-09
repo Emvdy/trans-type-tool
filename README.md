@@ -82,12 +82,13 @@ This creates `trans_type_mac` for the current Mac architecture.
 
 ## Basic Use On macOS
 
-The macOS tool supports two transfer modes:
+The macOS tool supports three transfer modes:
 
 - Simple mode: directly types the source text through keyboard events.
 - Complex mode: types a `cmd.exe` + `certutil -decodehex` sequence that recreates the source text as a file on the remote Windows side.
+- Zip-hex mode: zips the source locally, types the zip as hex, then expands it on the remote Windows side.
 
-Both modes support clipboard input, file input, and speed controls.
+All modes support clipboard input, file input, and speed controls.
 
 The macOS tool defaults to clipboard input and simple mode:
 
@@ -117,19 +118,36 @@ certutil -f -decodehex tt.hex trans.txt
 
 This avoids `>`, `>>`, Ctrl+Z, and F6, which can be unreliable through macOS RDP.
 
+For larger or repetitive text, try zip-hex mode:
+
+```sh
+./trans_type_mac --mode zip-hex --remote-output trans.txt
+```
+
+It creates a local zip with `/usr/bin/zip`, types the zip bytes as hex, then runs remote Windows built-ins:
+
+```bat
+certutil -f -decodehex tt.hex tt.zip
+expand-archive -force tt.zip .
+```
+
+For small files the zip header can be larger than the original text, so run `--dry-run` first and compare the reported byte counts.
+
 Use file input instead of the clipboard:
 
 ```sh
 ./trans_type_mac --mode simple --source file
 ./trans_type_mac --mode cmd-hex --source file --remote-output trans.txt
+./trans_type_mac --mode zip-hex --source file --remote-output trans.txt
 ./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.ps1
 ```
 
-Speed controls apply to both modes:
+Speed controls apply to all modes:
 
 ```sh
 ./trans_type_mac --mode simple --delay-ms 50 --line-delay-ms 300
 ./trans_type_mac --mode cmd-hex --delay-ms 20 --line-delay-ms 300 --start-delay-sec 10
+./trans_type_mac --mode zip-hex --hex-chunk-bytes 512 --delay-ms 10
 ```
 
 For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
@@ -145,11 +163,14 @@ Useful macOS options:
 ./trans_type_mac --delay-ms 50 --line-delay-ms 300
 ./trans_type_mac --mode simple
 ./trans_type_mac --mode cmd-hex
+./trans_type_mac --mode zip-hex
 ./trans_type_mac --input-mode keys
 ./trans_type_mac --input-mode unicode
 ./trans_type_mac --source file
 ./trans_type_mac --file /path/to/input.txt
 ./trans_type_mac --remote-output trans.ps1
+./trans_type_mac --remote-zip tt.zip
+./trans_type_mac --hex-chunk-bytes 512
 ./trans_type_mac --diagnose
 ./trans_type_mac --self-test
 ./trans_type_mac --debug-input
@@ -199,6 +220,15 @@ trans_type.exe --mode cmd-hex --file C:\path\to\input.txt --remote-output trans.
 
 Complex mode is the safer choice for scripts containing symbols such as `@`, `#`, `%`, quotes, Chinese, or other text that direct keyboard simulation may corrupt. It creates the remote file but does not run it.
 
+For larger text, zip-hex mode can reduce the number of typed characters:
+
+```bat
+trans_type.exe --mode zip-hex --source file --remote-output trans.txt
+trans_type_py.exe --mode zip-hex --source clipboard --remote-output trans.txt
+```
+
+Zip-hex mode creates a zip locally, sends that zip as hex, then uses remote `certutil` and PowerShell `Expand-Archive`. The Windows C/C++ builds use local PowerShell/.NET to create the zip; the Python build uses the Python standard library. Use `--dry-run` first because very small files may become larger after zip headers.
+
 Useful options:
 
 ```bat
@@ -206,9 +236,12 @@ trans_type.exe --dry-run
 trans_type.exe --delay-ms 50 --line-delay-ms 300
 trans_type.exe --mode simple
 trans_type.exe --mode cmd-hex
+trans_type.exe --mode zip-hex
 trans_type.exe --source clipboard
 trans_type.exe --file C:\path\to\input.txt
 trans_type.exe --remote-output trans.ps1
+trans_type.exe --remote-zip tt.zip
+trans_type.exe --hex-chunk-bytes 512
 trans_type.exe --ascii-only
 trans_type.exe --ascii-keys
 trans_type.exe --sendinput
@@ -227,6 +260,7 @@ The Python exe accepts the same options:
 trans_type_py.exe --dry-run
 trans_type_py.exe --delay-ms 50 --line-delay-ms 300
 trans_type_py.exe --mode cmd-hex --source clipboard --remote-output trans.txt
+trans_type_py.exe --mode zip-hex --dry-run --remote-output trans.txt
 ```
 
 ## Safety And Robustness
@@ -259,6 +293,10 @@ For scripts, ASCII text is the safest. The default mode is legacy ASCII key inpu
 `--mode simple` directly types the source text into the focused window. On Windows, default simple mode uses legacy `keybd_event` and supports ASCII text only. It works in some environments where `SendInput` is blocked, but it depends on the local keyboard layout.
 
 `--mode cmd-hex` types only safe command/hex text, then uses remote PowerShell and Windows `certutil -decodehex` to recreate the source as a file. It avoids `>`, `>>`, Ctrl+Z, and F6. Use it for scripts, symbols, Chinese, or any text that direct keyboard simulation corrupts.
+
+`--mode zip-hex` uses the same safe typing path, but sends a compressed zip and expands it remotely with `Expand-Archive`. It is usually better for larger or repetitive files and worse for tiny files.
+
+`--hex-chunk-bytes N` controls how many source or zip bytes are placed on each generated hex command line. The default is 240. Larger values reduce `add-content` command overhead; if an RDP session drops long lines, lower it.
 
 `--ascii-only` only validates that `trans.txt` contains ASCII. It does not change the input method.
 

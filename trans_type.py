@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import ctypes
+import io
 import locale
 import os
 import sys
 import time
+import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -21,6 +23,8 @@ DEFAULT_LINE_DELAY_MS = 100
 DEFAULT_START_DELAY_SEC = 5
 DEFAULT_MAX_BYTES = 1024 * 1024
 ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024
+DEFAULT_HEX_CHUNK_BYTES = 240
+MAX_HEX_CHUNK_BYTES = 2048
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -50,6 +54,8 @@ class Options:
     mode: str
     remote_output: str
     remote_hex: str
+    remote_zip: str
+    hex_chunk_bytes: int
     ascii_only: bool
     ascii_keys: bool
     legacy_keys: bool
@@ -119,9 +125,16 @@ def parse_args(argv: list[str]) -> Options:
     parser.add_argument("--max-bytes", type=bounded_int("--max-bytes", 1, ABSOLUTE_MAX_BYTES), default=DEFAULT_MAX_BYTES)
     parser.add_argument("--source", choices=("file", "clipboard"), default="file")
     parser.add_argument("--file", type=Path, help="Read text from PATH instead of trans.txt. Implies --source file")
-    parser.add_argument("--mode", choices=("simple", "cmd-hex", "complex", "cmd"), default="simple")
-    parser.add_argument("--remote-output", default="trans.txt", help="Remote output file for --mode cmd-hex")
-    parser.add_argument("--remote-hex", default="tt.hex", help="Remote temporary hex file for --mode cmd-hex")
+    parser.add_argument("--mode", choices=("simple", "cmd-hex", "zip-hex", "complex", "cmd", "zip"), default="simple")
+    parser.add_argument("--remote-output", default="trans.txt", help="Remote output file for --mode cmd-hex/zip-hex")
+    parser.add_argument("--remote-hex", default="tt.hex", help="Remote temporary hex file for --mode cmd-hex/zip-hex")
+    parser.add_argument("--remote-zip", default="tt.zip", help="Remote temporary zip file for --mode zip-hex")
+    parser.add_argument(
+        "--hex-chunk-bytes",
+        type=bounded_int("--hex-chunk-bytes", 1, MAX_HEX_CHUNK_BYTES),
+        default=DEFAULT_HEX_CHUNK_BYTES,
+        help=f"UTF-8/zip bytes per generated hex line. Default: {DEFAULT_HEX_CHUNK_BYTES}",
+    )
     parser.add_argument("--ascii-only", action="store_true")
     parser.add_argument("--ascii-keys", action="store_true")
     parser.add_argument("--legacy-keys", action="store_true", help="Type ASCII through legacy keybd_event instead of SendInput")
@@ -134,7 +147,12 @@ def parse_args(argv: list[str]) -> Options:
     parser.add_argument("--enter-mode", choices=("key", "unicode"), default="key")
     args = parser.parse_args(argv)
     source = "file" if args.file is not None else args.source
-    mode = "cmd-hex" if args.mode in ("cmd-hex", "complex", "cmd") else "simple"
+    if args.mode in ("cmd-hex", "complex", "cmd"):
+        mode = "cmd-hex"
+    elif args.mode in ("zip-hex", "zip"):
+        mode = "zip-hex"
+    else:
+        mode = "simple"
     return Options(
         delay_ms=args.delay_ms,
         line_delay_ms=args.line_delay_ms,
@@ -145,6 +163,8 @@ def parse_args(argv: list[str]) -> Options:
         mode=mode,
         remote_output=args.remote_output,
         remote_hex=args.remote_hex,
+        remote_zip=args.remote_zip,
+        hex_chunk_bytes=args.hex_chunk_bytes,
         ascii_only=args.ascii_only,
         ascii_keys=args.ascii_keys,
         legacy_keys=(args.legacy_keys or not args.sendinput) and not args.ascii_keys,
@@ -335,8 +355,12 @@ def line_col(text: str, index: int) -> tuple[int, int]:
 
 
 def is_safe_cmd_hex_path(path: str) -> bool:
-    if not path:
+    if not path or path[0] in "/\\" or path[-1] in "/\\":
         return False
+    normalized = path.replace("\\", "/")
+    for part in normalized.split("/"):
+        if part in ("", ".", ".."):
+            return False
     for ch in path:
         if "a" <= ch <= "z" or "0" <= ch <= "9":
             continue
@@ -347,6 +371,8 @@ def is_safe_cmd_hex_path(path: str) -> bool:
 
 
 def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
+    if not data.text:
+        raise RuntimeError("Input decoded to empty text.")
     if stats.control_count:
         line, col = line_col(data.text, stats.first_control)
         raise RuntimeError(
@@ -362,7 +388,7 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
             f"--ascii-only is enabled, but input has non-ASCII characters. "
             f"First one at line {line}, column {col}."
         )
-    if opt.mode == "cmd-hex":
+    if opt.mode in ("cmd-hex", "zip-hex"):
         if not is_safe_cmd_hex_path(opt.remote_output):
             raise RuntimeError(
                 "--remote-output must be a relative cmd-safe path using only lowercase letters, "
@@ -373,7 +399,16 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
                 "--remote-hex must be a relative cmd-safe path using only lowercase letters, "
                 "digits, '.', '-', '/', or '\\'. Example: tt.hex"
             )
-        if opt.remote_output == opt.remote_hex:
+        if opt.mode == "zip-hex":
+            if not is_safe_cmd_hex_path(opt.remote_zip):
+                raise RuntimeError(
+                    "--remote-zip must be a relative cmd-safe path using only lowercase letters, "
+                    "digits, '.', '-', '/', or '\\'. Example: tt.zip"
+                )
+            paths = [opt.remote_output, opt.remote_hex, opt.remote_zip]
+            if len({path.lower().replace("\\", "/") for path in paths}) != len(paths):
+                raise RuntimeError("--remote-output, --remote-hex, and --remote-zip must be different files.")
+        elif opt.remote_output.lower().replace("\\", "/") == opt.remote_hex.lower().replace("\\", "/"):
             raise RuntimeError("--remote-output and --remote-hex must be different files.")
         return
     if (opt.ascii_keys or opt.legacy_keys) and stats.non_ascii_count:
@@ -397,6 +432,13 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
         print("Mode: cmd-hex transfer through remote cmd/certutil")
         print(f"Remote output: {opt.remote_output}")
         print(f"Remote temporary hex: {opt.remote_hex}")
+        print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line")
+    elif opt.mode == "zip-hex":
+        print("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive")
+        print(f"Remote output: {opt.remote_output}")
+        print(f"Remote temporary hex: {opt.remote_hex}")
+        print(f"Remote temporary zip: {opt.remote_zip}")
+        print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line")
     elif opt.legacy_keys:
         input_mode = "Legacy keybd_event ASCII keys"
         print(f"Input mode: {input_mode}")
@@ -1026,25 +1068,61 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
     return EXIT_OK
 
 
-def hex_payload(text: str) -> tuple[str, int]:
-    raw = text.encode("utf-8", errors="strict")
+def hex_payload_from_bytes(raw: bytes, chunk_bytes: int) -> tuple[str, int, int]:
     encoded = raw.hex()
-    lines = [encoded[i : i + 48] for i in range(0, len(encoded), 48)]
-    return "\n".join(lines) + "\n", len(raw)
+    line_chars = chunk_bytes * 2
+    lines = [encoded[i : i + line_chars] for i in range(0, len(encoded), line_chars)]
+    return "\n".join(lines) + "\n", len(raw), len(lines)
+
+
+def hex_payload(text: str, chunk_bytes: int) -> tuple[str, int, int]:
+    raw = text.encode("utf-8", errors="strict")
+    return hex_payload_from_bytes(raw, chunk_bytes)
+
+
+def normalized_zip_entry_name(remote_output: str) -> str:
+    return remote_output.replace("\\", "/")
+
+
+def zip_payload(text: str, opt: Options) -> tuple[bytes, int]:
+    raw = text.encode("utf-8", errors="strict")
+    entry_name = normalized_zip_entry_name(opt.remote_output)
+    buffer = io.BytesIO()
+    info = zipfile.ZipInfo(entry_name)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.date_time = (1980, 1, 1, 0, 0, 0)
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(info, raw)
+    return buffer.getvalue(), len(raw)
 
 
 def generated_ascii_data(text: str, label: str) -> TextData:
     return TextData(path=Path(label), text=text, byte_count=len(text), encoding="generated ASCII command stream")
 
 
-def build_cmd_hex_commands(payload: str, opt: Options) -> str:
+def build_hex_writer_commands(payload: str, remote_hex: str) -> list[str]:
     lines = [line for line in payload.splitlines() if line]
     commands = ["powershell -nop"]
     for index, line in enumerate(lines):
         writer = "set-content" if index == 0 else "add-content"
-        commands.append(f"{writer} -encoding ascii {opt.remote_hex} {line}")
+        commands.append(f"{writer} -encoding ascii {remote_hex} {line}")
+    return commands
+
+
+def build_cmd_hex_commands(payload: str, opt: Options) -> str:
+    commands = build_hex_writer_commands(payload, opt.remote_hex)
     commands.append(f"certutil -f -decodehex {opt.remote_hex} {opt.remote_output}")
     commands.append(f"del {opt.remote_hex}")
+    commands.append("exit")
+    return "\n".join(commands) + "\n"
+
+
+def build_zip_hex_commands(payload: str, opt: Options) -> str:
+    commands = build_hex_writer_commands(payload, opt.remote_hex)
+    commands.append(f"certutil -f -decodehex {opt.remote_hex} {opt.remote_zip}")
+    commands.append(f"expand-archive -force {opt.remote_zip} .")
+    commands.append(f"del {opt.remote_hex}")
+    commands.append(f"del {opt.remote_zip}")
     commands.append("exit")
     return "\n".join(commands) + "\n"
 
@@ -1078,7 +1156,7 @@ def send_enter_key(win: WinKeyboard, opt: Options) -> None:
 
 def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
     try:
-        payload, byte_count = hex_payload(data.text)
+        payload, byte_count, line_count = hex_payload(data.text, opt.hex_chunk_bytes)
     except UnicodeEncodeError as exc:
         print(f"Input text could not be encoded as UTF-8: {exc}", file=sys.stderr)
         return EXIT_ENCODING
@@ -1087,11 +1165,12 @@ def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
     print(f"UTF-8 bytes to transfer: {byte_count}")
     print(f"Remote output: {opt.remote_output}")
     print(f"Remote temporary hex: {opt.remote_hex}")
+    print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line ({line_count} line(s))")
     print("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.")
 
     commands = build_cmd_hex_commands(payload, opt)
     if opt.dry_run:
-        print(f"Generated hex characters: {len(payload)}")
+        print(f"Generated hex characters: {sum(len(line) for line in payload.splitlines())}")
         print(f"Generated command characters: {len(commands)}")
         print("Dry run passed. No typing was performed.")
         return EXIT_OK
@@ -1111,6 +1190,52 @@ def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
         return rc
 
     print("cmd-hex transfer typing completed. Verify the remote output file before running it.")
+    return EXIT_OK
+
+
+def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
+    try:
+        zipped, raw_byte_count = zip_payload(data.text, opt)
+        payload, zip_byte_count, line_count = hex_payload_from_bytes(zipped, opt.hex_chunk_bytes)
+    except UnicodeEncodeError as exc:
+        print(f"Input text could not be encoded as UTF-8: {exc}", file=sys.stderr)
+        return EXIT_ENCODING
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_FILE
+
+    ratio = (zip_byte_count / raw_byte_count) if raw_byte_count else 0.0
+    print("zip-hex transfer mode.")
+    print(f"UTF-8 bytes before zip: {raw_byte_count}")
+    print(f"Zip bytes to transfer: {zip_byte_count} ({ratio:.2%} of UTF-8 size)")
+    print(f"Remote output: {opt.remote_output}")
+    print(f"Remote temporary hex: {opt.remote_hex}")
+    print(f"Remote temporary zip: {opt.remote_zip}")
+    print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line ({line_count} line(s))")
+    print("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.")
+
+    commands = build_zip_hex_commands(payload, opt)
+    if opt.dry_run:
+        print(f"Generated hex characters: {sum(len(line) for line in payload.splitlines())}")
+        print(f"Generated command characters: {len(commands)}")
+        print("Dry run passed. No typing was performed.")
+        return EXIT_OK
+
+    if os.name != "nt":
+        print("Keyboard input must run on Windows for the Windows exe. Use the macOS binary on macOS.", file=sys.stderr)
+        return EXIT_INPUT
+
+    win = WinKeyboard()
+    rc, target = prepare_target_window(win, opt)
+    if rc != EXIT_OK or target is None:
+        return rc
+
+    key_opt = keyboard_opt_for_generated_ascii(opt)
+    rc = type_generated_ascii(win, commands, "zip-hex expand-archive commands", key_opt, target)
+    if rc != EXIT_OK:
+        return rc
+
+    print("zip-hex transfer typing completed. Verify the remote output file before running it.")
     return EXIT_OK
 
 
@@ -1155,6 +1280,8 @@ def run(argv: list[str]) -> int:
 
     if opt.mode == "cmd-hex":
         return run_cmd_hex_transfer(data, opt)
+    if opt.mode == "zip-hex":
+        return run_zip_hex_transfer(data, opt)
 
     if opt.dry_run:
         print("Dry run passed. No typing was performed.")

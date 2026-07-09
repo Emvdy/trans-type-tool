@@ -26,7 +26,10 @@ jobs:
 
       - name: Python dry run
         shell: cmd
-        run: python trans_type.py --dry-run --ascii-only
+        run: |
+          python trans_type.py --dry-run --ascii-only
+          python trans_type.py --mode cmd-hex --dry-run --hex-chunk-bytes 240
+          python trans_type.py --mode zip-hex --dry-run --hex-chunk-bytes 240
 
       - name: Build native WinAPI exe
         shell: cmd
@@ -44,8 +47,14 @@ jobs:
         shell: cmd
         run: |
           trans_type.exe --dry-run --ascii-only
+          trans_type.exe --mode cmd-hex --dry-run --hex-chunk-bytes 240
+          trans_type.exe --mode zip-hex --dry-run --hex-chunk-bytes 240
           trans_type_cpp.exe --dry-run --ascii-only
+          trans_type_cpp.exe --mode cmd-hex --dry-run --hex-chunk-bytes 240
+          trans_type_cpp.exe --mode zip-hex --dry-run --hex-chunk-bytes 240
           trans_type_py.exe --dry-run --ascii-only
+          trans_type_py.exe --mode cmd-hex --dry-run --hex-chunk-bytes 240
+          trans_type_py.exe --mode zip-hex --dry-run --hex-chunk-bytes 240
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
