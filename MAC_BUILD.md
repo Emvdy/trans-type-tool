@@ -20,9 +20,14 @@ Default behavior:
 ./trans_type_mac
 ```
 
-By default, `trans_type_mac` reads the macOS clipboard and uses `--input-mode auto`.
+By default, `trans_type_mac` reads the macOS clipboard and uses simple direct keyboard typing.
 
-In auto mode:
+It has two transfer modes:
+
+- `--mode simple`: directly type the source text through keyboard events.
+- `--mode cmd-hex`: type a remote `cmd.exe` + `certutil -decodehex` sequence that recreates the source text as a file on Windows.
+
+In simple mode:
 
 - Simple ASCII text is typed as real virtual key presses. Use this path for RDP.
 - Non-ASCII text is typed through Unicode `CGEvent` payloads. This is useful for local macOS apps, but some RDP clients ignore the Unicode payload and forward only the underlying keycode, which can appear remotely as repeated `a`.
@@ -34,6 +39,20 @@ For RDP, keep the input to ASCII text without the excluded symbols, then use:
 ```
 
 This simplified key mode intentionally does not handle `@`, `#`, `%`, or currency symbols. `--dry-run` reports the first unsupported character before typing starts.
+
+For text that contains complex symbols, Chinese, or anything unreliable through direct keyboard typing, focus a remote `cmd.exe` or PowerShell prompt and use complex mode:
+
+```sh
+./trans_type_mac --mode cmd-hex --remote-output trans.txt
+```
+
+This types `cmd /q /d`, creates a temporary remote hex file with `copy con`, sends F6/EOF, then runs:
+
+```bat
+certutil -f -decodehex tt.hex trans.txt
+```
+
+Use `--remote-output trans.ps1` or another simple lowercase relative filename when needed.
 
 For local Unicode testing in TextEdit:
 
@@ -49,6 +68,7 @@ Useful checks that do not type:
 ./trans_type_mac --diagnose
 ./trans_type_mac --input-mode keys --dry-run
 ./trans_type_mac --input-mode unicode --dry-run
+./trans_type_mac --mode cmd-hex --dry-run
 ```
 
 Use `trans.txt` instead of the clipboard:
@@ -56,6 +76,13 @@ Use `trans.txt` instead of the clipboard:
 ```sh
 ./trans_type_mac --source file
 ./trans_type_mac --file /path/to/input.txt
+```
+
+Mode, input source, and speed can be combined:
+
+```sh
+./trans_type_mac --mode simple --source file --delay-ms 50 --line-delay-ms 300
+./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.ps1 --delay-ms 20 --line-delay-ms 300 --start-delay-sec 10
 ```
 
 For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in:

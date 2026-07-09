@@ -47,6 +47,11 @@ enum class InputMode {
     Unicode,
 };
 
+enum class TransferMode {
+    Simple,
+    CmdHex,
+};
+
 struct Options {
     int delay_ms = DEFAULT_DELAY_MS;
     int line_delay_ms = DEFAULT_LINE_DELAY_MS;
@@ -62,7 +67,10 @@ struct Options {
     SourceKind source = SourceKind::Clipboard;
     EnterMode enter_mode = EnterMode::Key;
     InputMode input_mode = InputMode::Auto;
+    TransferMode transfer_mode = TransferMode::Simple;
     std::filesystem::path file_path;
+    std::string remote_output = "trans.txt";
+    std::string remote_hex = "tt.hex";
 };
 
 struct TextData {
@@ -104,6 +112,10 @@ static void print_usage() {
     puts("  --source clipboard    Read text from the macOS clipboard. Default");
     puts("  --source file         Read text from trans.txt next to this binary");
     puts("  --file PATH           Read text from PATH. Implies --source file");
+    puts("  --mode simple         Type the source text directly through keyboard events. Default");
+    puts("  --mode cmd-hex        Type a cmd/certutil hex transfer to recreate the text file");
+    puts("  --remote-output PATH  Remote output file for --mode cmd-hex. Default: trans.txt");
+    puts("  --remote-hex PATH     Remote temporary hex file for --mode cmd-hex. Default: tt.hex");
     puts("  --input-mode auto     Simple ASCII virtual keys when possible, Unicode otherwise. Default");
     puts("  --input-mode keys     Type simple ASCII through real virtual keys. Best for RDP");
     puts("  --input-mode unicode  Type through Unicode CGEvent payloads. Best for local macOS apps");
@@ -246,6 +258,42 @@ static bool parse_args(int argc, char **argv, Options *opt) {
                 fprintf(stderr, "Invalid --enter-mode value: %s\n", value);
                 return false;
             }
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--mode", &value);
+        if (matched == 1) {
+            if (strcmp(value, "simple") == 0) {
+                opt->transfer_mode = TransferMode::Simple;
+            } else if (strcmp(value, "cmd-hex") == 0 || strcmp(value, "complex") == 0 || strcmp(value, "cmd") == 0) {
+                opt->transfer_mode = TransferMode::CmdHex;
+            } else {
+                fprintf(stderr, "Invalid --mode value: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--remote-output", &value);
+        if (matched == 1) {
+            opt->transfer_mode = TransferMode::CmdHex;
+            opt->remote_output = value;
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--remote-hex", &value);
+        if (matched == 1) {
+            opt->transfer_mode = TransferMode::CmdHex;
+            opt->remote_hex = value;
             continue;
         }
         if (matched == 0) {
@@ -441,6 +489,60 @@ static bool read_text_source(const Options &opt, TextData *out, std::string *err
     return read_file_source(opt, out, error);
 }
 
+static bool is_safe_cmd_hex_path(const std::string &path) {
+    if (path.empty()) {
+        return false;
+    }
+    for (unsigned char ch : path) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+            continue;
+        }
+        if (ch == '.' || ch == '-' || ch == '/' || ch == '\\') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static std::vector<unsigned char> text_to_utf8_bytes(const std::u16string &text) {
+    NSString *value = [[NSString alloc] initWithCharacters:reinterpret_cast<const unichar *>(text.data()) length:text.size()];
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    std::vector<unsigned char> out([data length]);
+    if (!out.empty()) {
+        memcpy(out.data(), [data bytes], out.size());
+    }
+    return out;
+}
+
+static std::string bytes_to_plain_hex(const std::vector<unsigned char> &bytes) {
+    std::string out;
+    char chunk[3];
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        snprintf(chunk, sizeof(chunk), "%02x", static_cast<unsigned int>(bytes[i]));
+        out += chunk;
+        if ((i + 1) % 24 == 0) {
+            out += '\n';
+        }
+    }
+    if (out.empty() || out.back() != '\n') {
+        out += '\n';
+    }
+    return out;
+}
+
+static TextData text_data_from_ascii(const std::string &text, const std::string &label) {
+    TextData data;
+    data.text.reserve(text.size());
+    for (unsigned char ch : text) {
+        data.text.push_back(static_cast<char16_t>(ch));
+    }
+    data.byte_count = text.size();
+    data.encoding = "generated ASCII command stream";
+    data.source_label = label;
+    return data;
+}
+
 static bool is_high_surrogate(char16_t ch) {
     return ch >= 0xD800 && ch <= 0xDBFF;
 }
@@ -574,6 +676,23 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         fprintf(stderr, "--ascii-only is enabled, but input has non-ASCII characters. First one at line %zu, column %zu.\n", line, col);
         return EXIT_CONTENT;
     }
+    if (opt.transfer_mode == TransferMode::CmdHex) {
+        if (!is_safe_cmd_hex_path(opt.remote_output)) {
+            fprintf(stderr, "--remote-output must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
+            fprintf(stderr, "Example: trans.txt\n");
+            return EXIT_ARGS;
+        }
+        if (!is_safe_cmd_hex_path(opt.remote_hex)) {
+            fprintf(stderr, "--remote-hex must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
+            fprintf(stderr, "Example: tt.hex\n");
+            return EXIT_ARGS;
+        }
+        if (opt.remote_output == opt.remote_hex) {
+            fprintf(stderr, "--remote-output and --remote-hex must be different files.\n");
+            return EXIT_ARGS;
+        }
+        return EXIT_OK;
+    }
     if (opt.input_mode == InputMode::Keys && stats.non_ascii_count > 0) {
         size_t line = 0;
         size_t col = 0;
@@ -661,12 +780,16 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     printf("Lines: %zu\n", stats.lines);
     printf("Non-ASCII characters: %zu\n", stats.non_ascii_count);
     printf("Delay: %d ms per character, %d ms per line\n", opt.delay_ms, opt.line_delay_ms);
-    if (opt.input_mode == InputMode::Auto) {
+    if (opt.transfer_mode == TransferMode::CmdHex) {
+        printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
+        printf("Remote output: %s\n", opt.remote_output.c_str());
+        printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+    } else if (opt.input_mode == InputMode::Auto) {
         printf("Input mode: Auto -> %s\n", input_mode_name(mode));
     } else {
         printf("Input mode: %s\n", input_mode_name(mode));
     }
-    if (mode == InputMode::Unicode) {
+    if (opt.transfer_mode == TransferMode::Simple && mode == InputMode::Unicode) {
         printf("RDP note: some RDP clients ignore Unicode CGEvent payloads and may type repeated 'a'. Use --input-mode keys for ASCII text.\n");
     }
     printf("Enter mode: %s\n", opt.enter_mode == EnterMode::Unicode ? "Unicode CR" : "Return key");
@@ -1110,6 +1233,86 @@ static int run_debug_input(const Options &opt) {
     return type_text(keyboard, unicode_data, unicode_stats, unicode_opt, target);
 }
 
+static int type_generated_ascii(MacKeyboard &keyboard, const std::string &text, const std::string &label, const Options &base_opt, const FrontApp &target) {
+    TextData data = text_data_from_ascii(text, label);
+    TextStats stats = analyze_text(data.text);
+    Options opt = base_opt;
+    opt.transfer_mode = TransferMode::Simple;
+    opt.input_mode = InputMode::Keys;
+    int rc = validate_text(data, stats, opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+    return type_text(keyboard, data, stats, opt, target);
+}
+
+static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
+    std::vector<unsigned char> bytes = text_to_utf8_bytes(data.text);
+    if (bytes.empty()) {
+        fprintf(stderr, "Input text encoded to empty UTF-8 data.\n");
+        return EXIT_CONTENT;
+    }
+
+    std::string hex_text = bytes_to_plain_hex(bytes);
+    printf("cmd-hex transfer mode.\n");
+    printf("UTF-8 bytes to transfer: %zu\n", bytes.size());
+    printf("Remote output: %s\n", opt.remote_output.c_str());
+    printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+    printf("Focus a remote cmd.exe or PowerShell prompt. The tool first types: cmd /q /d\n");
+    fflush(stdout);
+
+    if (opt.dry_run) {
+        printf("Generated hex characters: %zu\n", hex_text.size());
+        puts("Dry run passed. No typing was performed.");
+        return EXIT_OK;
+    }
+
+    MacKeyboard keyboard;
+    if (!keyboard.ok()) {
+        fprintf(stderr, "Cannot create CGEventSource.\n");
+        return EXIT_INPUT;
+    }
+
+    FrontApp target;
+    int rc = prepare_target(opt, &target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    std::string setup = "cmd /q /d\ncopy con " + opt.remote_hex + "\n";
+    rc = type_generated_ascii(keyboard, setup, "cmd-hex setup commands", opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    rc = type_generated_ascii(keyboard, hex_text, "cmd-hex payload", opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    if (!keyboard.send_key(kVK_F6)) {
+        fprintf(stderr, "Input failed while sending F6 EOF to finish copy con.\n");
+        return EXIT_INPUT;
+    }
+    sleep_ms(opt.line_delay_ms);
+    if (!keyboard.send_key(kVK_Return)) {
+        fprintf(stderr, "Input failed while sending Enter after F6 EOF.\n");
+        return EXIT_INPUT;
+    }
+    sleep_ms(opt.line_delay_ms);
+
+    std::string decode = "certutil -f -decodehex " + opt.remote_hex + " " + opt.remote_output + "\n";
+    decode += "del " + opt.remote_hex + "\n";
+    decode += "exit\n";
+    rc = type_generated_ascii(keyboard, decode, "cmd-hex decode commands", opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+
+    puts("cmd-hex transfer typing completed. Verify the remote output file before running it.");
+    return EXIT_OK;
+}
+
 static int run_diagnose(const Options &opt) {
     printf("Accessibility trusted: %s\n", accessibility_trusted(opt.request_accessibility) ? "yes" : "no");
     print_front_app(frontmost_app());
@@ -1160,6 +1363,10 @@ int main(int argc, char **argv) {
         int rc = validate_text(data, stats, opt);
         if (rc != EXIT_OK) {
             return rc;
+        }
+
+        if (opt.transfer_mode == TransferMode::CmdHex) {
+            return run_cmd_hex_transfer(data, opt);
         }
 
         if (opt.dry_run) {

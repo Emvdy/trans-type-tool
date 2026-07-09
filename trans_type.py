@@ -5,7 +5,7 @@ import locale
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 EXIT_OK = 0
@@ -33,10 +33,12 @@ VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_PAUSE = 0x13
 VK_ESCAPE = 0x1B
+VK_F6 = 0x75
 
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL = 25
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+CF_UNICODETEXT = 13
 
 
 @dataclass
@@ -45,6 +47,11 @@ class Options:
     line_delay_ms: int
     start_delay_sec: int
     max_bytes: int
+    source: str
+    file_path: Path | None
+    mode: str
+    remote_output: str
+    remote_hex: str
     ascii_only: bool
     ascii_keys: bool
     legacy_keys: bool
@@ -106,12 +113,17 @@ def bounded_int(name: str, minimum: int, maximum: int):
 def parse_args(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(
         prog="trans_type_py.exe",
-        description="Type trans.txt into the current foreground Windows window through simulated keyboard input.",
+        description="Type source text into the current foreground Windows window through simulated keyboard input.",
     )
     parser.add_argument("--delay-ms", type=bounded_int("--delay-ms", 0, 5000), default=DEFAULT_DELAY_MS)
     parser.add_argument("--line-delay-ms", type=bounded_int("--line-delay-ms", 0, 5000), default=DEFAULT_LINE_DELAY_MS)
     parser.add_argument("--start-delay-sec", type=bounded_int("--start-delay-sec", 0, 3600), default=DEFAULT_START_DELAY_SEC)
     parser.add_argument("--max-bytes", type=bounded_int("--max-bytes", 1, ABSOLUTE_MAX_BYTES), default=DEFAULT_MAX_BYTES)
+    parser.add_argument("--source", choices=("file", "clipboard"), default="file")
+    parser.add_argument("--file", type=Path, help="Read text from PATH instead of trans.txt. Implies --source file")
+    parser.add_argument("--mode", choices=("simple", "cmd-hex", "complex", "cmd"), default="simple")
+    parser.add_argument("--remote-output", default="trans.txt", help="Remote output file for --mode cmd-hex")
+    parser.add_argument("--remote-hex", default="tt.hex", help="Remote temporary hex file for --mode cmd-hex")
     parser.add_argument("--ascii-only", action="store_true")
     parser.add_argument("--ascii-keys", action="store_true")
     parser.add_argument("--legacy-keys", action="store_true", help="Type ASCII through legacy keybd_event instead of SendInput")
@@ -123,11 +135,18 @@ def parse_args(argv: list[str]) -> Options:
     parser.add_argument("--debug-input", action="store_true", help="Run visible SendInput diagnostics against the focused target window")
     parser.add_argument("--enter-mode", choices=("key", "unicode"), default="key")
     args = parser.parse_args(argv)
+    source = "file" if args.file is not None else args.source
+    mode = "cmd-hex" if args.mode in ("cmd-hex", "complex", "cmd") else "simple"
     return Options(
         delay_ms=args.delay_ms,
         line_delay_ms=args.line_delay_ms,
         start_delay_sec=args.start_delay_sec,
         max_bytes=args.max_bytes,
+        source=source,
+        file_path=args.file,
+        mode=mode,
+        remote_output=args.remote_output,
+        remote_hex=args.remote_hex,
         ascii_only=args.ascii_only,
         ascii_keys=args.ascii_keys,
         legacy_keys=(args.legacy_keys or not args.sendinput) and not args.ascii_keys,
@@ -151,6 +170,49 @@ def trans_path() -> Path:
     return app_dir() / "trans.txt"
 
 
+def read_clipboard_text(opt: Options) -> TextData:
+    if os.name != "nt":
+        raise RuntimeError("Clipboard input is only supported by the Windows exe/runtime.")
+
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+    if not user32.OpenClipboard(None):
+        raise RuntimeError(f"Cannot open clipboard. Windows error {ctypes.get_last_error()}.")
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            raise RuntimeError("Clipboard does not contain Unicode text.")
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise RuntimeError(f"Cannot lock clipboard text. Windows error {ctypes.get_last_error()}.")
+        try:
+            text = ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+    if not text:
+        raise RuntimeError("Clipboard text is empty.")
+    byte_count = len(text.encode("utf-16-le", errors="strict"))
+    if byte_count > opt.max_bytes:
+        raise RuntimeError("Clipboard text is larger than --max-bytes.")
+    return TextData(path=Path("Clipboard"), text=text, byte_count=byte_count, encoding="Windows clipboard Unicode string")
+
+
 def decode_bytes(raw: bytes) -> tuple[str, str]:
     if raw.startswith(b"\xef\xbb\xbf"):
         return raw[3:].decode("utf-8", errors="strict"), "UTF-8 BOM"
@@ -172,30 +234,36 @@ def read_trans_file(path: Path, opt: Options) -> TextData:
     try:
         stat = path.stat()
     except OSError as exc:
-        raise RuntimeError(f"Cannot open trans.txt: {path} ({exc})") from exc
+        raise RuntimeError(f"Cannot open input file: {path} ({exc})") from exc
 
     if stat.st_size == 0:
-        raise RuntimeError("trans.txt is empty.")
+        raise RuntimeError("Input file is empty.")
     if stat.st_size > opt.max_bytes:
         raise RuntimeError(
-            f"trans.txt is too large: {stat.st_size} bytes. Limit: {opt.max_bytes} bytes. "
+            f"Input file is too large: {stat.st_size} bytes. Limit: {opt.max_bytes} bytes. "
             "Use --max-bytes to override intentionally."
         )
 
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise RuntimeError(f"Cannot read trans.txt: {path} ({exc})") from exc
+        raise RuntimeError(f"Cannot read input file: {path} ({exc})") from exc
 
     try:
         text, encoding = decode_bytes(raw)
     except UnicodeDecodeError as exc:
-        raise ValueError(f"trans.txt could not be decoded as UTF-8 or the fallback ANSI code page ({exc})") from exc
+        raise ValueError(f"Input file could not be decoded as UTF-8 or the fallback ANSI code page ({exc})") from exc
 
     if not text:
-        raise RuntimeError("trans.txt decoded to empty text.")
+        raise RuntimeError("Input file decoded to empty text.")
 
     return TextData(path=path, text=text, byte_count=len(raw), encoding=encoding)
+
+
+def read_text_source(opt: Options) -> TextData:
+    if opt.source == "clipboard":
+        return read_clipboard_text(opt)
+    return read_trans_file(opt.file_path if opt.file_path is not None else trans_path(), opt)
 
 
 def analyze_text(text: str) -> TextStats:
@@ -268,22 +336,48 @@ def line_col(text: str, index: int) -> tuple[int, int]:
     return line, col
 
 
+def is_safe_cmd_hex_path(path: str) -> bool:
+    if not path:
+        return False
+    for ch in path:
+        if "a" <= ch <= "z" or "0" <= ch <= "9":
+            continue
+        if ch in ".-/\\":
+            continue
+        return False
+    return True
+
+
 def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
     if stats.control_count:
         line, col = line_col(data.text, stats.first_control)
         raise RuntimeError(
-            f"trans.txt contains unsupported control characters. First one at line {line}, column {col}. "
+            f"Input contains unsupported control characters. First one at line {line}, column {col}. "
             "Allowed control characters are tab and newlines only."
         )
     if stats.surrogate_error_count:
         line, col = line_col(data.text, stats.first_surrogate_error)
-        raise RuntimeError(f"trans.txt contains invalid surrogate data. First issue at line {line}, column {col}.")
+        raise RuntimeError(f"Input contains invalid surrogate data. First issue at line {line}, column {col}.")
     if opt.ascii_only and stats.non_ascii_count:
         line, col = line_col(data.text, stats.first_non_ascii)
         raise RuntimeError(
-            f"--ascii-only is enabled, but trans.txt has non-ASCII characters. "
+            f"--ascii-only is enabled, but input has non-ASCII characters. "
             f"First one at line {line}, column {col}."
         )
+    if opt.mode == "cmd-hex":
+        if not is_safe_cmd_hex_path(opt.remote_output):
+            raise RuntimeError(
+                "--remote-output must be a relative cmd-safe path using only lowercase letters, "
+                "digits, '.', '-', '/', or '\\'. Example: trans.txt"
+            )
+        if not is_safe_cmd_hex_path(opt.remote_hex):
+            raise RuntimeError(
+                "--remote-hex must be a relative cmd-safe path using only lowercase letters, "
+                "digits, '.', '-', '/', or '\\'. Example: tt.hex"
+            )
+        if opt.remote_output == opt.remote_hex:
+            raise RuntimeError("--remote-output and --remote-hex must be different files.")
+        return
     if (opt.ascii_keys or opt.legacy_keys) and stats.non_ascii_count:
         line, col = line_col(data.text, stats.first_non_ascii)
         raise RuntimeError(
@@ -293,7 +387,7 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
 
 
 def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
-    print(f"File: {data.path}")
+    print(f"Source: {data.path}")
     print(f"Encoding: {data.encoding}")
     print(f"Bytes: {data.byte_count}")
     print(f"Characters: {len(data.text)}")
@@ -301,13 +395,19 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
     print(f"Non-ASCII characters: {stats.non_ascii_count}")
     print(f"Delay: {opt.delay_ms} ms per character, {opt.line_delay_ms} ms per line")
     print(f"Focus check: {'off' if opt.no_focus_check else 'on'}")
-    if opt.legacy_keys:
+    if opt.mode == "cmd-hex":
+        print("Mode: cmd-hex transfer through remote cmd/certutil")
+        print(f"Remote output: {opt.remote_output}")
+        print(f"Remote temporary hex: {opt.remote_hex}")
+    elif opt.legacy_keys:
         input_mode = "Legacy keybd_event ASCII keys"
+        print(f"Input mode: {input_mode}")
     elif opt.ascii_keys:
         input_mode = "ASCII virtual keys"
+        print(f"Input mode: {input_mode}")
     else:
         input_mode = "Unicode SendInput"
-    print(f"Input mode: {input_mode}")
+        print(f"Input mode: {input_mode}")
     if opt.legacy_keys:
         enter_mode = "legacy VK_RETURN"
     else:
@@ -928,6 +1028,102 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
     return EXIT_OK
 
 
+def hex_payload(text: str) -> tuple[str, int]:
+    raw = text.encode("utf-8", errors="strict")
+    encoded = raw.hex()
+    lines = [encoded[i : i + 48] for i in range(0, len(encoded), 48)]
+    return "\n".join(lines) + "\n", len(raw)
+
+
+def generated_ascii_data(text: str, label: str) -> TextData:
+    return TextData(path=Path(label), text=text, byte_count=len(text), encoding="generated ASCII command stream")
+
+
+def keyboard_opt_for_generated_ascii(opt: Options) -> Options:
+    if opt.ascii_keys:
+        return replace(opt, mode="simple", ascii_keys=True, legacy_keys=False, sendinput=False)
+    return replace(opt, mode="simple", ascii_keys=False, legacy_keys=True, sendinput=False)
+
+
+def type_generated_ascii(win: WinKeyboard, text: str, label: str, opt: Options, target: TargetWindow) -> int:
+    generated = generated_ascii_data(text, label)
+    stats = analyze_text(generated.text)
+    key_opt = keyboard_opt_for_generated_ascii(opt)
+    try:
+        validate_text(generated, stats, key_opt)
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return EXIT_CONTENT
+    return type_text(win, generated, stats, key_opt, target)
+
+
+def send_enter_key(win: WinKeyboard, opt: Options) -> None:
+    if opt.legacy_keys:
+        win.legacy_vk(VK_RETURN)
+    elif opt.enter_mode == "unicode":
+        win.send_unicode_unit(ord("\r"), "Enter")
+    else:
+        win.send_vk(VK_RETURN, "Enter")
+
+
+def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
+    try:
+        payload, byte_count = hex_payload(data.text)
+    except UnicodeEncodeError as exc:
+        print(f"Input text could not be encoded as UTF-8: {exc}", file=sys.stderr)
+        return EXIT_ENCODING
+
+    print("cmd-hex transfer mode.")
+    print(f"UTF-8 bytes to transfer: {byte_count}")
+    print(f"Remote output: {opt.remote_output}")
+    print(f"Remote temporary hex: {opt.remote_hex}")
+    print("Focus a remote cmd.exe or PowerShell prompt. The tool first types: cmd /q /d")
+
+    if opt.dry_run:
+        print(f"Generated hex characters: {len(payload)}")
+        print("Dry run passed. No typing was performed.")
+        return EXIT_OK
+
+    if os.name != "nt":
+        print("Keyboard input must run on Windows for the Windows exe. Use GitHub Actions to build the exe, then run it on Windows.", file=sys.stderr)
+        return EXIT_INPUT
+
+    win = WinKeyboard()
+    rc, target = prepare_target_window(win, opt)
+    if rc != EXIT_OK or target is None:
+        return rc
+
+    key_opt = keyboard_opt_for_generated_ascii(opt)
+    setup = f"cmd /q /d\ncopy con {opt.remote_hex}\n"
+    rc = type_generated_ascii(win, setup, "cmd-hex setup commands", key_opt, target)
+    if rc != EXIT_OK:
+        return rc
+
+    rc = type_generated_ascii(win, payload, "cmd-hex payload", key_opt, target)
+    if rc != EXIT_OK:
+        return rc
+
+    try:
+        if key_opt.ascii_keys:
+            win.send_vk(VK_F6, "F6 EOF")
+        else:
+            win.legacy_vk(VK_F6)
+        sleep_ms(opt.line_delay_ms)
+        send_enter_key(win, key_opt)
+        sleep_ms(opt.line_delay_ms)
+    except RuntimeError as exc:
+        print(f"Input failed while finishing copy con: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+    decode = f"certutil -f -decodehex {opt.remote_hex} {opt.remote_output}\ndel {opt.remote_hex}\nexit\n"
+    rc = type_generated_ascii(win, decode, "cmd-hex decode commands", key_opt, target)
+    if rc != EXIT_OK:
+        return rc
+
+    print("cmd-hex transfer typing completed. Verify the remote output file before running it.")
+    return EXIT_OK
+
+
 def run(argv: list[str]) -> int:
     try:
         opt = parse_args(argv)
@@ -950,7 +1146,7 @@ def run(argv: list[str]) -> int:
             return rc
 
     try:
-        data = read_trans_file(trans_path(), opt)
+        data = read_text_source(opt)
     except RuntimeError as exc:
         print(exc, file=sys.stderr)
         return EXIT_FILE
@@ -966,6 +1162,9 @@ def run(argv: list[str]) -> int:
     except RuntimeError as exc:
         print(exc, file=sys.stderr)
         return EXIT_CONTENT
+
+    if opt.mode == "cmd-hex":
+        return run_cmd_hex_transfer(data, opt)
 
     if opt.dry_run:
         print("Dry run passed. No typing was performed.")

@@ -6,9 +6,9 @@ This project provides three Windows 10 tools with the same behavior:
 - `trans_type_cpp.exe`: C++ build wrapper for the same native implementation.
 - `trans_type_py.exe`: Python implementation packaged by PyInstaller. Easier to edit, but much larger.
 
-All three tools read `trans.txt` from the same directory as the executable and type it into the current foreground Windows window through simulated keyboard input. They are designed for Windows 10 + RDP cases where the target server has no network access and clipboard transfer is disabled.
+All three tools can read `trans.txt`, another local file, or the local Windows clipboard, then type into the current foreground Windows window through simulated keyboard input. They are designed for Windows 10 + RDP cases where the target server has no network access and remote clipboard transfer is disabled.
 
-The Windows tools do not use the clipboard, network, remote files, or any injection into the remote host. They only behave like a local keyboard typing into the focused window.
+The Windows tools do not use the network or inject into the remote host. Clipboard mode only reads the local Windows clipboard as an input source; it still types through keyboard simulation.
 
 It also includes a macOS command-line tool:
 
@@ -82,16 +82,52 @@ This creates `trans_type_mac` for the current Mac architecture.
 
 ## Basic Use On macOS
 
-The macOS tool defaults to clipboard input and `--input-mode auto`:
+The macOS tool supports two transfer modes:
+
+- Simple mode: directly types the source text through keyboard events.
+- Complex mode: types a `cmd.exe` + `certutil -decodehex` sequence that recreates the source text as a file on the remote Windows side.
+
+Both modes support clipboard input, file input, and speed controls.
+
+The macOS tool defaults to clipboard input and simple mode:
 
 ```sh
 ./trans_type_mac
 ```
 
-In auto mode, simple ASCII text is typed as real virtual key presses, which is the mode to use with RDP. If the input contains non-ASCII characters, the tool switches to Unicode `CGEvent` payloads. Some RDP clients ignore those Unicode payloads and forward only the underlying keycode; that makes the remote side see repeated `a`. For RDP, keep the clipboard/input to ASCII text without the excluded symbols, then use:
+Simple mode uses `--input-mode auto`. ASCII text is typed as real virtual key presses. If the input contains non-ASCII characters, the tool switches to Unicode `CGEvent` payloads. Some RDP clients ignore those Unicode payloads and forward only the underlying keycode; that makes the remote side see repeated `a`. For RDP, keep the clipboard/input to ASCII text without the excluded symbols, then use:
 
 ```sh
-./trans_type_mac --input-mode keys
+./trans_type_mac --mode simple --input-mode keys
+```
+
+The simplified macOS RDP key mode intentionally does not handle `@`, `#`, `%`, or currency symbols. `--dry-run` reports the first unsupported character before typing starts.
+
+Complex mode is for scripts or text containing symbols, Chinese, or other characters that are unreliable through direct keyboard simulation. Focus a remote `cmd.exe` or PowerShell prompt, then run:
+
+```sh
+./trans_type_mac --mode cmd-hex --remote-output trans.txt
+```
+
+It types `cmd /q /d`, creates a temporary remote hex file with `copy con`, sends F6/EOF, then runs:
+
+```bat
+certutil -f -decodehex tt.hex trans.txt
+```
+
+Use file input instead of the clipboard:
+
+```sh
+./trans_type_mac --mode simple --source file
+./trans_type_mac --mode cmd-hex --source file --remote-output trans.txt
+./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.ps1
+```
+
+Speed controls apply to both modes:
+
+```sh
+./trans_type_mac --mode simple --delay-ms 50 --line-delay-ms 300
+./trans_type_mac --mode cmd-hex --delay-ms 20 --line-delay-ms 300 --start-delay-sec 10
 ```
 
 For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
@@ -100,17 +136,18 @@ For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
 ./trans_type_mac --input-mode unicode
 ```
 
-The simplified macOS RDP key mode intentionally does not handle `@`, `#`, `%`, or currency symbols. `--dry-run` reports the first unsupported character before typing starts.
-
 Useful macOS options:
 
 ```sh
 ./trans_type_mac --dry-run
 ./trans_type_mac --delay-ms 50 --line-delay-ms 300
+./trans_type_mac --mode simple
+./trans_type_mac --mode cmd-hex
 ./trans_type_mac --input-mode keys
 ./trans_type_mac --input-mode unicode
 ./trans_type_mac --source file
 ./trans_type_mac --file /path/to/input.txt
+./trans_type_mac --remote-output trans.ps1
 ./trans_type_mac --diagnose
 ./trans_type_mac --self-test
 ./trans_type_mac --debug-input
@@ -120,7 +157,7 @@ For actual typing, macOS must allow the terminal app or the `trans_type_mac` bin
 
 ## Basic Use On Windows
 
-1. Put one of `trans_type.exe`, `trans_type_cpp.exe`, or `trans_type_py.exe` and `trans.txt` in the same directory.
+1. Put one of `trans_type.exe`, `trans_type_cpp.exe`, or `trans_type_py.exe` and `trans.txt` in the same directory, or prepare text in the Windows clipboard.
 2. Open the RDP session and place the cursor in the target editor, shell, or input box.
 3. Run:
 
@@ -142,11 +179,34 @@ trans_type_py.exe
 
 4. During the countdown, focus the target RDP window.
 
+Windows simple mode directly types the source text through keyboard events:
+
+```bat
+trans_type.exe --mode simple --source file
+trans_type.exe --mode simple --source clipboard
+trans_type.exe --mode simple --file C:\path\to\input.txt
+```
+
+Windows complex mode types a `cmd.exe` + `certutil -decodehex` sequence. Focus a remote `cmd.exe` or PowerShell prompt:
+
+```bat
+trans_type.exe --mode cmd-hex --source file --remote-output trans.txt
+trans_type.exe --mode cmd-hex --source clipboard --remote-output trans.txt
+trans_type.exe --mode cmd-hex --file C:\path\to\input.txt --remote-output trans.ps1
+```
+
+Complex mode is the safer choice for scripts containing symbols such as `@`, `#`, `%`, quotes, Chinese, or other text that direct keyboard simulation may corrupt. It creates the remote file but does not run it.
+
 Useful options:
 
 ```bat
 trans_type.exe --dry-run
 trans_type.exe --delay-ms 50 --line-delay-ms 300
+trans_type.exe --mode simple
+trans_type.exe --mode cmd-hex
+trans_type.exe --source clipboard
+trans_type.exe --file C:\path\to\input.txt
+trans_type.exe --remote-output trans.ps1
 trans_type.exe --ascii-only
 trans_type.exe --ascii-keys
 trans_type.exe --sendinput
@@ -164,6 +224,7 @@ The Python exe accepts the same options:
 ```bat
 trans_type_py.exe --dry-run
 trans_type_py.exe --delay-ms 50 --line-delay-ms 300
+trans_type_py.exe --mode cmd-hex --source clipboard --remote-output trans.txt
 ```
 
 ## Safety And Robustness
@@ -193,7 +254,9 @@ For scripts, ASCII text is the safest. The default mode is legacy ASCII key inpu
 
 ## Input Modes
 
-Default mode uses legacy `keybd_event` and supports ASCII text only. It works in some environments where `SendInput` is blocked, but it depends on the local keyboard layout.
+`--mode simple` directly types the source text into the focused window. On Windows, default simple mode uses legacy `keybd_event` and supports ASCII text only. It works in some environments where `SendInput` is blocked, but it depends on the local keyboard layout.
+
+`--mode cmd-hex` types only safe command/hex text, then uses remote Windows `certutil -decodehex` to recreate the source as a file. Use it for scripts, symbols, Chinese, or any text that direct keyboard simulation corrupts.
 
 `--ascii-only` only validates that `trans.txt` contains ASCII. It does not change the input method.
 
