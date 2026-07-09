@@ -33,8 +33,6 @@ VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_PAUSE = 0x13
 VK_ESCAPE = 0x1B
-VK_F6 = 0x75
-
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL = 25
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -1039,6 +1037,18 @@ def generated_ascii_data(text: str, label: str) -> TextData:
     return TextData(path=Path(label), text=text, byte_count=len(text), encoding="generated ASCII command stream")
 
 
+def build_cmd_hex_commands(payload: str, opt: Options) -> str:
+    lines = [line for line in payload.splitlines() if line]
+    commands = ["powershell -nop"]
+    for index, line in enumerate(lines):
+        writer = "set-content" if index == 0 else "add-content"
+        commands.append(f"{writer} -encoding ascii {opt.remote_hex} {line}")
+    commands.append(f"certutil -f -decodehex {opt.remote_hex} {opt.remote_output}")
+    commands.append(f"del {opt.remote_hex}")
+    commands.append("exit")
+    return "\n".join(commands) + "\n"
+
+
 def keyboard_opt_for_generated_ascii(opt: Options) -> Options:
     if opt.ascii_keys:
         return replace(opt, mode="simple", ascii_keys=True, legacy_keys=False, sendinput=False)
@@ -1077,10 +1087,12 @@ def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
     print(f"UTF-8 bytes to transfer: {byte_count}")
     print(f"Remote output: {opt.remote_output}")
     print(f"Remote temporary hex: {opt.remote_hex}")
-    print("Focus a remote cmd.exe or PowerShell prompt. The tool first types: cmd /q /d")
+    print("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.")
 
+    commands = build_cmd_hex_commands(payload, opt)
     if opt.dry_run:
         print(f"Generated hex characters: {len(payload)}")
+        print(f"Generated command characters: {len(commands)}")
         print("Dry run passed. No typing was performed.")
         return EXIT_OK
 
@@ -1094,29 +1106,7 @@ def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
         return rc
 
     key_opt = keyboard_opt_for_generated_ascii(opt)
-    setup = f"cmd /q /d\ncopy con {opt.remote_hex}\n"
-    rc = type_generated_ascii(win, setup, "cmd-hex setup commands", key_opt, target)
-    if rc != EXIT_OK:
-        return rc
-
-    rc = type_generated_ascii(win, payload, "cmd-hex payload", key_opt, target)
-    if rc != EXIT_OK:
-        return rc
-
-    try:
-        if key_opt.ascii_keys:
-            win.send_vk(VK_F6, "F6 EOF")
-        else:
-            win.legacy_vk(VK_F6)
-        sleep_ms(opt.line_delay_ms)
-        send_enter_key(win, key_opt)
-        sleep_ms(opt.line_delay_ms)
-    except RuntimeError as exc:
-        print(f"Input failed while finishing copy con: {exc}", file=sys.stderr)
-        return EXIT_INPUT
-
-    decode = f"certutil -f -decodehex {opt.remote_hex} {opt.remote_output}\ndel {opt.remote_hex}\nexit\n"
-    rc = type_generated_ascii(win, decode, "cmd-hex decode commands", key_opt, target)
+    rc = type_generated_ascii(win, commands, "cmd-hex echo/certutil commands", key_opt, target)
     if rc != EXIT_OK:
         return rc
 

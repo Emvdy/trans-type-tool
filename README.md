@@ -109,11 +109,13 @@ Complex mode is for scripts or text containing symbols, Chinese, or other charac
 ./trans_type_mac --mode cmd-hex --remote-output trans.txt
 ```
 
-It types `cmd /q /d`, creates a temporary remote hex file with `copy con`, sends F6/EOF, then runs:
+It starts PowerShell without a profile, writes the temporary hex file with `set-content` and `add-content`, then runs:
 
 ```bat
 certutil -f -decodehex tt.hex trans.txt
 ```
+
+This avoids `>`, `>>`, Ctrl+Z, and F6, which can be unreliable through macOS RDP.
 
 Use file input instead of the clipboard:
 
@@ -187,7 +189,7 @@ trans_type.exe --mode simple --source clipboard
 trans_type.exe --mode simple --file C:\path\to\input.txt
 ```
 
-Windows complex mode types a `cmd.exe` + `certutil -decodehex` sequence. Focus a remote `cmd.exe` or PowerShell prompt:
+Windows complex mode types a PowerShell + `certutil -decodehex` sequence. Focus a remote `cmd.exe` or PowerShell prompt:
 
 ```bat
 trans_type.exe --mode cmd-hex --source file --remote-output trans.txt
@@ -256,7 +258,7 @@ For scripts, ASCII text is the safest. The default mode is legacy ASCII key inpu
 
 `--mode simple` directly types the source text into the focused window. On Windows, default simple mode uses legacy `keybd_event` and supports ASCII text only. It works in some environments where `SendInput` is blocked, but it depends on the local keyboard layout.
 
-`--mode cmd-hex` types only safe command/hex text, then uses remote Windows `certutil -decodehex` to recreate the source as a file. Use it for scripts, symbols, Chinese, or any text that direct keyboard simulation corrupts.
+`--mode cmd-hex` types only safe command/hex text, then uses remote PowerShell and Windows `certutil -decodehex` to recreate the source as a file. It avoids `>`, `>>`, Ctrl+Z, and F6. Use it for scripts, symbols, Chinese, or any text that direct keyboard simulation corrupts.
 
 `--ascii-only` only validates that `trans.txt` contains ASCII. It does not change the input method.
 

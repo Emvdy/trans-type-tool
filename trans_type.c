@@ -836,6 +836,63 @@ static int text_data_from_ascii(const char *text, const char *label, TextData *d
     return 1;
 }
 
+static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
+    size_t hex_len = strlen(hex_text);
+    size_t line_count = 0;
+    size_t remote_hex_len = strlen(opt->remote_hex);
+    size_t remote_output_len = strlen(opt->remote_output);
+    size_t cap;
+    size_t pos = 0;
+    size_t start = 0;
+    int first_line = 1;
+    char *commands;
+    const char *p;
+
+    for (p = hex_text; *p != '\0'; ++p) {
+        if (*p == '\n') {
+            ++line_count;
+        }
+    }
+
+    cap = hex_len + line_count * (remote_hex_len + 40) + remote_hex_len * 2 + remote_output_len + 256;
+    commands = (char *)malloc(cap);
+    if (commands == NULL) {
+        return NULL;
+    }
+
+#define APPEND_FMT(...) do { \
+        int written = snprintf(commands + pos, cap - pos, __VA_ARGS__); \
+        if (written < 0 || (size_t)written >= cap - pos) { \
+            free(commands); \
+            return NULL; \
+        } \
+        pos += (size_t)written; \
+    } while (0)
+
+    APPEND_FMT("powershell -nop\n");
+
+    while (start < hex_len) {
+        size_t end = start;
+        while (end < hex_len && hex_text[end] != '\n') {
+            ++end;
+        }
+        if (end > start) {
+            APPEND_FMT("%s -encoding ascii %s %.*s\n",
+                       first_line ? "set-content" : "add-content",
+                       opt->remote_hex,
+                       (int)(end - start),
+                       hex_text + start);
+            first_line = 0;
+        }
+        start = end + 1;
+    }
+
+    APPEND_FMT("certutil -f -decodehex %s %s\ndel %s\nexit\n", opt->remote_hex, opt->remote_output, opt->remote_hex);
+#undef APPEND_FMT
+
+    return commands;
+}
+
 static int validate_text(const TextData *data, const TextStats *stats, const Options *opt) {
     int line;
     int col;
@@ -1383,23 +1440,14 @@ static int type_generated_ascii(const char *text, const char *label, const Optio
     return rc;
 }
 
-static int send_eof_key(const Options *base_opt) {
-    if (base_opt->ascii_keys) {
-        return send_vk(VK_F6, "F6 EOF");
-    }
-    return send_legacy_vk(VK_F6);
-}
-
 static int run_cmd_hex_transfer(const TextData *data, const Options *opt) {
     unsigned char *bytes = NULL;
     char *hex_text = NULL;
-    char *setup = NULL;
-    char *decode = NULL;
+    char *commands = NULL;
     TargetWindow target;
     Options key_opt = *opt;
     int byte_count = 0;
     int rc;
-    int needed;
 
     if (!text_to_utf8_bytes(data, &bytes, &byte_count)) {
         fprintf(stderr, "Input text could not be encoded as UTF-8.\n");
@@ -1417,75 +1465,39 @@ static int run_cmd_hex_transfer(const TextData *data, const Options *opt) {
     printf("UTF-8 bytes to transfer: %d\n", byte_count);
     printf("Remote output: %s\n", opt->remote_output);
     printf("Remote temporary hex: %s\n", opt->remote_hex);
-    printf("Focus a remote cmd.exe or PowerShell prompt. The tool first types: cmd /q /d\n");
+    printf("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.\n");
 
     if (!key_opt.ascii_keys) {
         key_opt.legacy_keys = 1;
         key_opt.ascii_keys = 0;
     }
 
+    commands = build_cmd_hex_commands(hex_text, opt);
+    if (commands == NULL) {
+        free(hex_text);
+        fprintf(stderr, "Not enough memory to build cmd-hex commands.\n");
+        return EXIT_FILE;
+    }
+
     if (opt->dry_run) {
         printf("Generated hex characters: %u\n", (unsigned int)strlen(hex_text));
+        printf("Generated command characters: %u\n", (unsigned int)strlen(commands));
         puts("Dry run passed. No typing was performed.");
         free(hex_text);
+        free(commands);
         return EXIT_OK;
     }
 
     rc = prepare_target_window(opt, &target);
     if (rc != EXIT_OK) {
         free(hex_text);
+        free(commands);
         return rc;
     }
 
-    needed = snprintf(NULL, 0, "cmd /q /d\ncopy con %s\n", opt->remote_hex);
-    setup = (char *)malloc((size_t)needed + 1);
-    if (setup == NULL) {
-        free(hex_text);
-        fprintf(stderr, "Not enough memory to build setup commands.\n");
-        return EXIT_FILE;
-    }
-    snprintf(setup, (size_t)needed + 1, "cmd /q /d\ncopy con %s\n", opt->remote_hex);
-
-    rc = type_generated_ascii(setup, "cmd-hex setup commands", &key_opt, &target);
-    free(setup);
-    if (rc != EXIT_OK) {
-        free(hex_text);
-        return rc;
-    }
-
-    rc = type_generated_ascii(hex_text, "cmd-hex payload", &key_opt, &target);
+    rc = type_generated_ascii(commands, "cmd-hex echo/certutil commands", &key_opt, &target);
     free(hex_text);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-
-    rc = send_eof_key(&key_opt);
-    if (rc != EXIT_OK) {
-        fprintf(stderr, "Input failed while sending F6 EOF to finish copy con.\n");
-        return rc;
-    }
-    if (opt->line_delay_ms > 0) {
-        Sleep((DWORD)opt->line_delay_ms);
-    }
-    rc = send_enter(&key_opt);
-    if (rc != EXIT_OK) {
-        fprintf(stderr, "Input failed while sending Enter after F6 EOF.\n");
-        return rc;
-    }
-    if (opt->line_delay_ms > 0) {
-        Sleep((DWORD)opt->line_delay_ms);
-    }
-
-    needed = snprintf(NULL, 0, "certutil -f -decodehex %s %s\ndel %s\nexit\n", opt->remote_hex, opt->remote_output, opt->remote_hex);
-    decode = (char *)malloc((size_t)needed + 1);
-    if (decode == NULL) {
-        fprintf(stderr, "Not enough memory to build decode commands.\n");
-        return EXIT_FILE;
-    }
-    snprintf(decode, (size_t)needed + 1, "certutil -f -decodehex %s %s\ndel %s\nexit\n", opt->remote_hex, opt->remote_output, opt->remote_hex);
-
-    rc = type_generated_ascii(decode, "cmd-hex decode commands", &key_opt, &target);
-    free(decode);
+    free(commands);
     if (rc != EXIT_OK) {
         return rc;
     }

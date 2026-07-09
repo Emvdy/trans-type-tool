@@ -25,7 +25,7 @@ By default, `trans_type_mac` reads the macOS clipboard and uses simple direct ke
 It has two transfer modes:
 
 - `--mode simple`: directly type the source text through keyboard events.
-- `--mode cmd-hex`: type a remote `cmd.exe` + `certutil -decodehex` sequence that recreates the source text as a file on Windows.
+- `--mode cmd-hex`: type a remote PowerShell + `certutil -decodehex` sequence that recreates the source text as a file on Windows.
 
 In simple mode:
 
@@ -46,11 +46,13 @@ For text that contains complex symbols, Chinese, or anything unreliable through 
 ./trans_type_mac --mode cmd-hex --remote-output trans.txt
 ```
 
-This types `cmd /q /d`, creates a temporary remote hex file with `copy con`, sends F6/EOF, then runs:
+This starts PowerShell without a profile, writes the temporary hex file with `set-content` and `add-content`, then runs:
 
 ```bat
 certutil -f -decodehex tt.hex trans.txt
 ```
+
+It avoids `>`, `>>`, Ctrl+Z, and F6, which can be unreliable through macOS RDP.
 
 Use `--remote-output trans.ps1` or another simple lowercase relative filename when needed.
 

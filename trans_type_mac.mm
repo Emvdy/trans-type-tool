@@ -543,6 +543,34 @@ static TextData text_data_from_ascii(const std::string &text, const std::string 
     return data;
 }
 
+static std::string build_cmd_hex_commands(const std::string &hex_text, const Options &opt) {
+    std::string commands = "powershell -nop\n";
+
+    size_t start = 0;
+    bool first_line = true;
+    while (start < hex_text.size()) {
+        size_t end = hex_text.find('\n', start);
+        if (end == std::string::npos) {
+            end = hex_text.size();
+        }
+        if (end > start) {
+            commands += first_line ? "set-content" : "add-content";
+            commands += " -encoding ascii ";
+            commands += opt.remote_hex;
+            commands += " ";
+            commands.append(hex_text, start, end - start);
+            commands += "\n";
+            first_line = false;
+        }
+        start = end + 1;
+    }
+
+    commands += "certutil -f -decodehex " + opt.remote_hex + " " + opt.remote_output + "\n";
+    commands += "del " + opt.remote_hex + "\n";
+    commands += "exit\n";
+    return commands;
+}
+
 static bool is_high_surrogate(char16_t ch) {
     return ch >= 0xD800 && ch <= 0xDBFF;
 }
@@ -1258,11 +1286,13 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
     printf("UTF-8 bytes to transfer: %zu\n", bytes.size());
     printf("Remote output: %s\n", opt.remote_output.c_str());
     printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
-    printf("Focus a remote cmd.exe or PowerShell prompt. The tool first types: cmd /q /d\n");
+    printf("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.\n");
     fflush(stdout);
 
+    std::string commands = build_cmd_hex_commands(hex_text, opt);
     if (opt.dry_run) {
         printf("Generated hex characters: %zu\n", hex_text.size());
+        printf("Generated command characters: %zu\n", commands.size());
         puts("Dry run passed. No typing was performed.");
         return EXIT_OK;
     }
@@ -1279,32 +1309,7 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
         return rc;
     }
 
-    std::string setup = "cmd /q /d\ncopy con " + opt.remote_hex + "\n";
-    rc = type_generated_ascii(keyboard, setup, "cmd-hex setup commands", opt, target);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-
-    rc = type_generated_ascii(keyboard, hex_text, "cmd-hex payload", opt, target);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-
-    if (!keyboard.send_key(kVK_F6)) {
-        fprintf(stderr, "Input failed while sending F6 EOF to finish copy con.\n");
-        return EXIT_INPUT;
-    }
-    sleep_ms(opt.line_delay_ms);
-    if (!keyboard.send_key(kVK_Return)) {
-        fprintf(stderr, "Input failed while sending Enter after F6 EOF.\n");
-        return EXIT_INPUT;
-    }
-    sleep_ms(opt.line_delay_ms);
-
-    std::string decode = "certutil -f -decodehex " + opt.remote_hex + " " + opt.remote_output + "\n";
-    decode += "del " + opt.remote_hex + "\n";
-    decode += "exit\n";
-    rc = type_generated_ascii(keyboard, decode, "cmd-hex decode commands", opt, target);
+    rc = type_generated_ascii(keyboard, commands, "cmd-hex echo/certutil commands", opt, target);
     if (rc != EXIT_OK) {
         return rc;
     }
