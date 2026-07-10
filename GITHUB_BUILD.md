@@ -3,6 +3,9 @@
 这套流程适合在 macOS 上维护源码，通过 GitHub 的 Windows 运行器生成三个
 Windows `.exe`。
 
+从注册 Windows 10 runner 到下载并实际使用 exe 的完整中文步骤见
+`WINDOWS10_ACTIONS.md`。
+
 ## 结论
 
 - macOS 上的 PyInstaller 不能生成受支持的 Windows `.exe`。
