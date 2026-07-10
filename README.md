@@ -25,9 +25,11 @@ the tools do not paste the clipboard into the remote session.
   English input method while typing.
 
 The Windows GitHub workflow builds on Windows Server 2022 because GitHub does not
-provide a Windows 10 hosted runner. It compiles for the Windows 10 API target and
-tests x64 PE files, PowerShell 5.1, `certutil`, and both complex protocols. A final
-RDP smoke test on the intended Windows 10 environment is still recommended.
+provide a Windows 10 hosted runner. A manual workflow run can then download the
+same artifacts onto a real self-hosted Windows 10 x64 runner and repeat the full
+compatibility/protocol suite. See `WINDOWS10_ACTIONS.md` for runner setup. A final
+attended RDP keyboard smoke test is still required because Actions does not drive
+an interactive target window.
 
 ## Transfer modes
 
@@ -252,7 +254,8 @@ deployment target:
 ./build_mac.sh
 ```
 
-See `MAC_BUILD.md` and `GITHUB_BUILD.md` for platform-specific instructions.
+See `MAC_BUILD.md`, `GITHUB_BUILD.md`, and `WINDOWS10_ACTIONS.md` for
+platform-specific instructions.
 
 ## Diagnostics and controls
 

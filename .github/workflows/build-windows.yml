@@ -1,14 +1,24 @@
-name: Build Windows exes
+name: Build Windows exes and validate Windows 10
 
 on:
   push:
+    branches:
+      - main
   workflow_dispatch:
+    inputs:
+      validate_windows_10:
+        description: Run compatibility tests on a self-hosted Windows 10 x64 runner
+        required: true
+        default: true
+        type: boolean
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
   build:
+    name: Build Windows x64 artifacts
     runs-on: windows-2022
     timeout-minutes: 30
 
@@ -90,4 +100,59 @@ jobs:
             requirements-build.txt
             MAC_BUILD.md
             GITHUB_BUILD.md
+            WINDOWS10_ACTIONS.md
             tests/*.py
+
+  validate-windows-10:
+    name: Validate on real Windows 10 x64
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_windows_10 && github.ref == 'refs/heads/main' }}
+    needs: build
+    runs-on: [self-hosted, windows, x64, windows-10]
+    timeout-minutes: 30
+
+    steps:
+      - name: Assert Windows 10 x64 runner and built-ins
+        shell: powershell
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $build = [int]$os.BuildNumber
+          Write-Host "Caption: $($os.Caption)"
+          Write-Host "Version: $($os.Version)"
+          Write-Host "Build: $build"
+          Write-Host "ProductType: $($os.ProductType)"
+          Write-Host "64-bit OS: $([Environment]::Is64BitOperatingSystem)"
+          Write-Host "Windows PowerShell: $($PSVersionTable.PSVersion)"
+
+          if ($os.ProductType -ne 1 -or $os.Version -notlike '10.0.*' -or $build -lt 10240 -or $build -ge 22000) {
+            throw "This job requires Windows 10 client, not Windows Server or Windows 11."
+          }
+          if (-not [Environment]::Is64BitOperatingSystem) {
+            throw "This job requires a 64-bit Windows 10 installation."
+          }
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
+            throw "This job requires Windows PowerShell 5.1."
+          }
+          Get-Command certutil.exe -ErrorAction Stop | Out-Null
+          Get-Command Expand-Archive -ErrorAction Stop | Out-Null
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Download Windows artifacts from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: trans_type-windows
+          path: windows-artifact
+
+      - name: Execute compatibility and protocol tests on Windows 10
+        shell: cmd
+        working-directory: windows-artifact
+        run: |
+          python -m unittest discover -s tests -v
+          trans_type.exe --mode simple --dry-run
+          trans_type_cpp.exe --mode simple --dry-run
+          trans_type_py.exe --mode simple --dry-run
+          python tests\verify_windows_exes.py trans_type.exe trans_type_cpp.exe trans_type_py.exe

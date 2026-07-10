@@ -163,9 +163,11 @@ does not create a supported Windows `.exe`. Use the repository's Windows workflo
 .github/workflows/build-windows.yml
 ```
 
-It runs on Windows Server 2022 x64, builds all three Windows executables, verifies
-their PE architecture, and executes the generated protocols using Windows
-PowerShell 5.1 and `certutil`. See `GITHUB_BUILD.md` for the complete procedure.
+It first runs on Windows Server 2022 x64, builds all three Windows executables,
+verifies their PE architecture, and executes the generated protocols using
+Windows PowerShell 5.1 and `certutil`. A manual run can repeat the suite on a real
+self-hosted Windows 10 x64 runner. See `GITHUB_BUILD.md` and
+`WINDOWS10_ACTIONS.md` for the complete procedure.
 
 The hosted runner validates Windows compatibility but is not an actual Windows
 10 RDP client. Perform the final attended simple/cmd-hex/zip-hex smoke test on the

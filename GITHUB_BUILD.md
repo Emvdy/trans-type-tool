@@ -7,13 +7,17 @@ Windows `.exe`。
 
 - macOS 上的 PyInstaller 不能生成受支持的 Windows `.exe`。
 - Windows exe 必须在 Windows 环境中打包。
-- 本仓库使用 `windows-2022` x64 运行器、MSVC、Python 3.12 和 PyInstaller。
-- 运行器不是 Windows 10，但编译目标设置为 Windows 10，产物仍需在实际
-  Windows 10 + RDP 环境做最后一次人工冒烟测试。
+- GitHub 没有 `windows-10` 官方托管标签，不能靠修改 `runs-on` 获得真实
+  Windows 10。
+- 本仓库先使用 `windows-2022` x64、MSVC、Python 3.12 和 PyInstaller 构建。
+- 手动运行 workflow 时，默认继续在带 `windows-10` 标签的真实 self-hosted
+  Windows 10 x64 runner 上重复完整测试。
+- Actions 不会自动操作交互式 RDP 窗口，最终按键冒烟测试仍需人在场完成。
 
 ## Actions 产物
 
-`Build Windows exes` 会上传 `trans_type-windows` artifact，包含：
+`Build Windows exes and validate Windows 10` 会上传 `trans_type-windows`
+artifact，包含：
 
 - `trans_type.exe`：原生 Win32 C 版本，体积最小。
 - `trans_type_cpp.exe`：复用同一实现的 C++ 版本。
@@ -57,21 +61,30 @@ gh auth login -h github.com
 ## 从网页运行
 
 1. 打开仓库的 **Actions** 页面。
-2. 选择 **Build Windows exes**。
+2. 选择 **Build Windows exes and validate Windows 10**。
 3. 点击 **Run workflow**，选择 `main`。
-4. 等待所有步骤变绿。
-5. 打开本次 run，在 **Artifacts** 下载 `trans_type-windows`。
+4. 已注册 Windows 10 runner 时，保持 Windows 10 验证选项为选中。
+5. 只想构建时取消该选项，否则没有在线 runner 会一直 queued。
+6. 等待所有实际运行的步骤变绿。
+7. 打开本次 run，在 **Artifacts** 下载 `trans_type-windows`。
 
-workflow 在每次 push 时也会自动运行。
+每次 push 到 `main` 都会自动运行托管构建；Windows 10 self-hosted job 只在手动
+workflow run 且勾选验证时运行。
 
 ## 从命令行运行
 
 `gh` 登录有效后：
 
 ```sh
-gh workflow run "Build Windows exes" --ref main
+gh workflow run build-windows.yml --ref main -f validate_windows_10=true
 gh run list --workflow build-windows.yml --limit 5
 gh run watch --exit-status
+```
+
+仅构建、不等待 Windows 10 runner：
+
+```sh
+gh workflow run build-windows.yml --ref main -f validate_windows_10=false
 ```
 
 下载指定 run 的产物：
@@ -88,7 +101,7 @@ workflow 文件：
 .github/workflows/build-windows.yml
 ```
 
-它会执行：
+托管 `Build Windows x64 artifacts` job 会执行：
 
 1. Python 语法检查和协议单元测试。
 2. Python 源码三种模式的 dry-run。
@@ -103,6 +116,17 @@ workflow 文件：
 11. 确认恢复用 `.hex`/`.zip` 临时文件仍然存在。
 
 因此，Actions 不只是检查“程序能启动”，还会验证复杂协议确实恢复出相同字节。
+
+手动勾选 Windows 10 验证后，`Validate on real Windows 10 x64` job 会：
+
+1. 等待 `[self-hosted, windows, x64, windows-10]` runner。
+2. 从操作系统读取 ProductType、版本和 build，拒绝 Windows Server/Windows 11。
+3. 检查 64 位系统、Windows PowerShell 5.1、`certutil` 和 `Expand-Archive`。
+4. 下载同一次 workflow 生成的 `trans_type-windows` artifact。
+5. 在真实 Windows 10 上再次执行三个 exe 的 simple、PE、压缩、编码和协议回读。
+
+注册 self-hosted runner 的完整步骤见 `WINDOWS10_ACTIONS.md`。不要把公开仓库的
+self-hosted runner 安装在生产服务器上，也不要让它保存生产凭据。
 
 ## 在 Windows 本机打包 Python exe
 
@@ -179,6 +203,9 @@ AppLocker、WDAC、EDR 或组织策略可能阻止或告警。这种情况下应
 - MSVC 失败：查看 `Build native WinAPI exe` 或 `Build C++ wrapper exe`。
 - PyInstaller 失败：查看 `Build Python exe` 和依赖安装输出。
 - 协议失败：查看 `Execute emitted protocols with Windows PowerShell 5.1`。
+- Windows 10 job 一直 queued：确认 runner 正在运行并带有 `windows-10` 标签。
+- Windows 10 系统断言失败：不要修改断言伪装版本，检查 runner 是否实际为
+  Windows 10 client x64。
 - 没有 Actions：确认 workflow 已 push，并在仓库设置中启用 Actions。
 - 下载不到 artifact：确认 run 成功且登录账号有仓库访问权限。
 
