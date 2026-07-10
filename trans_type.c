@@ -23,6 +23,7 @@
 #define ABSOLUTE_MAX_BYTES (100 * 1024 * 1024)
 #define DEFAULT_HEX_CHUNK_BYTES 240
 #define MAX_HEX_CHUNK_BYTES 2048
+#define MAX_DIRECTORY_ENTRIES 10000
 
 #ifndef PROGRAM_NAME
 #define PROGRAM_NAME "trans_type.exe"
@@ -53,6 +54,12 @@ enum OutputEncoding {
     OUTPUT_UTF8 = 0,
     OUTPUT_UTF8_BOM = 1,
     OUTPUT_PRESERVE = 2
+};
+
+enum DataKind {
+    DATA_TEXT = 0,
+    DATA_FILE_BYTES = 1,
+    DATA_DIRECTORY = 2
 };
 
 typedef struct Options {
@@ -87,6 +94,10 @@ typedef struct TextData {
     const char *encoding;
     unsigned char *raw_bytes;
     int raw_count;
+    int kind;
+    int file_count;
+    int directory_count;
+    wchar_t source_path[32768];
     wchar_t source_label[32768];
 } TextData;
 
@@ -131,44 +142,62 @@ static void init_options(Options *opt) {
     strcpy(opt->remote_zip, "tt.zip");
 }
 
+static void print_help_option(const char *option, const char *description) {
+    printf("  %-25s%s\n", option, description);
+}
+
 static void print_usage(void) {
-    puts(PROGRAM_NAME " - type trans.txt or clipboard text into the current foreground window");
+    puts(PROGRAM_NAME " - 通过模拟键盘输入文本或文件传输命令");
+    puts("Type text or file-transfer commands into the foreground Windows window.");
     puts("");
-    puts("Usage:");
+    puts("用法 / usage:");
     puts("  " PROGRAM_NAME " [options]");
     puts("");
-    puts("Options:");
-    puts("  --source file         Read text from trans.txt next to this executable. Default");
-    puts("  --source clipboard    Read text from the Windows clipboard");
-    puts("  --file PATH           Read text from PATH. Implies --source file");
-    puts("  --mode simple         Type the source text directly through keyboard events. Default");
-    puts("  --mode cmd-hex        Type a cmd/certutil hex transfer to recreate the text file");
-    puts("  --mode zip-hex        Type a zipped hex transfer, then expand it remotely");
-    puts("  --remote-output PATH  Remote output file for --mode cmd-hex/zip-hex. Default: trans.txt");
-    puts("  --remote-hex PATH     Remote temporary hex file for --mode cmd-hex/zip-hex. Default: tt.hex");
-    puts("  --remote-zip PATH     Remote temporary zip file for --mode zip-hex. Default: tt.zip");
-    puts("  --output-encoding E   utf8, utf8-bom, or preserve. Default: utf8");
-    puts("  --commands-out PATH   Write generated complex-mode commands to a local file");
-    puts("  --delay-ms N          Delay after each character. Default: 20");
-    puts("  --line-delay-ms N     Delay after each line. Default: 100");
-    puts("  --start-delay-sec N   Countdown before typing. Default: 5");
-    puts("  --max-bytes N         Maximum input size. Default: 1048576");
-    puts("  --hex-chunk-bytes N   Bytes per generated hex line. Default: 240");
-    puts("  --ascii-only          Refuse to type non-ASCII characters");
-    puts("  --ascii-keys          Type ASCII through SendInput virtual keys");
-    puts("  --legacy-keys         Type ASCII through legacy keybd_event. Default");
-    puts("  --sendinput           Use Unicode SendInput for validated simple text/diagnostics");
-    puts("                         Does not enable uppercase, symbols, or non-ASCII in simple mode");
-    puts("  --enter-mode key      Send Enter as VK_RETURN. Default");
-    puts("  --enter-mode unicode  Send Enter as Unicode carriage return");
-    puts("  --no-focus-check      Do not pause when the foreground window changes");
-    puts("  --dry-run             Parse and validate the source text without typing");
-    puts("  --self-test           Test whether the selected input mode can send a harmless F24 key event");
-    puts("  --help                Show this help");
+    puts("选项 / options:");
+    print_help_option("--source SOURCE", "来源：clipboard、file(trans.txt)或本地路径 / source (default: file)");
+    print_help_option("--file PATH", "--source PATH 的兼容别名 / compatibility alias (default: unset)");
+    print_help_option("--mode MODE", "传输模式 / simple, cmd-hex, or zip-hex (default: simple)");
+    print_help_option("--remote-output PATH", "远端文件或目录 / remote file or folder (default: trans.txt)");
+    print_help_option("--remote-hex PATH", "远端临时 hex / remote temporary hex (default: tt.hex)");
+    print_help_option("--remote-zip PATH", "远端临时 zip / remote temporary zip (default: tt.zip)");
+    print_help_option("--output-encoding E", "输出编码 / utf8, utf8-bom, or preserve (default: utf8)");
+    print_help_option("--commands-out PATH", "导出复杂模式命令 / export command stream (default: unset)");
+    print_help_option("--hex-chunk-bytes N", "每行 hex 原始字节数 / bytes per hex line (default: 240)");
+    print_help_option("--delay-ms N", "每个字符延迟 / delay per character (0..5000, default: 20)");
+    print_help_option("--line-delay-ms N", "每行延迟 / delay after each line (0..5000, default: 100)");
+    print_help_option("--start-delay-sec N", "开始前倒计时 / countdown before typing (default: 5)");
+    print_help_option("--max-bytes N", "文件字节上限 / source byte limit (default: 1048576)");
+    print_help_option("--ascii-only", "拒绝非 ASCII 文本 / reject non-ASCII text (default: off)");
+    print_help_option("--ascii-keys", "使用 SendInput 虚拟键 / use SendInput virtual keys (default: off)");
+    print_help_option("--legacy-keys", "使用 keybd_event ASCII 键 / use legacy keys (default)");
+    print_help_option("--sendinput", "诊断用 Unicode SendInput / diagnostic transport (default: off)");
+    print_help_option("--enter-mode MODE", "回车方式 / key or unicode (default: key)");
+    print_help_option("--no-focus-check", "关闭前台窗口检查 / disable focus check (default: check on)");
+    print_help_option("--dry-run", "只验证，不输入 / validate without typing (default: off)");
+    print_help_option("--self-test", "发送无害 F24 测试键 / harmless F24 test (default: off)");
+    print_help_option("-h, --help", "显示帮助并退出 / show help and exit");
     puts("");
-    puts("Controls while running:");
-    puts("  Esc                   Abort");
-    puts("  Pause/Break           Pause and resume through a new countdown");
+    puts("模式、内容与文件 / modes, content, and files:");
+    puts("  simple:");
+    puts("    内容/content : 受限小写文本 / restricted lowercase text");
+    puts("    允许/allowed : a-z 0-9 space tab newline ` - = [ ] \\ ; ' , . /");
+    puts("    文件/files   : 直接输入，不创建远端文件 / direct typing; no remote file");
+    puts("  cmd-hex:");
+    puts("    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file");
+    puts("    文件/files   : 输出 trans.txt，临时 tt.hex / output trans.txt; temporary tt.hex");
+    puts("  zip-hex (文本或文件 / text or file):");
+    puts("    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file");
+    puts("    文件/files   : 输出 trans.txt，临时 tt.hex、tt.zip / output trans.txt; temporary tt.hex, tt.zip");
+    puts("  zip-hex (目录 / directory):");
+    puts("    内容/content : 一个真实目录，不允许链接 / one real directory; no links");
+    puts("    文件/files   : 解压到 --remote-output；临时 tt.hex、tt.zip / destination folder; temporary files");
+    puts("  上述文件名是默认值，可用 --remote-* 修改；目录建议显式设置 --remote-output。");
+    puts("  These are defaults and can be changed with --remote-*; set a folder destination explicitly.");
+    puts("  本地默认 / local defaults: source=trans.txt, commands-out=unset, focus-check=on.");
+    puts("");
+    puts("运行控制 / runtime controls:");
+    puts("  Esc                    中止 / abort");
+    puts("  Pause/Break            暂停并重新倒计时 / pause and recapture target");
 }
 
 static int parse_int_range(const char *s, int min_value, int max_value, int *out) {
@@ -243,6 +272,8 @@ static int copy_remote_path(char *dest, size_t dest_len, const char *value, cons
 
 static int parse_args(int argc, char **argv, Options *opt) {
     int i;
+    int source_option_kind = 0;
+    int file_option_seen = 0;
 
     for (i = 1; i < argc; ++i) {
         const char *value = NULL;
@@ -305,13 +336,32 @@ static int parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--source", &value);
         if (matched == 1) {
+            if (source_option_kind != 0) {
+                fprintf(stderr, "--source may only be specified once.\n");
+                return 0;
+            }
             if (strcmp(value, "file") == 0) {
                 opt->source = SOURCE_FILE;
+                source_option_kind = 1;
             } else if (strcmp(value, "clipboard") == 0) {
+                if (file_option_seen) {
+                    fprintf(stderr, "--file cannot be combined with --source clipboard.\n");
+                    return 0;
+                }
                 opt->source = SOURCE_CLIPBOARD;
+                source_option_kind = 2;
             } else {
-                fprintf(stderr, "Invalid --source value: %s\n", value);
-                return 0;
+                if (file_option_seen) {
+                    fprintf(stderr, "--file cannot be combined with --source PATH.\n");
+                    return 0;
+                }
+                opt->source = SOURCE_FILE;
+                opt->has_file_path = 1;
+                if (!arg_to_wide_path(value, opt->file_path, sizeof(opt->file_path) / sizeof(opt->file_path[0]))) {
+                    fprintf(stderr, "Invalid --source path: %s\n", value);
+                    return 0;
+                }
+                source_option_kind = 3;
             }
             continue;
         } else if (matched == 0) {
@@ -320,12 +370,17 @@ static int parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--file", &value);
         if (matched == 1) {
+            if (file_option_seen || source_option_kind == 2 || source_option_kind == 3) {
+                fprintf(stderr, "--file conflicts with another explicit source path.\n");
+                return 0;
+            }
             opt->source = SOURCE_FILE;
             opt->has_file_path = 1;
             if (!arg_to_wide_path(value, opt->file_path, sizeof(opt->file_path) / sizeof(opt->file_path[0]))) {
                 fprintf(stderr, "Invalid --file path: %s\n", value);
                 return 0;
             }
+            file_option_seen = 1;
             continue;
         } else if (matched == 0) {
             return 0;
@@ -457,6 +512,14 @@ static int parse_args(int argc, char **argv, Options *opt) {
         }
     }
 
+    if (opt->output_encoding == OUTPUT_PRESERVE && opt->transfer_mode == TRANSFER_SIMPLE) {
+        fprintf(stderr, "--output-encoding preserve is only valid with --mode cmd-hex or --mode zip-hex.\n");
+        return 0;
+    }
+    if (opt->output_encoding == OUTPUT_PRESERVE && opt->source == SOURCE_CLIPBOARD) {
+        fprintf(stderr, "--output-encoding preserve requires a file source, not clipboard text.\n");
+        return 0;
+    }
     return 1;
 }
 
@@ -617,16 +680,158 @@ static int decode_utf16be(const unsigned char *bytes, int byte_count, wchar_t **
     return 1;
 }
 
+static int scan_directory_recursive(const wchar_t *path, const Options *opt, TextData *data, int depth) {
+    wchar_t *pattern = NULL;
+    wchar_t *child = NULL;
+    WIN32_FIND_DATAW found;
+    HANDLE search = INVALID_HANDLE_VALUE;
+    size_t path_len;
+    int result = 0;
+
+    if (depth > 128) {
+        fprintf(stderr, "Directory nesting exceeds the supported depth of 128.\n");
+        return 0;
+    }
+    path_len = wcslen(path);
+    if (path_len + 3 >= 32768) {
+        fprintf(stderr, "Directory path is too long while scanning.\n");
+        return 0;
+    }
+    pattern = (wchar_t *)calloc(path_len + 3, sizeof(wchar_t));
+    if (pattern == NULL) {
+        fprintf(stderr, "Not enough memory to scan the source directory.\n");
+        return 0;
+    }
+    wcscpy(pattern, path);
+    if (path_len > 0 && path[path_len - 1] != L'\\' && path[path_len - 1] != L'/') {
+        wcscat(pattern, L"\\");
+    }
+    wcscat(pattern, L"*");
+
+    search = FindFirstFileW(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE) {
+        print_windows_error_a("Cannot enumerate source directory", GetLastError());
+        print_wide_line(stderr, "Path: ", path);
+        goto cleanup;
+    }
+
+    do {
+        ULONGLONG file_size;
+        size_t child_len;
+        if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0) {
+            continue;
+        }
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            fprintf(stderr, "Directory source contains a symbolic link, junction, or reparse point.\n");
+            print_wide_line(stderr, "Entry: ", found.cFileName);
+            goto cleanup;
+        }
+        child_len = path_len + wcslen(found.cFileName) + 2;
+        if (child_len >= 32768) {
+            fprintf(stderr, "Directory entry path is too long.\n");
+            goto cleanup;
+        }
+        child = (wchar_t *)calloc(child_len, sizeof(wchar_t));
+        if (child == NULL) {
+            fprintf(stderr, "Not enough memory to inspect a directory entry.\n");
+            goto cleanup;
+        }
+        _snwprintf(child, child_len,
+                   (path_len > 0 && (path[path_len - 1] == L'\\' || path[path_len - 1] == L'/'))
+                       ? L"%ls%ls" : L"%ls\\%ls",
+                   path, found.cFileName);
+        child[child_len - 1] = L'\0';
+        if (child[0] == L'\0') {
+            fprintf(stderr, "Could not build a directory entry path.\n");
+            goto cleanup;
+        }
+        if (data->file_count + data->directory_count >= MAX_DIRECTORY_ENTRIES) {
+            fprintf(stderr, "Directory contains more than %d entries.\n", MAX_DIRECTORY_ENTRIES);
+            goto cleanup;
+        }
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ++data->directory_count;
+            if (!scan_directory_recursive(child, opt, data, depth + 1)) {
+                goto cleanup;
+            }
+            free(child);
+            child = NULL;
+            continue;
+        }
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DEVICE) {
+            fprintf(stderr, "Directory source contains an unsupported device entry.\n");
+            print_wide_line(stderr, "Entry: ", child);
+            goto cleanup;
+        }
+        file_size = ((ULONGLONG)found.nFileSizeHigh << 32) | found.nFileSizeLow;
+        if (file_size > (ULONGLONG)opt->max_bytes ||
+            (ULONGLONG)data->bytes + file_size > (ULONGLONG)opt->max_bytes) {
+            fprintf(stderr, "Directory file data is larger than --max-bytes.\n");
+            goto cleanup;
+        }
+        data->bytes += (int)file_size;
+        ++data->file_count;
+        free(child);
+        child = NULL;
+    } while (FindNextFileW(search, &found));
+
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        print_windows_error_a("Cannot continue enumerating source directory", GetLastError());
+        goto cleanup;
+    }
+    result = 1;
+
+cleanup:
+    free(child);
+    free(pattern);
+    if (search != INVALID_HANDLE_VALUE) {
+        FindClose(search);
+    }
+    return result;
+}
+
 static int read_trans_file(const wchar_t *path, const Options *opt, TextData *data) {
     HANDLE file;
     LARGE_INTEGER size;
     DWORD read_bytes;
     unsigned char *bytes;
     int ok;
+    DWORD attributes;
+    int preserve_file;
 
     memset(data, 0, sizeof(*data));
     _snwprintf(data->source_label, (sizeof(data->source_label) / sizeof(data->source_label[0])) - 1, L"File: %ls", path);
     data->source_label[(sizeof(data->source_label) / sizeof(data->source_label[0])) - 1] = L'\0';
+    if (wcslen(path) + 1 > sizeof(data->source_path) / sizeof(data->source_path[0])) {
+        fprintf(stderr, "Input path is too long.\n");
+        return EXIT_FILE;
+    }
+    wcscpy(data->source_path, path);
+
+    attributes = GetFileAttributesW(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        print_windows_error_a("Cannot inspect input path", GetLastError());
+        print_wide_line(stderr, "Path: ", path);
+        return EXIT_FILE;
+    }
+    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+        fprintf(stderr, "Input path cannot be a symbolic link, junction, or other reparse point.\n");
+        return EXIT_FILE;
+    }
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        if (opt->transfer_mode != TRANSFER_ZIP_HEX) {
+            fprintf(stderr, "Directory sources are only supported with --mode zip-hex.\n");
+            return EXIT_ARGS;
+        }
+        data->kind = DATA_DIRECTORY;
+        data->encoding = "directory tree (file bytes preserved)";
+        _snwprintf(data->source_label, (sizeof(data->source_label) / sizeof(data->source_label[0])) - 1,
+                   L"Directory: %ls", path);
+        if (!scan_directory_recursive(path, opt, data, 0)) {
+            return EXIT_FILE;
+        }
+        return EXIT_OK;
+    }
 
     file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) {
@@ -641,7 +846,8 @@ static int read_trans_file(const wchar_t *path, const Options *opt, TextData *da
         return EXIT_FILE;
     }
 
-    if (size.QuadPart == 0) {
+    preserve_file = opt->transfer_mode != TRANSFER_SIMPLE && opt->output_encoding == OUTPUT_PRESERVE;
+    if (size.QuadPart == 0 && !preserve_file) {
         fprintf(stderr, "Input file is empty.\n");
         CloseHandle(file);
         return EXIT_FILE;
@@ -660,7 +866,7 @@ static int read_trans_file(const wchar_t *path, const Options *opt, TextData *da
         return EXIT_FILE;
     }
 
-    bytes = (unsigned char *)malloc((size_t)size.QuadPart);
+    bytes = (unsigned char *)malloc(size.QuadPart > 0 ? (size_t)size.QuadPart : 1U);
     if (bytes == NULL) {
         fprintf(stderr, "Not enough memory to read input file.\n");
         CloseHandle(file);
@@ -677,6 +883,14 @@ static int read_trans_file(const wchar_t *path, const Options *opt, TextData *da
     }
 
     data->bytes = (int)size.QuadPart;
+
+    if (preserve_file) {
+        data->kind = DATA_FILE_BYTES;
+        data->encoding = "raw file bytes (preserved)";
+        data->raw_bytes = bytes;
+        data->raw_count = data->bytes;
+        return EXIT_OK;
+    }
 
     if (data->bytes >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
         if (!decode_with_codepage(bytes + 3, data->bytes - 3, CP_UTF8, MB_ERR_INVALID_CHARS, &data->text, &data->chars)) {
@@ -711,6 +925,7 @@ static int read_trans_file(const wchar_t *path, const Options *opt, TextData *da
 
     data->raw_bytes = bytes;
     data->raw_count = data->bytes;
+    data->kind = DATA_TEXT;
     return EXIT_OK;
 }
 
@@ -969,11 +1184,11 @@ static int make_output_bytes(const TextData *data, const Options *opt, unsigned 
     unsigned char *bytes;
 
     if (opt->output_encoding == OUTPUT_PRESERVE) {
-        if (data->raw_bytes == NULL || data->raw_count <= 0) {
+        if (data->kind != DATA_FILE_BYTES || data->raw_bytes == NULL || data->raw_count < 0) {
             fprintf(stderr, "--output-encoding preserve requires file input.\n");
             return 0;
         }
-        bytes = (unsigned char *)malloc((size_t)data->raw_count);
+        bytes = (unsigned char *)malloc(data->raw_count > 0 ? (size_t)data->raw_count : 1U);
         if (bytes == NULL) {
             return 0;
         }
@@ -1176,14 +1391,19 @@ static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
         start = end + 1;
     }
 
-    APPEND_FMT("certutil -f -decodehex '%s' '%s'\ncertutil -hashfile '%s' sha256\nexit\n",
-               opt->remote_hex, opt->remote_output, opt->remote_output);
+    if (first_line) {
+        APPEND_FMT("set-content -nonewline '%s' ''\nset-content -nonewline '%s' ''\n",
+                   opt->remote_hex, opt->remote_output);
+    } else {
+        APPEND_FMT("certutil -f -decodehex '%s' '%s'\n", opt->remote_hex, opt->remote_output);
+    }
+    APPEND_FMT("certutil -hashfile '%s' sha256\nexit\n", opt->remote_output);
 #undef APPEND_FMT
 
     return commands;
 }
 
-static char *build_zip_hex_commands(const char *hex_text, const Options *opt) {
+static char *build_zip_hex_commands(const char *hex_text, const Options *opt, int directory_source) {
     size_t hex_len = strlen(hex_text);
     size_t line_count = 0;
     size_t remote_hex_len = strlen(opt->remote_hex);
@@ -1201,8 +1421,8 @@ static char *build_zip_hex_commands(const char *hex_text, const Options *opt) {
         }
     }
 
-    cap = hex_len + line_count * (remote_hex_len + 48) + remote_hex_len + remote_zip_len * 2 +
-          strlen(opt->remote_output) + 640;
+    cap = hex_len + line_count * (remote_hex_len + 48) + remote_hex_len + remote_zip_len * 4 +
+          strlen(opt->remote_output) * 2 + 1024;
     commands = (char *)malloc(cap);
     if (commands == NULL) {
         return NULL;
@@ -1235,12 +1455,14 @@ static char *build_zip_hex_commands(const char *hex_text, const Options *opt) {
         start = end + 1;
     }
 
-    APPEND_FMT("certutil -f -decodehex '%s' '%s'\nexpand-archive -force '%s' .\n"
-               "certutil -hashfile '%s' sha256\nexit\n",
-               opt->remote_hex,
-               opt->remote_zip,
-               opt->remote_zip,
-               opt->remote_output);
+    APPEND_FMT("certutil -f -decodehex '%s' '%s'\n", opt->remote_hex, opt->remote_zip);
+    if (directory_source) {
+        APPEND_FMT("certutil -hashfile '%s' sha256\nexpand-archive -force '%s' '%s'\nexit\n",
+                   opt->remote_zip, opt->remote_zip, opt->remote_output);
+    } else {
+        APPEND_FMT("expand-archive -force '%s' .\ncertutil -hashfile '%s' sha256\nexit\n",
+                   opt->remote_zip, opt->remote_output);
+    }
 #undef APPEND_FMT
 
     return commands;
@@ -1430,6 +1652,72 @@ static int run_local_zip_command(const wchar_t *working_dir, const wchar_t *entr
     return 1;
 }
 
+static int run_local_directory_zip_command(const wchar_t *working_dir, const wchar_t *source_path) {
+    static const wchar_t variable_name[] = L"trans_type_source";
+    wchar_t command[] =
+        L"powershell.exe -NoProfile -NonInteractive -Command "
+        L"\"Add-Type -AssemblyName System.IO.Compression.FileSystem; "
+        L"[System.IO.Compression.ZipFile]::CreateFromDirectory($env:trans_type_source,'tt.zip',"
+        L"[System.IO.Compression.CompressionLevel]::Optimal,$false)\"";
+    wchar_t *old_value = NULL;
+    DWORD old_length;
+    DWORD old_error;
+    int had_old_value = 0;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code;
+
+    SetLastError(ERROR_SUCCESS);
+    old_length = GetEnvironmentVariableW(variable_name, NULL, 0);
+    old_error = GetLastError();
+    if (old_length > 0) {
+        old_value = (wchar_t *)calloc(old_length, sizeof(wchar_t));
+        if (old_value == NULL || GetEnvironmentVariableW(variable_name, old_value, old_length) == 0) {
+            free(old_value);
+            fprintf(stderr, "Could not preserve the local compression environment.\n");
+            return 0;
+        }
+        had_old_value = 1;
+    } else if (old_error != ERROR_ENVVAR_NOT_FOUND && old_error != ERROR_SUCCESS) {
+        fprintf(stderr, "Could not inspect the local compression environment. Win32 error: %lu\n", old_error);
+        return 0;
+    }
+
+    if (!SetEnvironmentVariableW(variable_name, source_path)) {
+        fprintf(stderr, "Could not prepare the local directory path for compression. Win32 error: %lu\n", GetLastError());
+        free(old_value);
+        return 0;
+    }
+
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, working_dir, &si, &pi)) {
+        DWORD create_error = GetLastError();
+        SetEnvironmentVariableW(variable_name, had_old_value ? old_value : NULL);
+        free(old_value);
+        fprintf(stderr, "Could not start local PowerShell to create directory zip. Win32 error: %lu\n", create_error);
+        return 0;
+    }
+    SetEnvironmentVariableW(variable_name, had_old_value ? old_value : NULL);
+    free(old_value);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code)) {
+        exit_code = 1;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (exit_code != 0) {
+        fprintf(stderr, "Local PowerShell directory compression failed with exit code %lu.\n", exit_code);
+        return 0;
+    }
+    return 1;
+}
+
 static int make_local_zip_payload(const unsigned char *bytes,
                                   int byte_count,
                                   const char *remote_output,
@@ -1489,6 +1777,58 @@ static int make_local_zip_payload(const unsigned char *bytes,
     return ok;
 }
 
+static int make_local_directory_zip_payload(const TextData *data,
+                                            const Options *opt,
+                                            unsigned char **zip_bytes,
+                                            int *zip_count) {
+    wchar_t temp_base[MAX_PATH];
+    wchar_t temp_dir[MAX_PATH];
+    wchar_t zip_path[MAX_PATH];
+    TextData current;
+    DWORD len;
+    int zip_path_len;
+    int ok = 0;
+
+    memset(&current, 0, sizeof(current));
+    if (!scan_directory_recursive(data->source_path, opt, &current, 0)) {
+        return 0;
+    }
+    if (current.bytes != data->bytes || current.file_count != data->file_count ||
+        current.directory_count != data->directory_count) {
+        fprintf(stderr, "Source directory changed after it was scanned; retry the transfer.\n");
+        return 0;
+    }
+
+    len = GetTempPathW((DWORD)(sizeof(temp_base) / sizeof(temp_base[0])), temp_base);
+    if (len == 0 || len >= sizeof(temp_base) / sizeof(temp_base[0])) {
+        fprintf(stderr, "Could not locate the Windows temp directory.\n");
+        return 0;
+    }
+    if (!GetTempFileNameW(temp_base, L"ttd", 0, temp_dir)) {
+        fprintf(stderr, "Could not reserve a temporary directory name. Win32 error: %lu\n", GetLastError());
+        return 0;
+    }
+    DeleteFileW(temp_dir);
+    if (!CreateDirectoryW(temp_dir, NULL)) {
+        fprintf(stderr, "Could not create a temporary directory for folder compression. Win32 error: %lu\n", GetLastError());
+        return 0;
+    }
+    zip_path_len = _snwprintf(zip_path, sizeof(zip_path) / sizeof(zip_path[0]), L"%ls\\tt.zip", temp_dir);
+    if (zip_path_len < 0 || zip_path_len >= (int)(sizeof(zip_path) / sizeof(zip_path[0]))) {
+        fprintf(stderr, "Temporary zip path is too long.\n");
+        RemoveDirectoryW(temp_dir);
+        return 0;
+    }
+
+    if (run_local_directory_zip_command(temp_dir, data->source_path) &&
+        read_binary_file_w(zip_path, zip_bytes, zip_count)) {
+        ok = 1;
+    }
+    DeleteFileW(zip_path);
+    RemoveDirectoryW(temp_dir);
+    return ok;
+}
+
 static int shift_free_simple_char(wchar_t ch) {
     if ((ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9')) {
         return 1;
@@ -1501,32 +1841,43 @@ static int validate_text(const TextData *data, const TextStats *stats, const Opt
     int line;
     int col;
 
-    if (data->chars == 0) {
+    if (data->kind == DATA_DIRECTORY && opt->transfer_mode != TRANSFER_ZIP_HEX) {
+        fprintf(stderr, "Directory sources are only supported with --mode zip-hex.\n");
+        return EXIT_ARGS;
+    }
+    if (data->kind == DATA_FILE_BYTES &&
+        (opt->transfer_mode == TRANSFER_SIMPLE || opt->output_encoding != OUTPUT_PRESERVE)) {
+        fprintf(stderr, "Raw file bytes require cmd-hex or zip-hex with --output-encoding preserve.\n");
+        return EXIT_ARGS;
+    }
+
+    if (data->kind == DATA_TEXT && data->chars == 0) {
         fprintf(stderr, "Input decoded to empty text.\n");
         return EXIT_CONTENT;
     }
 
-    if (stats->control_count > 0) {
+    if (data->kind == DATA_TEXT && stats->control_count > 0) {
         index_to_line_col(data->text, data->chars, stats->first_control, &line, &col);
         fprintf(stderr, "Input contains unsupported control characters. First one at line %d, column %d.\n", line, col);
         fprintf(stderr, "Allowed control characters are tab and newlines only.\n");
         return EXIT_CONTENT;
     }
 
-    if (stats->surrogate_error_count > 0) {
+    if (data->kind == DATA_TEXT && stats->surrogate_error_count > 0) {
         index_to_line_col(data->text, data->chars, stats->first_surrogate_error, &line, &col);
         fprintf(stderr, "Input contains invalid UTF-16 surrogate data. First issue at line %d, column %d.\n", line, col);
         return EXIT_CONTENT;
     }
 
-    if (opt->ascii_only && stats->non_ascii_count > 0) {
+    if (data->kind == DATA_TEXT && opt->ascii_only && stats->non_ascii_count > 0) {
         index_to_line_col(data->text, data->chars, stats->first_non_ascii, &line, &col);
         fprintf(stderr, "--ascii-only is enabled, but input has non-ASCII characters. First one at line %d, column %d.\n", line, col);
         return EXIT_CONTENT;
     }
 
     if (opt->transfer_mode == TRANSFER_CMD_HEX || opt->transfer_mode == TRANSFER_ZIP_HEX) {
-        if (opt->output_encoding == OUTPUT_PRESERVE && data->raw_bytes == NULL) {
+        if (opt->output_encoding == OUTPUT_PRESERVE && data->kind != DATA_FILE_BYTES &&
+            data->kind != DATA_DIRECTORY) {
             fprintf(stderr, "--output-encoding preserve requires file input; clipboard text has no original bytes.\n");
             return EXIT_ARGS;
         }
@@ -1583,9 +1934,15 @@ static void print_summary(const TextData *data, const TextStats *stats, const Op
     print_wide_line(stdout, "Source: ", data->source_label);
     printf("Encoding: %s\n", data->encoding);
     printf("Bytes: %d\n", data->bytes);
-    printf("Characters: %d\n", data->chars);
-    printf("Lines: %d\n", stats->lines);
-    printf("Non-ASCII characters: %d\n", stats->non_ascii_count);
+    if (data->kind == DATA_DIRECTORY) {
+        printf("Directory entries: %d file(s), %d subdirectory(s)\n", data->file_count, data->directory_count);
+    } else if (data->kind == DATA_FILE_BYTES) {
+        printf("Content: arbitrary regular file bytes\n");
+    } else {
+        printf("Characters: %d\n", data->chars);
+        printf("Lines: %d\n", stats->lines);
+        printf("Non-ASCII characters: %d\n", stats->non_ascii_count);
+    }
     printf("Delay: %d ms per character, %d ms per line\n", opt->delay_ms, opt->line_delay_ms);
     printf("Focus check: %s\n", opt->no_focus_check ? "off" : "on");
     if (opt->transfer_mode == TRANSFER_CMD_HEX) {
@@ -1596,8 +1953,13 @@ static void print_summary(const TextData *data, const TextStats *stats, const Op
         printf("Hex chunk: %d bytes per generated line\n", opt->hex_chunk_bytes);
     } else if (opt->transfer_mode == TRANSFER_ZIP_HEX) {
         printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
-        printf("Output encoding: %s\n", output_encoding_name(opt->output_encoding));
-        printf("Remote output: %s\n", opt->remote_output);
+        if (data->kind == DATA_DIRECTORY) {
+            printf("Output encoding: directory file bytes preserved\n");
+            printf("Remote destination directory: %s\n", opt->remote_output);
+        } else {
+            printf("Output encoding: %s\n", output_encoding_name(opt->output_encoding));
+            printf("Remote output: %s\n", opt->remote_output);
+        }
         printf("Remote temporary hex: %s\n", opt->remote_hex);
         printf("Remote temporary zip: %s\n", opt->remote_zip);
         printf("Hex chunk: %d bytes per generated line\n", opt->hex_chunk_bytes);
@@ -2167,24 +2529,36 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
     int zip_count = 0;
     size_t hex_line_count = 0;
     double ratio;
+    int directory_source = data->kind == DATA_DIRECTORY;
     int rc;
 
-    if (!make_output_bytes(data, opt, &bytes, &byte_count)) {
-        fprintf(stderr, "Input could not be converted to the selected output encoding.\n");
-        return EXIT_ENCODING;
-    }
-    if (!sha256_bytes(bytes, byte_count, digest)) {
-        fprintf(stderr, "Could not calculate SHA-256.\n");
+    if (directory_source) {
+        byte_count = data->bytes;
+        if (!make_local_directory_zip_payload(data, opt, &zip_bytes, &zip_count)) {
+            return EXIT_FILE;
+        }
+        if (!sha256_bytes(zip_bytes, zip_count, digest)) {
+            fprintf(stderr, "Could not calculate directory archive SHA-256.\n");
+            free(zip_bytes);
+            return EXIT_FILE;
+        }
+    } else {
+        if (!make_output_bytes(data, opt, &bytes, &byte_count)) {
+            fprintf(stderr, "Input could not be converted to the selected output encoding.\n");
+            return EXIT_ENCODING;
+        }
+        if (!sha256_bytes(bytes, byte_count, digest)) {
+            fprintf(stderr, "Could not calculate SHA-256.\n");
+            free(bytes);
+            return EXIT_FILE;
+        }
+        if (!make_local_zip_payload(bytes, byte_count, opt->remote_output, &zip_bytes, &zip_count)) {
+            free(bytes);
+            return EXIT_FILE;
+        }
         free(bytes);
-        return EXIT_FILE;
     }
     digest_to_hex(digest, digest_hex);
-
-    if (!make_local_zip_payload(bytes, byte_count, opt->remote_output, &zip_bytes, &zip_count)) {
-        free(bytes);
-        return EXIT_FILE;
-    }
-    free(bytes);
 
     hex_text = bytes_to_plain_hex(zip_bytes, zip_count, opt->hex_chunk_bytes);
     free(zip_bytes);
@@ -2202,7 +2576,12 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
     printf("Remote temporary hex: %s\n", opt->remote_hex);
     printf("Remote temporary zip: %s\n", opt->remote_zip);
     printf("Hex chunk: %d bytes per generated line (%u line(s))\n", opt->hex_chunk_bytes, (unsigned int)hex_line_count);
-    printf("Expected SHA-256: %s\n", digest_hex);
+    if (directory_source) {
+        printf("Expected archive SHA-256: %s\n", digest_hex);
+        printf("The remote destination is merged/overwritten; unrelated existing files are not removed.\n");
+    } else {
+        printf("Expected SHA-256: %s\n", digest_hex);
+    }
     printf("Remote temporary hex and zip files are retained for recovery and inspection.\n");
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.\n");
 
@@ -2211,7 +2590,7 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
         key_opt.ascii_keys = 0;
     }
 
-    commands = build_zip_hex_commands(hex_text, opt);
+    commands = build_zip_hex_commands(hex_text, opt, directory_source);
     if (commands == NULL) {
         free(hex_text);
         fprintf(stderr, "Not enough memory to build zip-hex commands.\n");

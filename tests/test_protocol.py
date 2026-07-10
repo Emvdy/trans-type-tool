@@ -92,12 +92,95 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(archive.namelist(), ["trans.txt"])
             self.assertEqual(archive.read("trans.txt"), raw)
 
-    def test_preserve_rejects_clipboard_data(self) -> None:
-        data = text_data("text")
-        data.raw_bytes = None
-        opt = options("--mode", "cmd-hex", "--source", "clipboard", "--output-encoding", "preserve")
-        with self.assertRaisesRegex(RuntimeError, "requires file input"):
+    def test_source_path_replaces_file_option_without_breaking_alias(self) -> None:
+        direct = options("--mode", "cmd-hex", "--source", "some/path.bin", "--output-encoding", "preserve")
+        alias = options("--mode", "cmd-hex", "--file", "some/path.bin", "--output-encoding", "preserve")
+        self.assertEqual(direct.source, "file")
+        self.assertEqual(direct.file_path, Path("some/path.bin"))
+        self.assertEqual(alias.file_path, direct.file_path)
+        with self.assertRaises(SystemExit):
+            options("--source", "clipboard", "--file", "some/path.bin")
+
+    def test_preserve_is_restricted_to_file_complex_modes(self) -> None:
+        with self.assertRaises(SystemExit):
+            options("--mode", "simple", "--output-encoding", "preserve")
+        with self.assertRaises(SystemExit):
+            options("--mode", "cmd-hex", "--source", "clipboard", "--output-encoding", "preserve")
+
+    def test_arbitrary_binary_file_roundtrips_in_complex_modes(self) -> None:
+        raw = bytes(range(256)) * 4
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "payload.bin"
+            source.write_bytes(raw)
+            for mode in ("cmd-hex", "zip-hex"):
+                opt = options(
+                    "--mode",
+                    mode,
+                    "--source",
+                    str(source),
+                    "--output-encoding",
+                    "preserve",
+                    "--remote-output",
+                    "payload.bin",
+                )
+                data = tool.read_text_source(opt)
+                self.assertEqual(data.source_kind, "file")
+                self.assertEqual(tool.output_bytes(data, opt), raw)
+                tool.validate_text(data, tool.analyze_text(data.text), opt)
+                transfer = tool.zip_payload(raw, opt) if mode == "zip-hex" else raw
+                payload, _, _ = tool.hex_payload_from_bytes(transfer, opt.hex_chunk_bytes)
+                commands = (
+                    tool.build_zip_hex_commands(payload, opt)
+                    if mode == "zip-hex"
+                    else tool.build_cmd_hex_commands(payload, opt)
+                )
+                assert_safe_stream(self, commands)
+
+    def test_directory_source_builds_content_only_zip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            (source / "Nested").mkdir(parents=True)
+            (source / "empty").mkdir()
+            (source / "root.bin").write_bytes(b"\x00\xffroot")
+            (source / "Nested" / "unicode-\u4e2d.txt").write_bytes(b"nested")
+            opt = options(
+                "--mode",
+                "zip-hex",
+                "--source",
+                str(source),
+                "--remote-output",
+                "copied-dir",
+            )
+            data = tool.read_text_source(opt)
+            self.assertEqual(data.source_kind, "directory")
             tool.validate_text(data, tool.analyze_text(data.text), opt)
+            zipped = tool.zip_directory_payload(data)
+            with zipfile.ZipFile(io.BytesIO(zipped), "r") as archive:
+                self.assertEqual(archive.read("root.bin"), b"\x00\xffroot")
+                self.assertEqual(archive.read("Nested/unicode-\u4e2d.txt"), b"nested")
+                self.assertIn("empty/", archive.namelist())
+                self.assertTrue(all(not name.startswith("source/") for name in archive.namelist()))
+            payload, _, _ = tool.hex_payload_from_bytes(zipped, opt.hex_chunk_bytes)
+            commands = tool.build_zip_hex_commands(payload, opt, directory_source=True)
+            assert_safe_stream(self, commands)
+            self.assertIn("certutil -hashfile 'tt.zip' sha256", commands)
+            self.assertIn("expand-archive -force 'tt.zip' 'copied-dir'", commands)
+
+    def test_directory_source_is_zip_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            for mode in ("simple", "cmd-hex"):
+                opt = options("--mode", mode, "--source", str(source))
+                with self.assertRaisesRegex(RuntimeError, "only supported with --mode zip-hex"):
+                    tool.read_text_source(opt)
+
+    def test_empty_binary_cmd_creates_empty_output_without_decodehex(self) -> None:
+        opt = options("--mode", "cmd-hex", "--output-encoding", "preserve", "--remote-output", "empty.bin")
+        commands = tool.build_cmd_hex_commands("\n", opt)
+        assert_safe_stream(self, commands)
+        self.assertIn("set-content -nonewline 'empty.bin' ''", commands)
+        self.assertNotIn("decodehex", commands)
 
     def test_simple_mode_is_strictly_shift_free(self) -> None:
         opt = options("--mode", "simple")

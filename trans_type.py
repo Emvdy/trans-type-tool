@@ -5,6 +5,7 @@ import hashlib
 import io
 import locale
 import os
+import stat
 import sys
 import time
 import zipfile
@@ -26,6 +27,7 @@ DEFAULT_MAX_BYTES = 1024 * 1024
 ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024
 DEFAULT_HEX_CHUNK_BYTES = 240
 MAX_HEX_CHUNK_BYTES = 2048
+MAX_DIRECTORY_ENTRIES = 10000
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -80,6 +82,16 @@ class TextData:
     byte_count: int
     encoding: str
     raw_bytes: bytes | None = None
+    source_kind: str = "text"
+    directory_entries: tuple["DirectoryEntry", ...] = ()
+
+
+@dataclass(frozen=True)
+class DirectoryEntry:
+    path: Path
+    archive_name: str
+    is_directory: bool
+    byte_count: int
 
 
 @dataclass
@@ -123,60 +135,138 @@ def bounded_int(name: str, minimum: int, maximum: int):
 def parse_args(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(
         prog="trans_type_py.exe",
-        description="Type source text into the current foreground Windows window through simulated keyboard input.",
+        add_help=False,
+        formatter_class=lambda prog: argparse.RawTextHelpFormatter(
+            prog, max_help_position=31, width=100
+        ),
+        description=(
+            "通过模拟键盘向当前前台 Windows 窗口输入文本或文件传输命令。\n"
+            "Type text or file-transfer commands into the foreground Windows window."
+        ),
+        epilog=(
+            "模式、内容与文件 / modes, content, and files:\n"
+            "  simple:\n"
+            "    内容/content : 受限小写文本 / restricted lowercase text\n"
+            "    允许/allowed : a-z 0-9 space tab newline ` - = [ ] \\ ; ' , . /\n"
+            "    文件/files   : 直接输入，不创建远端文件 / direct typing; no remote file\n"
+            "  cmd-hex:\n"
+            "    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file\n"
+            "    文件/files   : 输出 trans.txt，临时 tt.hex / output trans.txt; temporary tt.hex\n"
+            "  zip-hex (文本或文件 / text or file):\n"
+            "    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file\n"
+            "    文件/files   : 输出 trans.txt，临时 tt.hex、tt.zip / output trans.txt; temporary tt.hex, tt.zip\n"
+            "  zip-hex (目录 / directory):\n"
+            "    内容/content : 一个真实目录，不允许链接 / one real directory; no links\n"
+            "    文件/files   : 解压到 --remote-output；临时 tt.hex、tt.zip / destination folder; temporary files\n"
+            "  上述文件名是默认值，可用 --remote-* 修改；目录建议显式设置 --remote-output。\n"
+            "  These are defaults and can be changed with --remote-*; set a folder destination explicitly.\n\n"
+            "本地默认 / local defaults: source=trans.txt，commands-out=unset，focus-check=on。\n\n"
+            "运行控制 / runtime controls: Esc 中止/abort，Pause/Break 暂停/pause。"
+        ),
     )
-    parser.add_argument("--delay-ms", type=bounded_int("--delay-ms", 0, 5000), default=DEFAULT_DELAY_MS)
-    parser.add_argument("--line-delay-ms", type=bounded_int("--line-delay-ms", 0, 5000), default=DEFAULT_LINE_DELAY_MS)
-    parser.add_argument("--start-delay-sec", type=bounded_int("--start-delay-sec", 0, 3600), default=DEFAULT_START_DELAY_SEC)
-    parser.add_argument("--max-bytes", type=bounded_int("--max-bytes", 1, ABSOLUTE_MAX_BYTES), default=DEFAULT_MAX_BYTES)
-    parser.add_argument("--source", choices=("file", "clipboard"), default="file")
-    parser.add_argument("--file", type=Path, help="Read text from PATH instead of trans.txt. Implies --source file")
-    parser.add_argument("--mode", choices=("simple", "cmd-hex", "zip-hex", "complex", "cmd", "zip"), default="simple")
-    parser.add_argument("--remote-output", default="trans.txt", help="Remote output file for --mode cmd-hex/zip-hex")
-    parser.add_argument("--remote-hex", default="tt.hex", help="Remote temporary hex file for --mode cmd-hex/zip-hex")
-    parser.add_argument("--remote-zip", default="tt.zip", help="Remote temporary zip file for --mode zip-hex")
+    parser._optionals.title = "选项 / options"
+    parser.add_argument("-h", "--help", action="help", help="显示帮助并退出 / show help and exit")
+    parser.add_argument("--delay-ms", metavar="N", type=bounded_int("--delay-ms", 0, 5000), default=DEFAULT_DELAY_MS,
+                        help="每个字符延迟 / delay per character (0..5000, default: 20)")
+    parser.add_argument("--line-delay-ms", metavar="N", type=bounded_int("--line-delay-ms", 0, 5000), default=DEFAULT_LINE_DELAY_MS,
+                        help="每行延迟 / delay after each line (0..5000, default: 100)")
+    parser.add_argument("--start-delay-sec", metavar="N", type=bounded_int("--start-delay-sec", 0, 3600), default=DEFAULT_START_DELAY_SEC,
+                        help="开始前倒计时 / countdown before typing (default: 5)")
+    parser.add_argument("--max-bytes", metavar="N", type=bounded_int("--max-bytes", 1, ABSOLUTE_MAX_BYTES), default=DEFAULT_MAX_BYTES,
+                        help="文件字节上限 / source byte limit (default: 1048576)")
+    parser.add_argument(
+        "--source",
+        metavar="SOURCE",
+        help="来源：clipboard、file(trans.txt)或本地路径 / source selector (default: file)",
+    )
+    parser.add_argument("--file", metavar="PATH", type=Path,
+                        help="--source PATH 的兼容别名 / compatibility alias (default: unset)")
+    parser.add_argument("--mode", metavar="MODE", choices=("simple", "cmd-hex", "zip-hex", "complex", "cmd", "zip"), default="simple",
+                        help="传输模式 / simple, cmd-hex, or zip-hex (default: simple)")
+    parser.add_argument(
+        "--remote-output",
+        metavar="PATH",
+        default="trans.txt",
+        help="远端文件或目录 / remote file or folder destination (default: trans.txt)",
+    )
+    parser.add_argument("--remote-hex", metavar="PATH", default="tt.hex",
+                        help="远端临时 hex / remote temporary hex (default: tt.hex)")
+    parser.add_argument("--remote-zip", metavar="PATH", default="tt.zip",
+                        help="远端临时 zip / remote temporary zip (default: tt.zip)")
     parser.add_argument(
         "--output-encoding",
         choices=("utf8", "utf8-bom", "preserve"),
         default="utf8",
-        help="Bytes recreated by cmd-hex/zip-hex. preserve requires file input.",
+        metavar="E",
+        help="输出编码 / utf8, utf8-bom, or preserve (default: utf8)",
     )
-    parser.add_argument("--commands-out", type=Path, help="Write the generated complex-mode command stream to PATH")
+    parser.add_argument("--commands-out", metavar="PATH", type=Path,
+                        help="导出复杂模式命令 / export generated command stream (default: unset)")
     parser.add_argument(
         "--hex-chunk-bytes",
         type=bounded_int("--hex-chunk-bytes", 1, MAX_HEX_CHUNK_BYTES),
         default=DEFAULT_HEX_CHUNK_BYTES,
-        help=f"Output/zip bytes per generated hex line. Default: {DEFAULT_HEX_CHUNK_BYTES}",
+        metavar="N",
+        help=f"每行 hex 的原始字节数 / bytes per hex line (default: {DEFAULT_HEX_CHUNK_BYTES})",
     )
-    parser.add_argument("--ascii-only", action="store_true")
-    parser.add_argument("--ascii-keys", action="store_true")
-    parser.add_argument("--legacy-keys", action="store_true", help="Type ASCII through legacy keybd_event instead of SendInput")
+    parser.add_argument("--ascii-only", action="store_true",
+                        help="拒绝非 ASCII 文本 / reject non-ASCII text (default: off)")
+    parser.add_argument("--ascii-keys", action="store_true",
+                        help="使用 SendInput 虚拟键 / use SendInput virtual keys (default: off)")
+    parser.add_argument("--legacy-keys", action="store_true",
+                        help="使用 keybd_event ASCII 键 / use legacy ASCII keys (default)")
     parser.add_argument(
         "--sendinput",
         action="store_true",
-        help="Use Unicode SendInput for validated simple text/diagnostics; does not enable complex characters",
+        help="诊断用 Unicode SendInput / diagnostic transport (default: off)",
     )
-    parser.add_argument("--no-focus-check", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--diagnose", action="store_true", help="Report the focused target window and integrity levels without typing")
-    parser.add_argument("--self-test", action="store_true", help="Test whether the selected input mode can send a harmless F24 key event")
-    parser.add_argument("--debug-input", action="store_true", help="Run visible SendInput diagnostics against the focused target window")
-    parser.add_argument("--enter-mode", choices=("key", "unicode"), default="key")
+    parser.add_argument("--enter-mode", metavar="MODE", choices=("key", "unicode"), default="key",
+                        help="回车方式 / key or unicode (default: key)")
+    parser.add_argument("--no-focus-check", action="store_true",
+                        help="关闭前台窗口检查 / disable foreground-window check (default: check on)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只验证，不输入 / validate without typing (default: off)")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="显示窗口和完整性级别 / report target and integrity levels (default: off)")
+    parser.add_argument("--self-test", action="store_true",
+                        help="发送无害 F24 测试键 / send a harmless F24 test key (default: off)")
+    parser.add_argument("--debug-input", action="store_true",
+                        help="可见输入诊断 / run visible input diagnostics (default: off)")
     args = parser.parse_args(argv)
-    source = "file" if args.file is not None else args.source
     if args.mode in ("cmd-hex", "complex", "cmd"):
         mode = "cmd-hex"
     elif args.mode in ("zip-hex", "zip"):
         mode = "zip-hex"
     else:
         mode = "simple"
+
+    source_arg = args.source
+    if args.file is not None:
+        if source_arg not in (None, "file"):
+            parser.error("--file cannot be combined with --source clipboard or --source PATH")
+        source = "file"
+        file_path = args.file
+    elif source_arg in (None, "file"):
+        source = "file"
+        file_path = None
+    elif source_arg == "clipboard":
+        source = "clipboard"
+        file_path = None
+    else:
+        source = "file"
+        file_path = Path(source_arg)
+
+    if args.output_encoding == "preserve" and mode == "simple":
+        parser.error("--output-encoding preserve is only valid with --mode cmd-hex or --mode zip-hex")
+    if args.output_encoding == "preserve" and source == "clipboard":
+        parser.error("--output-encoding preserve requires a file source, not clipboard text")
     return Options(
         delay_ms=args.delay_ms,
         line_delay_ms=args.line_delay_ms,
         start_delay_sec=args.start_delay_sec,
         max_bytes=args.max_bytes,
         source=source,
-        file_path=args.file,
+        file_path=file_path,
         mode=mode,
         remote_output=args.remote_output,
         remote_hex=args.remote_hex,
@@ -267,17 +357,92 @@ def decode_bytes(raw: bytes) -> tuple[str, str]:
     return raw.decode(fallback, errors="strict"), f"{fallback} fallback"
 
 
+def is_reparse_path(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return path.is_symlink() or bool(getattr(info, "st_file_attributes", 0) & reparse_flag)
+
+
+def scan_directory(path: Path, opt: Options) -> tuple[tuple[DirectoryEntry, ...], int]:
+    if is_reparse_path(path):
+        raise RuntimeError("Directory source cannot be a symbolic link, junction, or other reparse point.")
+
+    entries: list[DirectoryEntry] = []
+    total_bytes = 0
+
+    def scan(current: Path, relative: Path) -> None:
+        nonlocal total_bytes
+        try:
+            with os.scandir(current) as iterator:
+                children = sorted(iterator, key=lambda item: item.name)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot enumerate source directory: {current} ({exc})") from exc
+
+        for child in children:
+            child_path = Path(child.path)
+            child_relative = relative / child.name
+            if is_reparse_path(child_path):
+                raise RuntimeError(
+                    f"Directory source contains a symbolic link, junction, or reparse point: {child_path}"
+                )
+            try:
+                child_stat = child.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RuntimeError(f"Cannot inspect directory entry: {child_path} ({exc})") from exc
+
+            if stat.S_ISDIR(child_stat.st_mode):
+                entries.append(DirectoryEntry(child_path, child_relative.as_posix() + "/", True, 0))
+                if len(entries) > MAX_DIRECTORY_ENTRIES:
+                    raise RuntimeError(f"Directory contains more than {MAX_DIRECTORY_ENTRIES} entries.")
+                scan(child_path, child_relative)
+                continue
+            if not stat.S_ISREG(child_stat.st_mode):
+                raise RuntimeError(f"Directory source contains an unsupported special file: {child_path}")
+
+            total_bytes += child_stat.st_size
+            if total_bytes > opt.max_bytes:
+                raise RuntimeError(
+                    f"Directory file data is too large: more than {opt.max_bytes} bytes. "
+                    "Use --max-bytes to override intentionally."
+                )
+            entries.append(DirectoryEntry(child_path, child_relative.as_posix(), False, child_stat.st_size))
+            if len(entries) > MAX_DIRECTORY_ENTRIES:
+                raise RuntimeError(f"Directory contains more than {MAX_DIRECTORY_ENTRIES} entries.")
+
+    scan(path, Path())
+    return tuple(entries), total_bytes
+
+
 def read_trans_file(path: Path, opt: Options) -> TextData:
     try:
-        stat = path.stat()
+        file_stat = path.stat()
     except OSError as exc:
         raise RuntimeError(f"Cannot open input file: {path} ({exc})") from exc
 
-    if stat.st_size == 0:
+    if stat.S_ISDIR(file_stat.st_mode):
+        if opt.mode != "zip-hex":
+            raise RuntimeError("Directory sources are only supported with --mode zip-hex.")
+        entries, total_bytes = scan_directory(path, opt)
+        return TextData(
+            path=path,
+            text="",
+            byte_count=total_bytes,
+            encoding="directory tree (file bytes preserved)",
+            source_kind="directory",
+            directory_entries=entries,
+        )
+    if not stat.S_ISREG(file_stat.st_mode) or is_reparse_path(path):
+        raise RuntimeError("Input path must be a regular file, or a real directory in zip-hex mode.")
+
+    preserve_file = opt.mode in ("cmd-hex", "zip-hex") and opt.output_encoding == "preserve"
+    if file_stat.st_size == 0 and not preserve_file:
         raise RuntimeError("Input file is empty.")
-    if stat.st_size > opt.max_bytes:
+    if file_stat.st_size > opt.max_bytes:
         raise RuntimeError(
-            f"Input file is too large: {stat.st_size} bytes. Limit: {opt.max_bytes} bytes. "
+            f"Input file is too large: {file_stat.st_size} bytes. Limit: {opt.max_bytes} bytes. "
             "Use --max-bytes to override intentionally."
         )
 
@@ -285,6 +450,16 @@ def read_trans_file(path: Path, opt: Options) -> TextData:
         raw = path.read_bytes()
     except OSError as exc:
         raise RuntimeError(f"Cannot read input file: {path} ({exc})") from exc
+
+    if preserve_file:
+        return TextData(
+            path=path,
+            text="",
+            byte_count=len(raw),
+            encoding="raw file bytes (preserved)",
+            raw_bytes=raw,
+            source_kind="file",
+        )
 
     try:
         text, encoding = decode_bytes(raw)
@@ -424,7 +599,45 @@ def output_bytes(data: TextData, opt: Options) -> bytes:
     return encoded
 
 
+def validate_complex_paths(opt: Options, directory_source: bool = False) -> None:
+    if not is_safe_cmd_hex_path(opt.remote_output):
+        noun = "directory" if directory_source else "file"
+        raise RuntimeError(
+            f"--remote-output must be a relative cmd-safe {noun} path using only lowercase letters, "
+            "digits, '.', '-', '/', or '\\'. Example: trans.txt"
+        )
+    if not is_safe_cmd_hex_path(opt.remote_hex):
+        raise RuntimeError(
+            "--remote-hex must be a relative cmd-safe path using only lowercase letters, "
+            "digits, '.', '-', '/', or '\\'. Example: tt.hex"
+        )
+    if opt.mode == "zip-hex":
+        if not is_safe_cmd_hex_path(opt.remote_zip):
+            raise RuntimeError(
+                "--remote-zip must be a relative cmd-safe path using only lowercase letters, "
+                "digits, '.', '-', '/', or '\\'. Example: tt.zip"
+            )
+        paths = [opt.remote_output, opt.remote_hex, opt.remote_zip]
+        if len({path.lower().replace("\\", "/") for path in paths}) != len(paths):
+            raise RuntimeError("--remote-output, --remote-hex, and --remote-zip must be different paths.")
+    elif opt.remote_output.lower().replace("\\", "/") == opt.remote_hex.lower().replace("\\", "/"):
+        raise RuntimeError("--remote-output and --remote-hex must be different files.")
+
+
 def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
+    if data.source_kind == "directory":
+        if opt.mode != "zip-hex":
+            raise RuntimeError("Directory sources are only supported with --mode zip-hex.")
+        validate_complex_paths(opt, directory_source=True)
+        return
+    if data.source_kind == "file":
+        if opt.mode not in ("cmd-hex", "zip-hex") or opt.output_encoding != "preserve":
+            raise RuntimeError("Raw file bytes require cmd-hex or zip-hex with --output-encoding preserve.")
+        if data.raw_bytes is None:
+            raise RuntimeError("Raw file source is missing its original bytes.")
+        validate_complex_paths(opt)
+        return
+
     if not data.text:
         raise RuntimeError("Input decoded to empty text.")
     if stats.control_count:
@@ -445,27 +658,7 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
     if opt.mode in ("cmd-hex", "zip-hex"):
         if opt.output_encoding == "preserve" and data.raw_bytes is None:
             raise RuntimeError("--output-encoding preserve requires file input; clipboard text has no original byte encoding.")
-        if not is_safe_cmd_hex_path(opt.remote_output):
-            raise RuntimeError(
-                "--remote-output must be a relative cmd-safe path using only lowercase letters, "
-                "digits, '.', '-', '/', or '\\'. Example: trans.txt"
-            )
-        if not is_safe_cmd_hex_path(opt.remote_hex):
-            raise RuntimeError(
-                "--remote-hex must be a relative cmd-safe path using only lowercase letters, "
-                "digits, '.', '-', '/', or '\\'. Example: tt.hex"
-            )
-        if opt.mode == "zip-hex":
-            if not is_safe_cmd_hex_path(opt.remote_zip):
-                raise RuntimeError(
-                    "--remote-zip must be a relative cmd-safe path using only lowercase letters, "
-                    "digits, '.', '-', '/', or '\\'. Example: tt.zip"
-                )
-            paths = [opt.remote_output, opt.remote_hex, opt.remote_zip]
-            if len({path.lower().replace("\\", "/") for path in paths}) != len(paths):
-                raise RuntimeError("--remote-output, --remote-hex, and --remote-zip must be different files.")
-        elif opt.remote_output.lower().replace("\\", "/") == opt.remote_hex.lower().replace("\\", "/"):
-            raise RuntimeError("--remote-output and --remote-hex must be different files.")
+        validate_complex_paths(opt)
         return
     if opt.commands_out is not None:
         raise RuntimeError("--commands-out is only valid with --mode cmd-hex or --mode zip-hex.")
@@ -484,9 +677,16 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
     print(f"Source: {data.path}")
     print(f"Encoding: {data.encoding}")
     print(f"Bytes: {data.byte_count}")
-    print(f"Characters: {len(data.text)}")
-    print(f"Lines: {stats.lines}")
-    print(f"Non-ASCII characters: {stats.non_ascii_count}")
+    if data.source_kind == "directory":
+        file_count = sum(not entry.is_directory for entry in data.directory_entries)
+        directory_count = sum(entry.is_directory for entry in data.directory_entries)
+        print(f"Directory entries: {file_count} file(s), {directory_count} subdirectory(s)")
+    elif data.source_kind == "file":
+        print("Content: arbitrary regular file bytes")
+    else:
+        print(f"Characters: {len(data.text)}")
+        print(f"Lines: {stats.lines}")
+        print(f"Non-ASCII characters: {stats.non_ascii_count}")
     print(f"Delay: {opt.delay_ms} ms per character, {opt.line_delay_ms} ms per line")
     print(f"Focus check: {'off' if opt.no_focus_check else 'on'}")
     if opt.mode == "cmd-hex":
@@ -497,8 +697,12 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
         print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line")
     elif opt.mode == "zip-hex":
         print("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive")
-        print(f"Output encoding: {opt.output_encoding}")
-        print(f"Remote output: {opt.remote_output}")
+        if data.source_kind == "directory":
+            print("Output encoding: directory file bytes preserved")
+            print(f"Remote destination directory: {opt.remote_output}")
+        else:
+            print(f"Output encoding: {opt.output_encoding}")
+            print(f"Remote output: {opt.remote_output}")
         print(f"Remote temporary hex: {opt.remote_hex}")
         print(f"Remote temporary zip: {opt.remote_zip}")
         print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line")
@@ -1160,6 +1364,33 @@ def zip_payload(raw: bytes, opt: Options) -> bytes:
     return buffer.getvalue()
 
 
+def zip_directory_payload(data: TextData) -> bytes:
+    if data.source_kind != "directory":
+        raise RuntimeError("Internal error: directory ZIP requested for a non-directory source.")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for entry in data.directory_entries:
+            info = zipfile.ZipInfo(entry.archive_name)
+            info.date_time = (1980, 1, 1, 0, 0, 0)
+            info.compress_type = zipfile.ZIP_STORED if entry.is_directory else zipfile.ZIP_DEFLATED
+            info.external_attr = (0o40755 if entry.is_directory else 0o100644) << 16
+            if entry.is_directory:
+                archive.writestr(info, b"")
+                continue
+
+            if is_reparse_path(entry.path) or not entry.path.is_file():
+                raise RuntimeError(f"Directory entry changed or became unsafe while archiving: {entry.path}")
+            try:
+                content = entry.path.read_bytes()
+            except OSError as exc:
+                raise RuntimeError(f"Cannot read directory file while archiving: {entry.path} ({exc})") from exc
+            if len(content) != entry.byte_count:
+                raise RuntimeError(f"Directory file changed size while archiving: {entry.path}")
+            archive.writestr(info, content)
+    return buffer.getvalue()
+
+
 def generated_ascii_data(text: str, label: str) -> TextData:
     return TextData(path=Path(label), text=text, byte_count=len(text), encoding="generated ASCII command stream")
 
@@ -1183,23 +1414,34 @@ def build_hex_writer_commands(payload: str, remote_hex: str) -> list[str]:
 
 def build_cmd_hex_commands(payload: str, opt: Options) -> str:
     commands = build_hex_writer_commands(payload, opt.remote_hex)
-    commands.append(
-        f"certutil -f -decodehex {quote_powershell_literal(opt.remote_hex)} "
-        f"{quote_powershell_literal(opt.remote_output)}"
-    )
+    if payload.strip():
+        commands.append(
+            f"certutil -f -decodehex {quote_powershell_literal(opt.remote_hex)} "
+            f"{quote_powershell_literal(opt.remote_output)}"
+        )
+    else:
+        commands.append(f"set-content -nonewline {quote_powershell_literal(opt.remote_hex)} ''")
+        commands.append(f"set-content -nonewline {quote_powershell_literal(opt.remote_output)} ''")
     commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_output)} sha256")
     commands.append("exit")
     return "\n".join(commands) + "\n"
 
 
-def build_zip_hex_commands(payload: str, opt: Options) -> str:
+def build_zip_hex_commands(payload: str, opt: Options, directory_source: bool = False) -> str:
     commands = build_hex_writer_commands(payload, opt.remote_hex)
     commands.append(
         f"certutil -f -decodehex {quote_powershell_literal(opt.remote_hex)} "
         f"{quote_powershell_literal(opt.remote_zip)}"
     )
-    commands.append(f"expand-archive -force {quote_powershell_literal(opt.remote_zip)} .")
-    commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_output)} sha256")
+    if directory_source:
+        commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_zip)} sha256")
+        commands.append(
+            f"expand-archive -force {quote_powershell_literal(opt.remote_zip)} "
+            f"{quote_powershell_literal(opt.remote_output)}"
+        )
+    else:
+        commands.append(f"expand-archive -force {quote_powershell_literal(opt.remote_zip)} .")
+        commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_output)} sha256")
     commands.append("exit")
     return "\n".join(commands) + "\n"
 
@@ -1309,9 +1551,15 @@ def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
 
 def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
     try:
-        raw = output_bytes(data, opt)
-        zipped = zip_payload(raw, opt)
-        raw_byte_count = len(raw)
+        directory_source = data.source_kind == "directory"
+        if directory_source:
+            raw = None
+            zipped = zip_directory_payload(data)
+            raw_byte_count = data.byte_count
+        else:
+            raw = output_bytes(data, opt)
+            zipped = zip_payload(raw, opt)
+            raw_byte_count = len(raw)
         payload, zip_byte_count, line_count = hex_payload_from_bytes(zipped, opt.hex_chunk_bytes)
     except UnicodeEncodeError as exc:
         print(f"Input text could not be encoded as UTF-8: {exc}", file=sys.stderr)
@@ -1328,11 +1576,16 @@ def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
     print(f"Remote temporary hex: {opt.remote_hex}")
     print(f"Remote temporary zip: {opt.remote_zip}")
     print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line ({line_count} line(s))")
-    print(f"Expected SHA-256: {hashlib.sha256(raw).hexdigest()}")
+    if directory_source:
+        print(f"Expected archive SHA-256: {hashlib.sha256(zipped).hexdigest()}")
+        print("The remote destination is merged/overwritten; unrelated existing files are not removed.")
+    else:
+        assert raw is not None
+        print(f"Expected SHA-256: {hashlib.sha256(raw).hexdigest()}")
     print("Remote temporary hex and zip files are retained for recovery and inspection.")
     print("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.")
 
-    commands = build_zip_hex_commands(payload, opt)
+    commands = build_zip_hex_commands(payload, opt, directory_source=directory_source)
     rc = prepare_generated_commands(commands, opt)
     if rc != EXIT_OK:
         return rc
@@ -1361,6 +1614,11 @@ def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
 
 
 def run(argv: list[str]) -> int:
+    if os.name == "nt":
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     try:
         opt = parse_args(argv)
     except SystemExit as exc:

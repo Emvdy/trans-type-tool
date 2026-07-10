@@ -64,21 +64,31 @@ Use file input:
 
 ```sh
 ./trans_type_mac --source file
-./trans_type_mac --file /path/to/input.txt
+./trans_type_mac --source /path/to/input.txt
 ```
+
+`--source` accepts `clipboard`, `file` (the adjacent `trans.txt`), or a local
+path. The older `--file PATH` spelling remains a compatibility alias.
 
 Use a complex mode for scripts, symbols, or Unicode. Focus a remote `cmd.exe` or
 PowerShell prompt during the countdown:
 
 ```sh
-./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.txt
-./trans_type_mac --mode zip-hex --file /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode cmd-hex --source /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode zip-hex --source /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode zip-hex --source /path/to/folder --remote-output copied-dir
 ```
 
 Both modes type a validated stream containing no uppercase and no Shift-required
 characters. `cmd-hex` sends source bytes directly as hex. `zip-hex` uses the
 macOS system `/usr/bin/zip` first and is useful only when compression saves enough
 typing.
+
+Copy arbitrary regular-file bytes with `--output-encoding preserve`. Directory
+sources are accepted only by `zip-hex`; their contents are extracted into the
+remote directory named by `--remote-output`. Existing destination files are
+overwritten/merged, but unrelated files are not deleted. Symbolic links and
+special files are rejected.
 
 Simple mode does not automatically switch to Unicode. `--input-mode unicode` is
 retained for explicit diagnostics and does not bypass strict simple validation.
@@ -88,10 +98,12 @@ retained for explicit diagnostics and does not bypass strict simple validation.
 ```sh
 ./trans_type_mac --mode cmd-hex --output-encoding utf8
 ./trans_type_mac --mode cmd-hex --output-encoding utf8-bom
-./trans_type_mac --mode zip-hex --file /path/to/input.txt --output-encoding preserve
+./trans_type_mac --mode zip-hex --source /path/to/input.bin --output-encoding preserve --remote-output input.bin
 ```
 
-`preserve` requires file input and recreates the original decoded file bytes.
+`preserve` requires a regular-file source in `cmd-hex` or `zip-hex`, bypasses
+text decoding, and recreates arbitrary file bytes exactly. A directory source is
+always archived byte for byte and does not use text output encoding.
 
 Export and inspect the exact generated stream without typing:
 
@@ -151,6 +163,7 @@ The binary verifier checks:
 - `cmd-hex` payload reconstruction
 - `zip-hex` archive contents
 - UTF-8, UTF-8 BOM, and byte-preserving output
+- arbitrary binary files and nested directory ZIP payloads
 
 These dry-run tests do not post keyboard events.
 

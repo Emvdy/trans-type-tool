@@ -35,6 +35,7 @@ static constexpr int DEFAULT_MAX_BYTES = 1024 * 1024;
 static constexpr int ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024;
 static constexpr int DEFAULT_HEX_CHUNK_BYTES = 240;
 static constexpr int MAX_HEX_CHUNK_BYTES = 2048;
+static constexpr size_t MAX_DIRECTORY_ENTRIES = 10000;
 
 enum class SourceKind {
     Clipboard,
@@ -62,6 +63,12 @@ enum class OutputEncoding {
     Utf8,
     Utf8Bom,
     Preserve,
+};
+
+enum class DataKind {
+    Text,
+    FileBytes,
+    Directory,
 };
 
 struct Options {
@@ -95,6 +102,10 @@ struct TextData {
     std::string encoding;
     std::string source_label;
     std::vector<unsigned char> raw_bytes;
+    DataKind kind = DataKind::Text;
+    std::filesystem::path source_path;
+    size_t file_count = 0;
+    size_t directory_count = 0;
 };
 
 struct TextStats {
@@ -117,52 +128,63 @@ struct FrontApp {
 
 static bool simple_ascii_key_supported(char16_t ch);
 
+static void print_help_option(const char *option, const char *description) {
+    printf("  %-25s%s\n", option, description);
+}
+
 static void print_usage() {
-    puts(PROGRAM_NAME " - type clipboard or trans.txt into the current foreground macOS window");
+    puts(PROGRAM_NAME " - 通过模拟键盘输入文本或文件传输命令");
+    puts("Type text or file-transfer commands into the foreground macOS window.");
     puts("");
-    puts("Usage:");
+    puts("用法 / usage:");
     puts("  " PROGRAM_NAME " [options]");
     puts("");
-    puts("Default behavior:");
-    puts("  Reads the macOS clipboard. Simple mode accepts only lowercase text and");
-    puts("  unmodified US-keyboard keys, then sends real virtual keys for RDP.");
+    puts("选项 / options:");
+    print_help_option("--source SOURCE", "来源：clipboard、file(trans.txt)或本地路径 / source (default: clipboard)");
+    print_help_option("--file PATH", "--source PATH 的兼容别名 / compatibility alias (default: unset)");
+    print_help_option("--mode MODE", "传输模式 / simple, cmd-hex, or zip-hex (default: simple)");
+    print_help_option("--remote-output PATH", "远端文件或目录 / remote file or folder (default: trans.txt)");
+    print_help_option("--remote-hex PATH", "远端临时 hex / remote temporary hex (default: tt.hex)");
+    print_help_option("--remote-zip PATH", "远端临时 zip / remote temporary zip (default: tt.zip)");
+    print_help_option("--output-encoding E", "输出编码 / utf8, utf8-bom, or preserve (default: utf8)");
+    print_help_option("--commands-out PATH", "导出复杂模式命令 / export command stream (default: unset)");
+    print_help_option("--hex-chunk-bytes N", "每行 hex 原始字节数 / bytes per hex line (default: 240)");
+    print_help_option("--delay-ms N", "每个字符延迟 / delay per character (0..5000, default: 20)");
+    print_help_option("--line-delay-ms N", "每行延迟 / delay after each line (0..5000, default: 100)");
+    print_help_option("--start-delay-sec N", "开始前倒计时 / countdown before typing (default: 5)");
+    print_help_option("--max-bytes N", "文件字节上限 / source byte limit (default: 1048576)");
+    print_help_option("--ascii-only", "拒绝非 ASCII 文本 / reject non-ASCII text (default: off)");
+    print_help_option("--input-mode MODE", "按键方式 / auto, keys, or unicode (default: auto)");
+    print_help_option("--enter-mode MODE", "回车方式 / key or unicode (default: key)");
+    print_help_option("--no-focus-check", "关闭前台窗口检查 / disable focus check (default: check on)");
+    print_help_option("--request-accessibility", "请求辅助功能权限 / request permission (default: off)");
+    print_help_option("--dry-run", "只验证，不输入 / validate without typing (default: off)");
+    print_help_option("--diagnose", "显示来源、窗口和权限 / report status (default: off)");
+    print_help_option("--self-test", "发送无害 F20 测试键 / harmless F20 test (default: off)");
+    print_help_option("--debug-input", "可见输入诊断 / visible diagnostics (default: off)");
+    print_help_option("-h, --help", "显示帮助并退出 / show help and exit");
     puts("");
-    puts("Options:");
-    puts("  --source clipboard    Read text from the macOS clipboard. Default");
-    puts("  --source file         Read text from trans.txt next to this binary");
-    puts("  --file PATH           Read text from PATH. Implies --source file");
-    puts("  --mode simple         Type the source text directly through keyboard events. Default");
-    puts("  --mode cmd-hex        Type a cmd/certutil hex transfer to recreate the text file");
-    puts("  --mode zip-hex        Type a zipped hex transfer, then expand it remotely");
-    puts("  --remote-output PATH  Remote output file for --mode cmd-hex/zip-hex. Default: trans.txt");
-    puts("  --remote-hex PATH     Remote temporary hex file for --mode cmd-hex/zip-hex. Default: tt.hex");
-    puts("  --remote-zip PATH     Remote temporary zip file for --mode zip-hex. Default: tt.zip");
-    puts("  --output-encoding E   utf8, utf8-bom, or preserve. Default: utf8");
-    puts("  --commands-out PATH   Write generated complex-mode commands to a local file");
-    puts("  --input-mode auto     Use real virtual keys for validated simple text. Default");
-    puts("  --input-mode keys     Explicitly use real virtual keys. Best for RDP");
-    puts("  --input-mode unicode  Diagnostic Unicode transport for validated simple text");
-    puts("                         Does not bypass simple-mode character validation");
-    puts("  --delay-ms N          Delay after each character. Default: 20");
-    puts("  --line-delay-ms N     Delay after each line. Default: 100");
-    puts("  --start-delay-sec N   Countdown before typing. Default: 5");
-    puts("  --max-bytes N         Maximum input size. Default: 1048576");
-    puts("  --hex-chunk-bytes N   Bytes per generated hex line. Default: 240");
-    puts("  --ascii-only          Refuse to type non-ASCII characters");
-    puts("  --enter-mode key      Send newlines as Return key. Default");
-    puts("  --enter-mode unicode  Send newlines as Unicode carriage return");
-    puts("  --no-focus-check      Do not abort when the foreground app changes");
-    puts("  --request-accessibility");
-    puts("                         Ask macOS to show the Accessibility permission prompt");
-    puts("  --dry-run             Parse and validate input without typing");
-    puts("  --diagnose            Show source, focused app, and permission status without typing");
-    puts("  --self-test           Check permission and send a harmless F20 key event");
-    puts("  --debug-input         Type visible keys and Unicode test markers into the focused target");
-    puts("  --help                Show this help");
+    puts("模式、内容与文件 / modes, content, and files:");
+    puts("  simple:");
+    puts("    内容/content : 受限小写文本 / restricted lowercase text");
+    puts("    允许/allowed : a-z 0-9 space tab newline ` - = [ ] \\ ; ' , . /");
+    puts("    文件/files   : 直接输入，不创建远端文件 / direct typing; no remote file");
+    puts("  cmd-hex:");
+    puts("    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file");
+    puts("    文件/files   : 输出 trans.txt，临时 tt.hex / output trans.txt; temporary tt.hex");
+    puts("  zip-hex (文本或文件 / text or file):");
+    puts("    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file");
+    puts("    文件/files   : 输出 trans.txt，临时 tt.hex、tt.zip / output trans.txt; temporary tt.hex, tt.zip");
+    puts("  zip-hex (目录 / directory):");
+    puts("    内容/content : 一个真实目录，不允许链接 / one real directory; no links");
+    puts("    文件/files   : 解压到 --remote-output；临时 tt.hex、tt.zip / destination folder; temporary files");
+    puts("  上述文件名是默认值，可用 --remote-* 修改；目录建议显式设置 --remote-output。");
+    puts("  These are defaults and can be changed with --remote-*; set a folder destination explicitly.");
+    puts("  本地默认 / local defaults: source=clipboard, commands-out=unset, focus-check=on.");
     puts("");
-    puts("Controls while running:");
-    puts("  Ctrl-C                Abort immediately");
-    puts("  Esc                   Abort before the next character if macOS reports it as pressed");
+    puts("运行控制 / runtime controls:");
+    puts("  Ctrl-C                 立即中止 / abort immediately");
+    puts("  Esc                    下一个字符前中止 / abort before the next character");
 }
 
 static bool parse_int_range(const char *value, int min_value, int max_value, int *out) {
@@ -197,6 +219,8 @@ static int get_option_value(int *i, int argc, char **argv, const char *name, con
 }
 
 static bool parse_args(int argc, char **argv, Options *opt) {
+    int source_option_kind = 0;
+    bool file_option_seen = false;
     for (int i = 1; i < argc; ++i) {
         const char *value = nullptr;
         int matched = get_option_value(&i, argc, argv, "--delay-ms", &value);
@@ -261,13 +285,28 @@ static bool parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--source", &value);
         if (matched == 1) {
+            if (source_option_kind != 0) {
+                fprintf(stderr, "--source may only be specified once.\n");
+                return false;
+            }
             if (strcmp(value, "clipboard") == 0) {
+                if (file_option_seen) {
+                    fprintf(stderr, "--file cannot be combined with --source clipboard.\n");
+                    return false;
+                }
                 opt->source = SourceKind::Clipboard;
+                source_option_kind = 2;
             } else if (strcmp(value, "file") == 0) {
                 opt->source = SourceKind::File;
+                source_option_kind = 1;
             } else {
-                fprintf(stderr, "Invalid --source value: %s\n", value);
-                return false;
+                if (file_option_seen) {
+                    fprintf(stderr, "--file cannot be combined with --source PATH.\n");
+                    return false;
+                }
+                opt->source = SourceKind::File;
+                opt->file_path = std::filesystem::u8path(value);
+                source_option_kind = 3;
             }
             continue;
         }
@@ -277,8 +316,13 @@ static bool parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--file", &value);
         if (matched == 1) {
+            if (file_option_seen || source_option_kind == 2 || source_option_kind == 3) {
+                fprintf(stderr, "--file conflicts with another explicit source path.\n");
+                return false;
+            }
             opt->source = SourceKind::File;
-            opt->file_path = value;
+            opt->file_path = std::filesystem::u8path(value);
+            file_option_seen = true;
             continue;
         }
         if (matched == 0) {
@@ -422,6 +466,14 @@ static bool parse_args(int argc, char **argv, Options *opt) {
             return false;
         }
     }
+    if (opt->output_encoding == OutputEncoding::Preserve && opt->transfer_mode == TransferMode::Simple) {
+        fprintf(stderr, "--output-encoding preserve is only valid with --mode cmd-hex or --mode zip-hex.\n");
+        return false;
+    }
+    if (opt->output_encoding == OutputEncoding::Preserve && opt->source == SourceKind::Clipboard) {
+        fprintf(stderr, "--output-encoding preserve requires a file source, not clipboard text.\n");
+        return false;
+    }
     return true;
 }
 
@@ -506,8 +558,95 @@ static bool decode_data(NSData *data, TextData *out, std::string *error) {
     return true;
 }
 
+static bool scan_directory_source(const std::filesystem::path &path, const Options &opt,
+                                  TextData *out, std::string *error) {
+    std::error_code ec;
+    auto root_status = std::filesystem::symlink_status(path, ec);
+    if (ec || std::filesystem::is_symlink(root_status)) {
+        *error = "Directory source cannot be a symbolic link.";
+        return false;
+    }
+
+    size_t entries = 0;
+    uintmax_t total_bytes = 0;
+    std::filesystem::recursive_directory_iterator iterator(path, ec);
+    std::filesystem::recursive_directory_iterator end;
+    if (ec) {
+        *error = "Cannot enumerate source directory: " + path.string();
+        return false;
+    }
+    while (iterator != end) {
+        const auto entry_path = iterator->path();
+        auto entry_status = iterator->symlink_status(ec);
+        if (ec) {
+            *error = "Cannot inspect directory entry: " + entry_path.string();
+            return false;
+        }
+        if (std::filesystem::is_symlink(entry_status)) {
+            *error = "Directory source contains a symbolic link: " + entry_path.string();
+            return false;
+        }
+        if (std::filesystem::is_directory(entry_status)) {
+            ++out->directory_count;
+        } else if (std::filesystem::is_regular_file(entry_status)) {
+            uintmax_t size = iterator->file_size(ec);
+            if (ec) {
+                *error = "Cannot determine directory file size: " + entry_path.string();
+                return false;
+            }
+            total_bytes += size;
+            if (total_bytes > static_cast<uintmax_t>(opt.max_bytes)) {
+                *error = "Directory file data is larger than --max-bytes.";
+                return false;
+            }
+            ++out->file_count;
+        } else {
+            *error = "Directory source contains an unsupported special file: " + entry_path.string();
+            return false;
+        }
+        if (++entries > MAX_DIRECTORY_ENTRIES) {
+            *error = "Directory contains more than 10000 entries.";
+            return false;
+        }
+        iterator.increment(ec);
+        if (ec) {
+            *error = "Cannot continue enumerating source directory: " + path.string();
+            return false;
+        }
+    }
+
+    out->kind = DataKind::Directory;
+    out->source_path = path;
+    out->byte_count = static_cast<size_t>(total_bytes);
+    out->encoding = "directory tree (file bytes preserved)";
+    out->source_label = "Directory: " + path.string();
+    return true;
+}
+
 static bool read_file_source(const Options &opt, TextData *out, std::string *error) {
     std::filesystem::path path = opt.file_path.empty() ? executable_dir() / "trans.txt" : opt.file_path;
+    std::error_code status_error;
+    auto link_status = std::filesystem::symlink_status(path, status_error);
+    if (status_error) {
+        *error = "Cannot inspect input path: " + path.string();
+        return false;
+    }
+    if (std::filesystem::is_symlink(link_status)) {
+        *error = "Input path cannot be a symbolic link.";
+        return false;
+    }
+    if (std::filesystem::is_directory(link_status)) {
+        if (opt.transfer_mode != TransferMode::ZipHex) {
+            *error = "Directory sources are only supported with --mode zip-hex.";
+            return false;
+        }
+        return scan_directory_source(path, opt, out, error);
+    }
+    if (!std::filesystem::is_regular_file(link_status)) {
+        *error = "Input path must be a regular file, or a real directory in zip-hex mode.";
+        return false;
+    }
+
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         *error = "Cannot open input file: " + path.string();
@@ -533,12 +672,25 @@ static bool read_file_source(const Options &opt, TextData *out, std::string *err
         return false;
     }
 
+    bool preserve_file = opt.transfer_mode != TransferMode::Simple &&
+                         opt.output_encoding == OutputEncoding::Preserve;
+    if (preserve_file) {
+        out->raw_bytes.assign(bytes.begin(), bytes.end());
+        out->byte_count = bytes.size();
+        out->encoding = "raw file bytes (preserved)";
+        out->source_label = "File: " + path.string();
+        out->source_path = path;
+        out->kind = DataKind::FileBytes;
+        return true;
+    }
+
     NSData *data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
     if (!decode_data(data, out, error)) {
         return false;
     }
     out->raw_bytes.assign(bytes.begin(), bytes.end());
     out->source_label = "File: " + path.string();
+    out->source_path = path;
     return true;
 }
 
@@ -634,7 +786,7 @@ static const char *output_encoding_name(OutputEncoding encoding) {
 static bool make_output_bytes(const TextData &data, const Options &opt,
                               std::vector<unsigned char> *out, std::string *error) {
     if (opt.output_encoding == OutputEncoding::Preserve) {
-        if (data.raw_bytes.empty()) {
+        if (data.kind != DataKind::FileBytes) {
             *error = "--output-encoding preserve requires file input.";
             return false;
         }
@@ -746,6 +898,63 @@ static bool read_binary_file(const std::filesystem::path &path, std::vector<unsi
     return true;
 }
 
+static uint16_t zip_u16(const std::vector<unsigned char> &bytes, size_t offset) {
+    return static_cast<uint16_t>(bytes[offset]) |
+           static_cast<uint16_t>(bytes[offset + 1] << 8);
+}
+
+static uint32_t zip_u32(const std::vector<unsigned char> &bytes, size_t offset) {
+    return static_cast<uint32_t>(bytes[offset]) |
+           (static_cast<uint32_t>(bytes[offset + 1]) << 8) |
+           (static_cast<uint32_t>(bytes[offset + 2]) << 16) |
+           (static_cast<uint32_t>(bytes[offset + 3]) << 24);
+}
+
+static void zip_set_u16(std::vector<unsigned char> *bytes, size_t offset, uint16_t value) {
+    (*bytes)[offset] = static_cast<unsigned char>(value & 0xff);
+    (*bytes)[offset + 1] = static_cast<unsigned char>((value >> 8) & 0xff);
+}
+
+static bool mark_zip_filenames_utf8(std::vector<unsigned char> *bytes, std::string *error) {
+    if (bytes->size() < 22) {
+        *error = "Generated directory ZIP is too short.";
+        return false;
+    }
+    size_t search_start = bytes->size() > 65557 ? bytes->size() - 65557 : 0;
+    size_t eocd = bytes->size() - 22;
+    while (true) {
+        if (zip_u32(*bytes, eocd) == 0x06054b50) {
+            break;
+        }
+        if (eocd == search_start) {
+            *error = "Generated directory ZIP has no end-of-central-directory record.";
+            return false;
+        }
+        --eocd;
+    }
+
+    uint16_t entry_count = zip_u16(*bytes, eocd + 10);
+    size_t central = zip_u32(*bytes, eocd + 16);
+    for (uint16_t index = 0; index < entry_count; ++index) {
+        if (central + 46 > bytes->size() || zip_u32(*bytes, central) != 0x02014b50) {
+            *error = "Generated directory ZIP has an invalid central-directory entry.";
+            return false;
+        }
+        uint16_t flags = zip_u16(*bytes, central + 8);
+        zip_set_u16(bytes, central + 8, static_cast<uint16_t>(flags | 0x0800));
+        size_t local = zip_u32(*bytes, central + 42);
+        if (local + 30 > bytes->size() || zip_u32(*bytes, local) != 0x04034b50) {
+            *error = "Generated directory ZIP has an invalid local entry.";
+            return false;
+        }
+        uint16_t local_flags = zip_u16(*bytes, local + 6);
+        zip_set_u16(bytes, local + 6, static_cast<uint16_t>(local_flags | 0x0800));
+        central += 46 + zip_u16(*bytes, central + 28) + zip_u16(*bytes, central + 30) +
+                   zip_u16(*bytes, central + 32);
+    }
+    return true;
+}
+
 static bool run_zip_tool(const std::filesystem::path &cwd,
                          const std::filesystem::path &zip_path,
                          const std::string &entry_name,
@@ -825,6 +1034,9 @@ static bool make_zip_payload(const std::vector<unsigned char> &bytes,
             return false;
         }
         bool ok = read_binary_file(zip_path, zip_bytes, error);
+        if (ok) {
+            ok = mark_zip_filenames_utf8(zip_bytes, error);
+        }
         std::error_code ignored;
         std::filesystem::remove_all(temp_root, ignored);
         return ok;
@@ -834,6 +1046,58 @@ static bool make_zip_payload(const std::vector<unsigned char> &bytes,
             std::filesystem::remove_all(temp_root, ignored);
         }
         *error = std::string("Zip compression failed: ") + ex.what();
+        return false;
+    }
+}
+
+static bool make_directory_zip_payload(const TextData &data, const Options &opt,
+                                       std::vector<unsigned char> *zip_bytes,
+                                       std::string *error) {
+    TextData current;
+    if (!scan_directory_source(data.source_path, opt, &current, error)) {
+        return false;
+    }
+    if (current.byte_count != data.byte_count || current.file_count != data.file_count ||
+        current.directory_count != data.directory_count) {
+        *error = "Source directory changed after it was scanned; retry the transfer.";
+        return false;
+    }
+
+    if (current.file_count == 0 && current.directory_count == 0) {
+        static const unsigned char empty_zip[] = {
+            0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        zip_bytes->assign(std::begin(empty_zip), std::end(empty_zip));
+        return true;
+    }
+
+    std::filesystem::path temp_root;
+    try {
+        temp_root = create_temp_directory();
+        if (temp_root.empty()) {
+            *error = "Could not create a temporary directory for folder compression.";
+            return false;
+        }
+        std::filesystem::path zip_path = temp_root / "tt.zip";
+        if (!run_zip_tool(data.source_path, zip_path, ".", error)) {
+            std::error_code ignored;
+            std::filesystem::remove_all(temp_root, ignored);
+            return false;
+        }
+        bool ok = read_binary_file(zip_path, zip_bytes, error);
+        if (ok) {
+            ok = mark_zip_filenames_utf8(zip_bytes, error);
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(temp_root, ignored);
+        return ok;
+    } catch (const std::exception &ex) {
+        if (!temp_root.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(temp_root, ignored);
+        }
+        *error = std::string("Directory ZIP creation failed: ") + ex.what();
         return false;
     }
 }
@@ -883,19 +1147,31 @@ static std::string build_hex_writer_commands(const std::string &hex_text, const 
 
 static std::string build_cmd_hex_commands(const std::string &hex_text, const Options &opt) {
     std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
-    commands += "certutil -f -decodehex " + quote_powershell_literal(opt.remote_hex) + " " +
-                quote_powershell_literal(opt.remote_output) + "\n";
+    if (count_hex_lines(hex_text) > 0) {
+        commands += "certutil -f -decodehex " + quote_powershell_literal(opt.remote_hex) + " " +
+                    quote_powershell_literal(opt.remote_output) + "\n";
+    } else {
+        commands += "set-content -nonewline " + quote_powershell_literal(opt.remote_hex) + " ''\n";
+        commands += "set-content -nonewline " + quote_powershell_literal(opt.remote_output) + " ''\n";
+    }
     commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
     commands += "exit\n";
     return commands;
 }
 
-static std::string build_zip_hex_commands(const std::string &hex_text, const Options &opt) {
+static std::string build_zip_hex_commands(const std::string &hex_text, const Options &opt,
+                                          bool directory_source = false) {
     std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
     commands += "certutil -f -decodehex " + quote_powershell_literal(opt.remote_hex) + " " +
                 quote_powershell_literal(opt.remote_zip) + "\n";
-    commands += "expand-archive -force " + quote_powershell_literal(opt.remote_zip) + " .\n";
-    commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
+    if (directory_source) {
+        commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_zip) + " sha256\n";
+        commands += "expand-archive -force " + quote_powershell_literal(opt.remote_zip) + " " +
+                    quote_powershell_literal(opt.remote_output) + "\n";
+    } else {
+        commands += "expand-archive -force " + quote_powershell_literal(opt.remote_zip) + " .\n";
+        commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
+    }
     commands += "exit\n";
     return commands;
 }
@@ -1047,11 +1323,21 @@ static void line_col_for_index(const std::u16string &text, size_t wanted, size_t
 }
 
 static int validate_text(const TextData &data, const TextStats &stats, const Options &opt) {
-    if (data.text.empty()) {
+    if (data.kind == DataKind::Directory && opt.transfer_mode != TransferMode::ZipHex) {
+        fprintf(stderr, "Directory sources are only supported with --mode zip-hex.\n");
+        return EXIT_ARGS;
+    }
+    if (data.kind == DataKind::FileBytes &&
+        (opt.transfer_mode == TransferMode::Simple || opt.output_encoding != OutputEncoding::Preserve)) {
+        fprintf(stderr, "Raw file bytes require cmd-hex or zip-hex with --output-encoding preserve.\n");
+        return EXIT_ARGS;
+    }
+
+    if (data.kind == DataKind::Text && data.text.empty()) {
         fprintf(stderr, "Input text is empty.\n");
         return EXIT_CONTENT;
     }
-    if (stats.control_count > 0) {
+    if (data.kind == DataKind::Text && stats.control_count > 0) {
         size_t line = 0;
         size_t col = 0;
         line_col_for_index(data.text, stats.first_control, &line, &col);
@@ -1059,14 +1345,14 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         fprintf(stderr, "Allowed control characters are tab and newlines only.\n");
         return EXIT_CONTENT;
     }
-    if (stats.surrogate_error_count > 0) {
+    if (data.kind == DataKind::Text && stats.surrogate_error_count > 0) {
         size_t line = 0;
         size_t col = 0;
         line_col_for_index(data.text, stats.first_surrogate_error, &line, &col);
         fprintf(stderr, "Input contains invalid UTF-16 surrogate data. First issue at line %zu, column %zu.\n", line, col);
         return EXIT_CONTENT;
     }
-    if (opt.ascii_only && stats.non_ascii_count > 0) {
+    if (data.kind == DataKind::Text && opt.ascii_only && stats.non_ascii_count > 0) {
         size_t line = 0;
         size_t col = 0;
         line_col_for_index(data.text, stats.first_non_ascii, &line, &col);
@@ -1074,7 +1360,8 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         return EXIT_CONTENT;
     }
     if (opt.transfer_mode == TransferMode::CmdHex || opt.transfer_mode == TransferMode::ZipHex) {
-        if (opt.output_encoding == OutputEncoding::Preserve && data.raw_bytes.empty()) {
+        if (opt.output_encoding == OutputEncoding::Preserve && data.kind != DataKind::FileBytes &&
+            data.kind != DataKind::Directory) {
             fprintf(stderr, "--output-encoding preserve requires file input; clipboard text has no original bytes.\n");
             return EXIT_ARGS;
         }
@@ -1206,10 +1493,16 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     printf("Source: %s\n", data.source_label.c_str());
     printf("Encoding: %s\n", data.encoding.c_str());
     printf("Bytes: %zu\n", data.byte_count);
-    printf("Characters: %zu\n", stats.scalar_count);
-    printf("UTF-16 units: %zu\n", data.text.size());
-    printf("Lines: %zu\n", stats.lines);
-    printf("Non-ASCII characters: %zu\n", stats.non_ascii_count);
+    if (data.kind == DataKind::Directory) {
+        printf("Directory entries: %zu file(s), %zu subdirectory(s)\n", data.file_count, data.directory_count);
+    } else if (data.kind == DataKind::FileBytes) {
+        printf("Content: arbitrary regular file bytes\n");
+    } else {
+        printf("Characters: %zu\n", stats.scalar_count);
+        printf("UTF-16 units: %zu\n", data.text.size());
+        printf("Lines: %zu\n", stats.lines);
+        printf("Non-ASCII characters: %zu\n", stats.non_ascii_count);
+    }
     printf("Delay: %d ms per character, %d ms per line\n", opt.delay_ms, opt.line_delay_ms);
     if (opt.transfer_mode == TransferMode::CmdHex) {
         printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
@@ -1219,8 +1512,13 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
         printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
     } else if (opt.transfer_mode == TransferMode::ZipHex) {
         printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
-        printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
-        printf("Remote output: %s\n", opt.remote_output.c_str());
+        if (data.kind == DataKind::Directory) {
+            printf("Output encoding: directory file bytes preserved\n");
+            printf("Remote destination directory: %s\n", opt.remote_output.c_str());
+        } else {
+            printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
+            printf("Remote output: %s\n", opt.remote_output.c_str());
+        }
         printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
         printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
         printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
@@ -1688,31 +1986,46 @@ static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
     std::vector<unsigned char> zip_bytes;
     std::vector<unsigned char> bytes;
     std::string error;
-    if (!make_output_bytes(data, opt, &bytes, &error)) {
-        fprintf(stderr, "%s\n", error.c_str());
-        return EXIT_ENCODING;
-    }
-    if (!make_zip_payload(bytes, opt.remote_output, &zip_bytes, &error)) {
-        fprintf(stderr, "%s\n", error.c_str());
-        return EXIT_FILE;
+    bool directory_source = data.kind == DataKind::Directory;
+    if (directory_source) {
+        if (!make_directory_zip_payload(data, opt, &zip_bytes, &error)) {
+            fprintf(stderr, "%s\n", error.c_str());
+            return EXIT_FILE;
+        }
+    } else {
+        if (!make_output_bytes(data, opt, &bytes, &error)) {
+            fprintf(stderr, "%s\n", error.c_str());
+            return EXIT_ENCODING;
+        }
+        if (!make_zip_payload(bytes, opt.remote_output, &zip_bytes, &error)) {
+            fprintf(stderr, "%s\n", error.c_str());
+            return EXIT_FILE;
+        }
     }
 
     std::string hex_text = bytes_to_plain_hex(zip_bytes, opt.hex_chunk_bytes);
     size_t hex_line_count = count_hex_lines(hex_text);
-    double ratio = bytes.empty() ? 0.0 : (static_cast<double>(zip_bytes.size()) / static_cast<double>(bytes.size())) * 100.0;
+    size_t source_bytes = directory_source ? data.byte_count : bytes.size();
+    double ratio = source_bytes == 0 ? 0.0 :
+        (static_cast<double>(zip_bytes.size()) / static_cast<double>(source_bytes)) * 100.0;
     printf("zip-hex transfer mode.\n");
-    printf("Output bytes before zip: %zu\n", bytes.size());
+    printf("Output bytes before zip: %zu\n", source_bytes);
     printf("Zip bytes to transfer: %zu (%.2f%% of output size)\n", zip_bytes.size(), ratio);
     printf("Remote output: %s\n", opt.remote_output.c_str());
     printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
     printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
     printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
-    printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
+    if (directory_source) {
+        printf("Expected archive SHA-256: %s\n", sha256_hex(zip_bytes).c_str());
+        printf("The remote destination is merged/overwritten; unrelated existing files are not removed.\n");
+    } else {
+        printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
+    }
     printf("Remote temporary hex and zip files are retained for recovery and inspection.\n");
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.\n");
     fflush(stdout);
 
-    std::string commands = build_zip_hex_commands(hex_text, opt);
+    std::string commands = build_zip_hex_commands(hex_text, opt, directory_source);
     int rc = prepare_generated_commands(commands, opt);
     if (rc != EXIT_OK) {
         return rc;

@@ -188,8 +188,11 @@ trans_type_py.exe --debug-input
 3. simple 只测试允许的小写、数字和无修饰符字符。
 4. 在远端临时目录打开普通权限的 `cmd.exe` 或 PowerShell。
 5. 用短文本测试 `cmd-hex`，比较程序显示的 SHA-256 与远端 `certutil` 输出。
-6. 用可压缩的长文本测试 `zip-hex`，再次比较 SHA-256。
-7. 确认输出无误后，再人工删除远端 `tt.hex` 和 `tt.zip`。
+6. 用含 NUL/非文本字节的文件测试 `--output-encoding preserve`。
+7. 用可压缩的长文本测试 `zip-hex`，再次比较 SHA-256。
+8. 用临时目录测试 `zip-hex --source <目录> --remote-output copied-dir`，核对
+   `tt.zip` 的 SHA-256、嵌套文件、Unicode 文件名和空目录。
+9. 确认输出无误后，再人工删除远端 `tt.hex` 和 `tt.zip`。
 
 正常 medium integrity 的 RDP 不要求管理员权限。如果目标窗口本身以管理员身份
 运行，Windows 可能阻止低完整性进程发送输入。应把目标窗口重新以普通权限打开，

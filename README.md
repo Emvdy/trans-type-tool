@@ -1,8 +1,10 @@
 # trans_type
 
-`trans_type` types local text into a foreground window, including an RDP client,
-without using remote clipboard or network transfer. It is intended for attended,
-authorized administration of Windows systems.
+`trans_type` types local text or a file-reconstruction command stream into a
+foreground window, including an RDP client, without using remote clipboard or
+network transfer. It can copy one arbitrary file through `cmd-hex`/`zip-hex`, or
+one directory tree through `zip-hex`. It is intended for attended, authorized
+administration of Windows systems.
 
 The repository contains four implementations:
 
@@ -31,6 +33,27 @@ compatibility/protocol suite. See `WINDOWS10_ACTIONS.md` for runner setup. A fin
 attended RDP keyboard smoke test is still required because Actions does not drive
 an interactive target window.
 
+## Sources and modes
+
+`--source` is the canonical source selector:
+
+```text
+--source clipboard          local clipboard text
+--source file               trans.txt beside the executable/binary
+--source <local-path>       a local regular file, or a directory in zip-hex
+```
+
+The older `--file <local-path>` spelling remains as a compatibility alias for
+`--source <local-path>`. Do not specify both with different values.
+
+The supported matrix is:
+
+| Mode | Clipboard text | Text file | Arbitrary regular file | Directory |
+|---|---:|---:|---:|---:|
+| `simple` | yes | yes | no | no |
+| `cmd-hex` | yes | yes | yes, with `preserve` | no |
+| `zip-hex` | yes | yes | yes, with `preserve` | yes |
+
 ## Transfer modes
 
 ### `simple`
@@ -56,8 +79,9 @@ of modifier timing, which was unreliable in the tested RDP environment.
 ### `cmd-hex`
 
 `cmd-hex` is the reliable mode for scripts, complex ASCII such as `@#$`, Chinese,
-emoji, and other Unicode. It converts the selected output bytes to lowercase hex,
-then types commands that reconstruct the file on remote Windows.
+emoji, other Unicode, and one arbitrary regular file. It converts the selected
+output bytes to lowercase hex, then types commands that reconstruct the file on
+remote Windows. Use `--output-encoding preserve` for a byte-for-byte binary copy.
 
 The generated outer stream is validated immediately before typing. It contains
 only lowercase letters, digits, whitespace, and these unmodified characters:
@@ -85,8 +109,9 @@ hex chunks and are an unmodified key on the required keyboard layout.
 
 ### `zip-hex`
 
-`zip-hex` first compresses the selected output bytes, then sends the zip through
-the same validated lowercase hex channel. Remote Windows runs:
+For a regular file or text source, `zip-hex` first compresses the selected output
+bytes, then sends the zip through the same validated lowercase hex channel.
+Remote Windows runs:
 
 ```powershell
 certutil -f -decodehex 'tt.hex' 'tt.zip'
@@ -97,6 +122,27 @@ certutil -hashfile 'trans.txt' sha256
 Compression is useful for longer or repetitive content. It is normally slower
 than `cmd-hex` for very small or already-compressed input. Run `--dry-run` and
 compare the reported source and zip sizes before choosing it.
+
+For a directory source, `--remote-output` is the destination directory, and the
+archive contains the source directory's contents rather than the local root
+directory itself:
+
+```powershell
+certutil -hashfile 'tt.zip' sha256
+expand-archive -force 'tt.zip' 'copied-dir'
+```
+
+The displayed expected hash is the ZIP archive hash. Matching it proves the hex
+transport arrived intact; `Expand-Archive` also checks each ZIP entry's CRC while
+extracting. Extraction overwrites/merges files in an existing destination but
+does not delete unrelated files already there, so this is a copy operation, not
+an exact directory mirror.
+
+Directory transfer rejects symbolic links, junctions, reparse points, and special
+files. It allows at most 10,000 entries and limits the sum of regular-file bytes
+with `--max-bytes`. Directory entry names are ZIP metadata and may contain
+uppercase or Unicode; they are hex-encoded and never appear literally in the
+typed command stream. Names must still be valid on the target Windows filesystem.
 
 Neither complex mode executes the reconstructed file. The temporary `.hex` and
 `.zip` files are retained for inspection and recovery. Delete them manually only
@@ -114,21 +160,28 @@ trans_type_py.exe --mode simple
 
 During the five-second countdown, focus the intended target window.
 
-Read another file or the local Windows clipboard:
+Read another text file or the local Windows clipboard:
 
 ```bat
-trans_type.exe --mode simple --file C:\path\to\input.txt
+trans_type.exe --mode simple --source C:\path\to\input.txt
 trans_type.exe --mode simple --source clipboard
 ```
 
 Use a complex mode for unrestricted text:
 
 ```bat
-trans_type.exe --mode cmd-hex --file C:\path\to\input.txt --remote-output trans.txt
+trans_type.exe --mode cmd-hex --source C:\path\to\input.txt --remote-output trans.txt
 trans_type.exe --mode zip-hex --source clipboard --remote-output trans.txt
 ```
 
-The local `--file` path may be a normal Windows path. Remote paths are more
+Copy an arbitrary file byte for byte, or copy a directory tree:
+
+```bat
+trans_type.exe --mode cmd-hex --source C:\path\to\tool.exe --output-encoding preserve --remote-output tool.exe
+trans_type.exe --mode zip-hex --source C:\path\to\data --remote-output copied-dir
+```
+
+The local `--source` path may be a normal Windows path. Remote paths are more
 restricted because they become part of the typed command stream: use only
 lowercase letters, digits, `.`, `-`, `/`, and `\` in a relative path. Reserved
 Windows device names, traversal, leading `-`, and paths longer than 240 characters
@@ -149,8 +202,9 @@ macOS defaults to local clipboard input. Use `trans.txt` or another file with:
 
 ```sh
 ./trans_type_mac --mode simple --source file
-./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.txt
-./trans_type_mac --mode zip-hex --file /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode cmd-hex --source /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode zip-hex --source /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode zip-hex --source /path/to/data --remote-output copied-dir
 ```
 
 Simple mode never automatically switches to Unicode. `--input-mode unicode` is
@@ -179,8 +233,10 @@ Complex modes support:
 - `--output-encoding preserve`: recreate the original file bytes exactly. This
   requires file input; clipboard text has no original byte encoding.
 
-`preserve` is not an arbitrary binary mode. The source must still decode as one
-of the supported text encodings so content validation can run.
+`preserve` is the arbitrary regular-file mode. It bypasses text decoding and
+copies every byte, including NUL bytes and data that is not valid text. It is
+accepted only by `cmd-hex` and `zip-hex`. Directory entries are always preserved
+as raw bytes by `zip-hex`, so their transfer does not use text output encoding.
 
 Supported file decoding includes UTF-8 and UTF-16 LE/BE with BOM. Windows uses
 the active ANSI code page as its final fallback; macOS uses Windows-1252.
@@ -189,13 +245,14 @@ Examples:
 
 ```bat
 trans_type.exe --mode cmd-hex --output-encoding utf8-bom
-trans_type.exe --mode zip-hex --file C:\path\to\input.txt --output-encoding preserve
+trans_type.exe --mode zip-hex --source C:\path\to\input.bin --output-encoding preserve --remote-output input.bin
 ```
 
-Each complex transfer prints the expected local SHA-256. The generated remote
-command prints the reconstructed file's SHA-256 with `certutil`. Compare the two
-values; the program cannot read remote console output back through the keyboard
-channel automatically.
+Each regular-file complex transfer prints the expected output SHA-256, and the
+remote command hashes the reconstructed file with `certutil`. Directory mode
+instead prints and remotely checks the transferred ZIP SHA-256 before extraction.
+Compare the two values; the program cannot read remote console output back through
+the keyboard channel automatically.
 
 ## Speed and command auditing
 
