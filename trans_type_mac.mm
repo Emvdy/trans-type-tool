@@ -1,6 +1,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
 
@@ -22,6 +23,7 @@
 static constexpr int EXIT_OK = 0;
 static constexpr int EXIT_ARGS = 2;
 static constexpr int EXIT_FILE = 3;
+static constexpr int EXIT_ENCODING = 4;
 static constexpr int EXIT_CONTENT = 5;
 static constexpr int EXIT_ABORTED = 6;
 static constexpr int EXIT_INPUT = 7;
@@ -56,6 +58,12 @@ enum class TransferMode {
     ZipHex,
 };
 
+enum class OutputEncoding {
+    Utf8,
+    Utf8Bom,
+    Preserve,
+};
+
 struct Options {
     int delay_ms = DEFAULT_DELAY_MS;
     int line_delay_ms = DEFAULT_LINE_DELAY_MS;
@@ -72,7 +80,9 @@ struct Options {
     EnterMode enter_mode = EnterMode::Key;
     InputMode input_mode = InputMode::Auto;
     TransferMode transfer_mode = TransferMode::Simple;
+    OutputEncoding output_encoding = OutputEncoding::Utf8;
     std::filesystem::path file_path;
+    std::filesystem::path commands_out;
     std::string remote_output = "trans.txt";
     std::string remote_hex = "tt.hex";
     std::string remote_zip = "tt.zip";
@@ -84,6 +94,7 @@ struct TextData {
     size_t byte_count = 0;
     std::string encoding;
     std::string source_label;
+    std::vector<unsigned char> raw_bytes;
 };
 
 struct TextStats {
@@ -100,6 +111,8 @@ struct TextStats {
 struct FrontApp {
     pid_t pid = 0;
     std::string name;
+    CGWindowID window_id = 0;
+    std::string window_title;
 };
 
 static bool simple_ascii_key_supported(char16_t ch);
@@ -111,8 +124,8 @@ static void print_usage() {
     puts("  " PROGRAM_NAME " [options]");
     puts("");
     puts("Default behavior:");
-    puts("  Reads the macOS clipboard. Simple ASCII text uses real virtual keys for RDP;");
-    puts("  non-ASCII text uses Unicode CGEvent payloads for local macOS apps.");
+    puts("  Reads the macOS clipboard. Simple mode accepts only lowercase text and");
+    puts("  unmodified US-keyboard keys, then sends real virtual keys for RDP.");
     puts("");
     puts("Options:");
     puts("  --source clipboard    Read text from the macOS clipboard. Default");
@@ -124,9 +137,12 @@ static void print_usage() {
     puts("  --remote-output PATH  Remote output file for --mode cmd-hex/zip-hex. Default: trans.txt");
     puts("  --remote-hex PATH     Remote temporary hex file for --mode cmd-hex/zip-hex. Default: tt.hex");
     puts("  --remote-zip PATH     Remote temporary zip file for --mode zip-hex. Default: tt.zip");
-    puts("  --input-mode auto     Simple ASCII virtual keys when possible, Unicode otherwise. Default");
-    puts("  --input-mode keys     Type simple ASCII through real virtual keys. Best for RDP");
-    puts("  --input-mode unicode  Type through Unicode CGEvent payloads. Best for local macOS apps");
+    puts("  --output-encoding E   utf8, utf8-bom, or preserve. Default: utf8");
+    puts("  --commands-out PATH   Write generated complex-mode commands to a local file");
+    puts("  --input-mode auto     Use real virtual keys for validated simple text. Default");
+    puts("  --input-mode keys     Explicitly use real virtual keys. Best for RDP");
+    puts("  --input-mode unicode  Diagnostic Unicode transport for validated simple text");
+    puts("                         Does not bypass simple-mode character validation");
     puts("  --delay-ms N          Delay after each character. Default: 20");
     puts("  --line-delay-ms N     Delay after each line. Default: 100");
     puts("  --start-delay-sec N   Countdown before typing. Default: 5");
@@ -140,7 +156,7 @@ static void print_usage() {
     puts("                         Ask macOS to show the Accessibility permission prompt");
     puts("  --dry-run             Parse and validate input without typing");
     puts("  --diagnose            Show source, focused app, and permission status without typing");
-    puts("  --self-test           Check permission and send a harmless Shift key event");
+    puts("  --self-test           Check permission and send a harmless F20 key event");
     puts("  --debug-input         Type visible keys and Unicode test markers into the focused target");
     puts("  --help                Show this help");
     puts("");
@@ -339,6 +355,33 @@ static bool parse_args(int argc, char **argv, Options *opt) {
             return false;
         }
 
+        matched = get_option_value(&i, argc, argv, "--output-encoding", &value);
+        if (matched == 1) {
+            if (strcmp(value, "utf8") == 0) {
+                opt->output_encoding = OutputEncoding::Utf8;
+            } else if (strcmp(value, "utf8-bom") == 0) {
+                opt->output_encoding = OutputEncoding::Utf8Bom;
+            } else if (strcmp(value, "preserve") == 0) {
+                opt->output_encoding = OutputEncoding::Preserve;
+            } else {
+                fprintf(stderr, "Invalid --output-encoding value: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--commands-out", &value);
+        if (matched == 1) {
+            opt->commands_out = value;
+            continue;
+        }
+        if (matched == 0) {
+            return false;
+        }
+
         matched = get_option_value(&i, argc, argv, "--input-mode", &value);
         if (matched == 1) {
             if (strcmp(value, "auto") == 0) {
@@ -494,6 +537,7 @@ static bool read_file_source(const Options &opt, TextData *out, std::string *err
     if (!decode_data(data, out, error)) {
         return false;
     }
+    out->raw_bytes.assign(bytes.begin(), bytes.end());
     out->source_label = "File: " + path.string();
     return true;
 }
@@ -529,14 +573,23 @@ static bool read_text_source(const Options &opt, TextData *out, std::string *err
 }
 
 static bool is_safe_cmd_hex_path(const std::string &path) {
-    if (path.empty() || path.front() == '/' || path.front() == '\\' || path.back() == '/' || path.back() == '\\') {
+    if (path.empty() || path.size() > 240 || path.front() == '/' || path.front() == '\\' ||
+        path.back() == '/' || path.back() == '\\') {
         return false;
     }
     size_t start = 0;
     while (start <= path.size()) {
         size_t end = path.find_first_of("/\\", start);
         std::string part = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
-        if (part.empty() || part == "." || part == "..") {
+        if (part.empty() || part == "." || part == ".." || part.front() == '-' || part.back() == '.') {
+            return false;
+        }
+        std::string base = part.substr(0, part.find('.'));
+        if (base == "con" || base == "prn" || base == "aux" || base == "nul") {
+            return false;
+        }
+        if (base.size() == 4 && (base.compare(0, 3, "com") == 0 || base.compare(0, 3, "lpt") == 0) &&
+            base[3] >= '1' && base[3] <= '9') {
             return false;
         }
         if (end == std::string::npos) {
@@ -562,6 +615,51 @@ static std::vector<unsigned char> text_to_utf8_bytes(const std::u16string &text)
     std::vector<unsigned char> out([data length]);
     if (!out.empty()) {
         memcpy(out.data(), [data bytes], out.size());
+    }
+    return out;
+}
+
+static const char *output_encoding_name(OutputEncoding encoding) {
+    switch (encoding) {
+        case OutputEncoding::Utf8Bom:
+            return "utf8-bom";
+        case OutputEncoding::Preserve:
+            return "preserve";
+        case OutputEncoding::Utf8:
+            return "utf8";
+    }
+    return "utf8";
+}
+
+static bool make_output_bytes(const TextData &data, const Options &opt,
+                              std::vector<unsigned char> *out, std::string *error) {
+    if (opt.output_encoding == OutputEncoding::Preserve) {
+        if (data.raw_bytes.empty()) {
+            *error = "--output-encoding preserve requires file input.";
+            return false;
+        }
+        *out = data.raw_bytes;
+        return true;
+    }
+    *out = text_to_utf8_bytes(data.text);
+    if (out->empty()) {
+        *error = "Input text encoded to empty UTF-8 data.";
+        return false;
+    }
+    if (opt.output_encoding == OutputEncoding::Utf8Bom) {
+        out->insert(out->begin(), {0xEF, 0xBB, 0xBF});
+    }
+    return true;
+}
+
+static std::string sha256_hex(const std::vector<unsigned char> &bytes) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    static const char hex[] = "0123456789abcdef";
+    CC_SHA256(bytes.data(), static_cast<CC_LONG>(bytes.size()), digest);
+    std::string out(CC_SHA256_DIGEST_LENGTH * 2, '0');
+    for (size_t i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0F];
     }
     return out;
 }
@@ -752,8 +850,12 @@ static TextData text_data_from_ascii(const std::string &text, const std::string 
     return data;
 }
 
+static std::string quote_powershell_literal(const std::string &value) {
+    return "'" + value + "'";
+}
+
 static std::string build_hex_writer_commands(const std::string &hex_text, const std::string &remote_hex) {
-    std::string commands = "powershell -nop\n";
+    std::string commands = "powershell -noprofile\n";
 
     size_t start = 0;
     bool first_line = true;
@@ -765,9 +867,11 @@ static std::string build_hex_writer_commands(const std::string &hex_text, const 
         if (end > start) {
             commands += first_line ? "set-content" : "add-content";
             commands += " -encoding ascii ";
-            commands += remote_hex;
+            commands += quote_powershell_literal(remote_hex);
             commands += " ";
+            commands += "'";
             commands.append(hex_text, start, end - start);
+            commands += "'";
             commands += "\n";
             first_line = false;
         }
@@ -779,20 +883,61 @@ static std::string build_hex_writer_commands(const std::string &hex_text, const 
 
 static std::string build_cmd_hex_commands(const std::string &hex_text, const Options &opt) {
     std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
-    commands += "certutil -f -decodehex " + opt.remote_hex + " " + opt.remote_output + "\n";
-    commands += "del " + opt.remote_hex + "\n";
+    commands += "certutil -f -decodehex " + quote_powershell_literal(opt.remote_hex) + " " +
+                quote_powershell_literal(opt.remote_output) + "\n";
+    commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
     commands += "exit\n";
     return commands;
 }
 
 static std::string build_zip_hex_commands(const std::string &hex_text, const Options &opt) {
     std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
-    commands += "certutil -f -decodehex " + opt.remote_hex + " " + opt.remote_zip + "\n";
-    commands += "expand-archive -force " + opt.remote_zip + " .\n";
-    commands += "del " + opt.remote_hex + "\n";
-    commands += "del " + opt.remote_zip + "\n";
+    commands += "certutil -f -decodehex " + quote_powershell_literal(opt.remote_hex) + " " +
+                quote_powershell_literal(opt.remote_zip) + "\n";
+    commands += "expand-archive -force " + quote_powershell_literal(opt.remote_zip) + " .\n";
+    commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
     commands += "exit\n";
     return commands;
+}
+
+static bool generated_command_char_allowed(unsigned char ch) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+        return true;
+    }
+    return ch == ' ' || ch == '\r' || ch == '\n' || ch == '-' || ch == '.' ||
+           ch == '/' || ch == '\\' || ch == '\'';
+}
+
+static int prepare_generated_commands(const std::string &commands, const Options &opt) {
+    size_t line = 1;
+    size_t col = 1;
+    for (unsigned char ch : commands) {
+        if (!generated_command_char_allowed(ch)) {
+            fprintf(stderr, "Generated command stream contains forbidden character U+%04X at line %zu, column %zu.\n",
+                    static_cast<unsigned int>(ch), line, col);
+            return EXIT_CONTENT;
+        }
+        if (ch == '\n') {
+            ++line;
+            col = 1;
+        } else {
+            ++col;
+        }
+    }
+    if (!opt.commands_out.empty()) {
+        std::ofstream output(opt.commands_out, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            fprintf(stderr, "Cannot create --commands-out file: %s\n", opt.commands_out.string().c_str());
+            return EXIT_FILE;
+        }
+        output.write(commands.data(), static_cast<std::streamsize>(commands.size()));
+        if (!output) {
+            fprintf(stderr, "Cannot write --commands-out file: %s\n", opt.commands_out.string().c_str());
+            return EXIT_FILE;
+        }
+        printf("Generated commands written to: %s\n", opt.commands_out.string().c_str());
+    }
+    return EXIT_OK;
 }
 
 static bool is_high_surrogate(char16_t ch) {
@@ -929,6 +1074,10 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         return EXIT_CONTENT;
     }
     if (opt.transfer_mode == TransferMode::CmdHex || opt.transfer_mode == TransferMode::ZipHex) {
+        if (opt.output_encoding == OutputEncoding::Preserve && data.raw_bytes.empty()) {
+            fprintf(stderr, "--output-encoding preserve requires file input; clipboard text has no original bytes.\n");
+            return EXIT_ARGS;
+        }
         if (!is_safe_cmd_hex_path(opt.remote_output)) {
             fprintf(stderr, "--remote-output must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
             fprintf(stderr, "Example: trans.txt\n");
@@ -958,43 +1107,38 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         }
         return EXIT_OK;
     }
-    if (opt.input_mode == InputMode::Keys && stats.non_ascii_count > 0) {
-        size_t line = 0;
-        size_t col = 0;
-        line_col_for_index(data.text, stats.first_non_ascii, &line, &col);
-        fprintf(stderr, "--input-mode keys can only type ASCII. First non-ASCII character is at line %zu, column %zu.\n", line, col);
-        fprintf(stderr, "Use --input-mode unicode for local macOS apps that accept Unicode CGEvent payloads.\n");
-        return EXIT_CONTENT;
+    if (!opt.commands_out.empty()) {
+        fprintf(stderr, "--commands-out is only valid with --mode cmd-hex or --mode zip-hex.\n");
+        return EXIT_ARGS;
     }
-    bool key_mode = opt.input_mode == InputMode::Keys ||
-                    (opt.input_mode == InputMode::Auto && stats.non_ascii_count == 0);
-    if (key_mode) {
-        for (size_t i = 0; i < data.text.size();) {
-            uint32_t scalar = 0;
-            size_t units = 1;
-            bool invalid = false;
-            next_scalar(data.text, i, &scalar, &units, &invalid);
-            bool allowed_control = scalar == '\t' || scalar == '\n' || scalar == '\r';
-            if (!allowed_control && (invalid || units != 1 || !simple_ascii_key_supported(data.text[i]))) {
-                size_t line = 0;
-                size_t col = 0;
-                line_col_for_index(data.text, i, &line, &col);
-                fprintf(stderr, "ASCII key mode does not support the character at line %zu, column %zu.\n", line, col);
-                fprintf(stderr, "This simplified macOS RDP mode supports letters, digits, spaces, tabs, newlines, and common ASCII punctuation except the excluded symbols.\n");
-                fprintf(stderr, "Characters such as @, #, %%, and currency symbols are intentionally not handled in this build.\n");
-                return EXIT_CONTENT;
-            }
-            i += units;
+    if (opt.debug_input && opt.input_mode == InputMode::Unicode) {
+        return EXIT_OK;
+    }
+    for (size_t i = 0; i < data.text.size();) {
+        uint32_t scalar = 0;
+        size_t units = 1;
+        bool invalid = false;
+        next_scalar(data.text, i, &scalar, &units, &invalid);
+        bool allowed_control = scalar == '\t' || scalar == '\n' || scalar == '\r';
+        if (!allowed_control && (invalid || units != 1 || !simple_ascii_key_supported(data.text[i]))) {
+            size_t line = 0;
+            size_t col = 0;
+            line_col_for_index(data.text, i, &line, &col);
+            fprintf(stderr, "Simple mode rejects the character at line %zu, column %zu because it is uppercase, Unicode, or requires a modifier.\n",
+                    line, col);
+            fprintf(stderr, "Use --mode cmd-hex or --mode zip-hex.\n");
+            return EXIT_CONTENT;
         }
+        i += units;
     }
     return EXIT_OK;
 }
 
-static InputMode effective_input_mode(const Options &opt, const TextStats &stats) {
+static InputMode effective_input_mode(const Options &opt) {
     if (opt.input_mode != InputMode::Auto) {
         return opt.input_mode;
     }
-    return stats.non_ascii_count == 0 ? InputMode::Keys : InputMode::Unicode;
+    return InputMode::Keys;
 }
 
 static const char *input_mode_name(InputMode mode) {
@@ -1017,6 +1161,23 @@ static FrontApp frontmost_app() {
             app.pid = [running processIdentifier];
             NSString *name = [running localizedName];
             app.name = name ? nsstring_to_utf8(name) : "";
+
+            CFArrayRef copied = CGWindowListCopyWindowInfo(
+                kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+                kCGNullWindowID);
+            NSArray *windows = CFBridgingRelease(copied);
+            for (NSDictionary *info in windows) {
+                NSNumber *owner_pid = info[(__bridge NSString *)kCGWindowOwnerPID];
+                NSNumber *layer = info[(__bridge NSString *)kCGWindowLayer];
+                if ([owner_pid intValue] != app.pid || [layer intValue] != 0) {
+                    continue;
+                }
+                NSNumber *number = info[(__bridge NSString *)kCGWindowNumber];
+                NSString *title = info[(__bridge NSString *)kCGWindowName];
+                app.window_id = static_cast<CGWindowID>([number unsignedIntValue]);
+                app.window_title = title ? nsstring_to_utf8(title) : "";
+                break;
+            }
         }
     }
     return app;
@@ -1026,7 +1187,12 @@ static void print_front_app(const FrontApp &app) {
     if (app.pid == 0) {
         puts("Target app: <unknown>");
     } else {
-        printf("Target app: \"%s\" (pid %d)\n", app.name.c_str(), app.pid);
+        printf("Target app: \"%s\" (pid %d, window %u)", app.name.c_str(), app.pid,
+               static_cast<unsigned int>(app.window_id));
+        if (!app.window_title.empty()) {
+            printf(" \"%s\"", app.window_title.c_str());
+        }
+        printf("\n");
     }
 }
 
@@ -1036,7 +1202,7 @@ static bool accessibility_trusted(bool prompt) {
 }
 
 static void print_summary(const TextData &data, const TextStats &stats, const Options &opt) {
-    InputMode mode = effective_input_mode(opt, stats);
+    InputMode mode = effective_input_mode(opt);
     printf("Source: %s\n", data.source_label.c_str());
     printf("Encoding: %s\n", data.encoding.c_str());
     printf("Bytes: %zu\n", data.byte_count);
@@ -1047,11 +1213,13 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     printf("Delay: %d ms per character, %d ms per line\n", opt.delay_ms, opt.line_delay_ms);
     if (opt.transfer_mode == TransferMode::CmdHex) {
         printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
+        printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
         printf("Remote output: %s\n", opt.remote_output.c_str());
         printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
         printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
     } else if (opt.transfer_mode == TransferMode::ZipHex) {
         printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
+        printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
         printf("Remote output: %s\n", opt.remote_output.c_str());
         printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
         printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
@@ -1064,7 +1232,11 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     if (opt.transfer_mode == TransferMode::Simple && mode == InputMode::Unicode) {
         printf("RDP note: some RDP clients ignore Unicode CGEvent payloads and may type repeated 'a'. Use --input-mode keys for ASCII text.\n");
     }
-    printf("Enter mode: %s\n", opt.enter_mode == EnterMode::Unicode ? "Unicode CR" : "Return key");
+    if (opt.transfer_mode == TransferMode::CmdHex || opt.transfer_mode == TransferMode::ZipHex) {
+        printf("Enter mode: physical Return key (forced for complex mode)\n");
+    } else {
+        printf("Enter mode: %s\n", opt.enter_mode == EnterMode::Unicode ? "Unicode CR" : "Return key");
+    }
     printf("Focus check: %s\n", opt.no_focus_check ? "off" : "on");
     printf("Accessibility check: required before typing\n");
 }
@@ -1077,48 +1249,25 @@ static void sleep_ms(int ms) {
 
 struct KeyStroke {
     CGKeyCode keycode = 0;
-    bool shift = false;
 };
 
 static bool simple_ascii_key_supported(char16_t ch) {
-    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
         return true;
     }
-    if (ch == '@' || ch == '#' || ch == '%') {
-        return false;
-    }
-
     switch (ch) {
         case ' ':
         case '`':
-        case '~':
-        case '!':
-        case '$':
-        case '^':
-        case '&':
-        case '*':
-        case '(':
-        case ')':
         case '-':
-        case '_':
         case '=':
-        case '+':
         case '[':
-        case '{':
         case ']':
-        case '}':
         case '\\':
-        case '|':
         case ';':
-        case ':':
         case '\'':
-        case '"':
         case ',':
-        case '<':
         case '.':
-        case '>':
         case '/':
-        case '?':
             return true;
         default:
             return false;
@@ -1135,14 +1284,6 @@ static bool ascii_keystroke(char16_t ch, KeyStroke *stroke) {
             kVK_ANSI_Y, kVK_ANSI_Z,
         };
         stroke->keycode = keys[ch - 'a'];
-        stroke->shift = false;
-        return true;
-    }
-    if (ch >= 'A' && ch <= 'Z') {
-        if (!ascii_keystroke(static_cast<char16_t>(ch - 'A' + 'a'), stroke)) {
-            return false;
-        }
-        stroke->shift = true;
         return true;
     }
     if (ch >= '0' && ch <= '9') {
@@ -1151,41 +1292,22 @@ static bool ascii_keystroke(char16_t ch, KeyStroke *stroke) {
             kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9,
         };
         stroke->keycode = keys[ch - '0'];
-        stroke->shift = false;
         return true;
     }
 
     switch (ch) {
-        case ' ': stroke->keycode = kVK_Space; stroke->shift = false; return true;
-        case '`': stroke->keycode = kVK_ANSI_Grave; stroke->shift = false; return true;
-        case '~': stroke->keycode = kVK_ANSI_Grave; stroke->shift = true; return true;
-        case '!': stroke->keycode = kVK_ANSI_1; stroke->shift = true; return true;
-        case '$': stroke->keycode = kVK_ANSI_4; stroke->shift = true; return true;
-        case '^': stroke->keycode = kVK_ANSI_6; stroke->shift = true; return true;
-        case '&': stroke->keycode = kVK_ANSI_7; stroke->shift = true; return true;
-        case '*': stroke->keycode = kVK_ANSI_8; stroke->shift = true; return true;
-        case '(': stroke->keycode = kVK_ANSI_9; stroke->shift = true; return true;
-        case ')': stroke->keycode = kVK_ANSI_0; stroke->shift = true; return true;
-        case '-': stroke->keycode = kVK_ANSI_Minus; stroke->shift = false; return true;
-        case '_': stroke->keycode = kVK_ANSI_Minus; stroke->shift = true; return true;
-        case '=': stroke->keycode = kVK_ANSI_Equal; stroke->shift = false; return true;
-        case '+': stroke->keycode = kVK_ANSI_Equal; stroke->shift = true; return true;
-        case '[': stroke->keycode = kVK_ANSI_LeftBracket; stroke->shift = false; return true;
-        case '{': stroke->keycode = kVK_ANSI_LeftBracket; stroke->shift = true; return true;
-        case ']': stroke->keycode = kVK_ANSI_RightBracket; stroke->shift = false; return true;
-        case '}': stroke->keycode = kVK_ANSI_RightBracket; stroke->shift = true; return true;
-        case '\\': stroke->keycode = kVK_ANSI_Backslash; stroke->shift = false; return true;
-        case '|': stroke->keycode = kVK_ANSI_Backslash; stroke->shift = true; return true;
-        case ';': stroke->keycode = kVK_ANSI_Semicolon; stroke->shift = false; return true;
-        case ':': stroke->keycode = kVK_ANSI_Semicolon; stroke->shift = true; return true;
-        case '\'': stroke->keycode = kVK_ANSI_Quote; stroke->shift = false; return true;
-        case '"': stroke->keycode = kVK_ANSI_Quote; stroke->shift = true; return true;
-        case ',': stroke->keycode = kVK_ANSI_Comma; stroke->shift = false; return true;
-        case '<': stroke->keycode = kVK_ANSI_Comma; stroke->shift = true; return true;
-        case '.': stroke->keycode = kVK_ANSI_Period; stroke->shift = false; return true;
-        case '>': stroke->keycode = kVK_ANSI_Period; stroke->shift = true; return true;
-        case '/': stroke->keycode = kVK_ANSI_Slash; stroke->shift = false; return true;
-        case '?': stroke->keycode = kVK_ANSI_Slash; stroke->shift = true; return true;
+        case ' ': stroke->keycode = kVK_Space; return true;
+        case '`': stroke->keycode = kVK_ANSI_Grave; return true;
+        case '-': stroke->keycode = kVK_ANSI_Minus; return true;
+        case '=': stroke->keycode = kVK_ANSI_Equal; return true;
+        case '[': stroke->keycode = kVK_ANSI_LeftBracket; return true;
+        case ']': stroke->keycode = kVK_ANSI_RightBracket; return true;
+        case '\\': stroke->keycode = kVK_ANSI_Backslash; return true;
+        case ';': stroke->keycode = kVK_ANSI_Semicolon; return true;
+        case '\'': stroke->keycode = kVK_ANSI_Quote; return true;
+        case ',': stroke->keycode = kVK_ANSI_Comma; return true;
+        case '.': stroke->keycode = kVK_ANSI_Period; return true;
+        case '/': stroke->keycode = kVK_ANSI_Slash; return true;
         default:
             return false;
     }
@@ -1193,6 +1315,18 @@ static bool ascii_keystroke(char16_t ch, KeyStroke *stroke) {
 
 static bool escape_pressed() {
     return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, kVK_Escape);
+}
+
+static std::string keyboard_state_error() {
+    CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+    if ((flags & kCGEventFlagMaskAlphaShift) != 0) {
+        return "Caps Lock is on. Turn it off before typing.";
+    }
+    if ((flags & (kCGEventFlagMaskShift | kCGEventFlagMaskControl |
+                  kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand)) != 0) {
+        return "A modifier key is held. Release Shift, Control, Option, and Command before typing.";
+    }
+    return {};
 }
 
 class MacKeyboard {
@@ -1215,37 +1349,12 @@ public:
     }
 
     bool send_key(CGKeyCode keycode) {
-        return send_key_with_shift(keycode, false);
-    }
-
-    bool send_key_with_shift(CGKeyCode keycode, bool shift) {
         if (!source_) {
             return false;
-        }
-        CGEventRef shift_down = nullptr;
-        CGEventRef shift_up = nullptr;
-        if (shift) {
-            shift_down = CGEventCreateKeyboardEvent(source_, kVK_Shift, true);
-            shift_up = CGEventCreateKeyboardEvent(source_, kVK_Shift, false);
-            if (!shift_down || !shift_up) {
-                if (shift_down) {
-                    CFRelease(shift_down);
-                }
-                if (shift_up) {
-                    CFRelease(shift_up);
-                }
-                return false;
-            }
         }
         CGEventRef down = CGEventCreateKeyboardEvent(source_, keycode, true);
         CGEventRef up = CGEventCreateKeyboardEvent(source_, keycode, false);
         if (!down || !up) {
-            if (shift_down) {
-                CFRelease(shift_down);
-            }
-            if (shift_up) {
-                CFRelease(shift_up);
-            }
             if (down) {
                 CFRelease(down);
             }
@@ -1254,20 +1363,8 @@ public:
             }
             return false;
         }
-        if (shift_down) {
-            CGEventPost(kCGHIDEventTap, shift_down);
-        }
         CGEventPost(kCGHIDEventTap, down);
         CGEventPost(kCGHIDEventTap, up);
-        if (shift_up) {
-            CGEventPost(kCGHIDEventTap, shift_up);
-        }
-        if (shift_down) {
-            CFRelease(shift_down);
-        }
-        if (shift_up) {
-            CFRelease(shift_up);
-        }
         CFRelease(down);
         CFRelease(up);
         return true;
@@ -1278,7 +1375,7 @@ public:
         if (!ascii_keystroke(ch, &stroke)) {
             return false;
         }
-        return send_key_with_shift(stroke.keycode, stroke.shift);
+        return send_key(stroke.keycode);
     }
 
     bool send_unicode_units(const char16_t *units, size_t len) {
@@ -1343,6 +1440,11 @@ static int prepare_target(const Options &opt, FrontApp *target) {
     if (rc != EXIT_OK) {
         return rc;
     }
+    std::string state_error = keyboard_state_error();
+    if (!state_error.empty()) {
+        fprintf(stderr, "%s\n", state_error.c_str());
+        return EXIT_INPUT;
+    }
     *target = frontmost_app();
     print_front_app(*target);
     return EXIT_OK;
@@ -1353,7 +1455,7 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
     size_t col = 1;
     size_t typed = 0;
     FrontApp target = initial_target;
-    InputMode mode = effective_input_mode(opt, stats);
+    InputMode mode = effective_input_mode(opt);
 
     puts("");
     puts("Typing started. Ctrl-C aborts. Esc aborts before the next character.");
@@ -1364,11 +1466,20 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
             printf("\nAborted at line %zu, column %zu after %zu character/event unit(s).\n", line, col, typed);
             return EXIT_ABORTED;
         }
+        std::string state_error = keyboard_state_error();
+        if (!state_error.empty()) {
+            fprintf(stderr, "\n%s\n", state_error.c_str());
+            return EXIT_ABORTED;
+        }
         if (!opt.no_focus_check) {
             FrontApp current = frontmost_app();
-            if (target.pid != 0 && current.pid != target.pid) {
-                fprintf(stderr, "\nForeground app changed from \"%s\" to \"%s\". Aborting to avoid typing into the wrong target.\n",
-                        target.name.c_str(), current.name.c_str());
+            bool app_changed = target.pid != 0 && current.pid != target.pid;
+            bool window_changed = target.window_id != 0 && current.window_id != target.window_id;
+            if (app_changed || window_changed) {
+                fprintf(stderr, "\nForeground target changed from app \"%s\" window %u to app \"%s\" window %u. "
+                        "Aborting to avoid typing into the wrong target.\n",
+                        target.name.c_str(), static_cast<unsigned int>(target.window_id),
+                        current.name.c_str(), static_cast<unsigned int>(current.window_id));
                 return EXIT_ABORTED;
             }
         }
@@ -1446,11 +1557,11 @@ static int run_self_test(const Options &opt) {
         fprintf(stderr, "Self-test failed: cannot create CGEventSource.\n");
         return EXIT_INPUT;
     }
-    if (!keyboard.send_key(kVK_Shift)) {
-        fprintf(stderr, "Self-test failed: cannot post Shift key event.\n");
+    if (!keyboard.send_key(kVK_F20)) {
+        fprintf(stderr, "Self-test failed: cannot post F20 key event.\n");
         return EXIT_INPUT;
     }
-    puts("Self-test completed: posted a harmless Shift key event.");
+    puts("Self-test completed: posted a harmless F20 key event.");
     puts("Note: macOS CGEventPost has no per-event accepted count. Use --debug-input for visible verification.");
     return EXIT_OK;
 }
@@ -1468,7 +1579,7 @@ static int run_debug_input(const Options &opt) {
     }
 
     TextData keys_data;
-    NSString *keys_marker = @"TTDBG_MAC_KEYS abc xyz 0123456789\n";
+    NSString *keys_marker = @"ttdbg-mac-keys abc xyz 0123456789\n";
     keys_data.text = nsstring_to_u16(keys_marker);
     keys_data.byte_count = [[keys_marker dataUsingEncoding:NSUTF8StringEncoding] length];
     keys_data.encoding = "built-in ASCII debug marker";
@@ -1488,7 +1599,7 @@ static int run_debug_input(const Options &opt) {
     }
 
     TextData unicode_data;
-    NSString *unicode_marker = @"TTDBG_MAC_UNICODE Unicode=中 emoji=✓\n";
+    NSString *unicode_marker = @"ttdbg-mac-unicode unicode=中 check=✓\n";
     unicode_data.text = nsstring_to_u16(unicode_marker);
     unicode_data.byte_count = [[unicode_marker dataUsingEncoding:NSUTF8StringEncoding] length];
     unicode_data.encoding = "built-in Unicode debug marker";
@@ -1511,6 +1622,8 @@ static int type_generated_ascii(MacKeyboard &keyboard, const std::string &text, 
     Options opt = base_opt;
     opt.transfer_mode = TransferMode::Simple;
     opt.input_mode = InputMode::Keys;
+    opt.enter_mode = EnterMode::Key;
+    opt.commands_out.clear();
     int rc = validate_text(data, stats, opt);
     if (rc != EXIT_OK) {
         return rc;
@@ -1519,23 +1632,30 @@ static int type_generated_ascii(MacKeyboard &keyboard, const std::string &text, 
 }
 
 static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
-    std::vector<unsigned char> bytes = text_to_utf8_bytes(data.text);
-    if (bytes.empty()) {
-        fprintf(stderr, "Input text encoded to empty UTF-8 data.\n");
-        return EXIT_CONTENT;
+    std::vector<unsigned char> bytes;
+    std::string error;
+    if (!make_output_bytes(data, opt, &bytes, &error)) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return EXIT_ENCODING;
     }
 
     std::string hex_text = bytes_to_plain_hex(bytes, opt.hex_chunk_bytes);
     size_t hex_line_count = count_hex_lines(hex_text);
     printf("cmd-hex transfer mode.\n");
-    printf("UTF-8 bytes to transfer: %zu\n", bytes.size());
+    printf("Output bytes to transfer: %zu\n", bytes.size());
     printf("Remote output: %s\n", opt.remote_output.c_str());
     printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
     printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
+    printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
+    printf("Remote temporary hex is retained for recovery and inspection.\n");
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.\n");
     fflush(stdout);
 
     std::string commands = build_cmd_hex_commands(hex_text, opt);
+    int rc = prepare_generated_commands(commands, opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
     if (opt.dry_run) {
         printf("Generated hex characters: %zu\n", hex_text.size() - hex_line_count);
         printf("Generated command characters: %zu\n", commands.size());
@@ -1550,7 +1670,7 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
     }
 
     FrontApp target;
-    int rc = prepare_target(opt, &target);
+    rc = prepare_target(opt, &target);
     if (rc != EXIT_OK) {
         return rc;
     }
@@ -1565,14 +1685,13 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
 }
 
 static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
-    std::vector<unsigned char> bytes = text_to_utf8_bytes(data.text);
-    if (bytes.empty()) {
-        fprintf(stderr, "Input text encoded to empty UTF-8 data.\n");
-        return EXIT_CONTENT;
-    }
-
     std::vector<unsigned char> zip_bytes;
+    std::vector<unsigned char> bytes;
     std::string error;
+    if (!make_output_bytes(data, opt, &bytes, &error)) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return EXIT_ENCODING;
+    }
     if (!make_zip_payload(bytes, opt.remote_output, &zip_bytes, &error)) {
         fprintf(stderr, "%s\n", error.c_str());
         return EXIT_FILE;
@@ -1582,16 +1701,22 @@ static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
     size_t hex_line_count = count_hex_lines(hex_text);
     double ratio = bytes.empty() ? 0.0 : (static_cast<double>(zip_bytes.size()) / static_cast<double>(bytes.size())) * 100.0;
     printf("zip-hex transfer mode.\n");
-    printf("UTF-8 bytes before zip: %zu\n", bytes.size());
-    printf("Zip bytes to transfer: %zu (%.2f%% of UTF-8 size)\n", zip_bytes.size(), ratio);
+    printf("Output bytes before zip: %zu\n", bytes.size());
+    printf("Zip bytes to transfer: %zu (%.2f%% of output size)\n", zip_bytes.size(), ratio);
     printf("Remote output: %s\n", opt.remote_output.c_str());
     printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
     printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
     printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
+    printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
+    printf("Remote temporary hex and zip files are retained for recovery and inspection.\n");
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.\n");
     fflush(stdout);
 
     std::string commands = build_zip_hex_commands(hex_text, opt);
+    int rc = prepare_generated_commands(commands, opt);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
     if (opt.dry_run) {
         printf("Generated hex characters: %zu\n", hex_text.size() - hex_line_count);
         printf("Generated command characters: %zu\n", commands.size());
@@ -1606,7 +1731,7 @@ static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
     }
 
     FrontApp target;
-    int rc = prepare_target(opt, &target);
+    rc = prepare_target(opt, &target);
     if (rc != EXIT_OK) {
         return rc;
     }

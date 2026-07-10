@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ctypes
+import hashlib
 import io
 import locale
 import os
@@ -36,7 +37,9 @@ VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_PAUSE = 0x13
+VK_CAPITAL = 0x14
 VK_ESCAPE = 0x1B
+VK_F24 = 0x87
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL = 25
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -55,6 +58,8 @@ class Options:
     remote_output: str
     remote_hex: str
     remote_zip: str
+    output_encoding: str
+    commands_out: Path | None
     hex_chunk_bytes: int
     ascii_only: bool
     ascii_keys: bool
@@ -74,6 +79,7 @@ class TextData:
     text: str
     byte_count: int
     encoding: str
+    raw_bytes: bytes | None = None
 
 
 @dataclass
@@ -130,19 +136,30 @@ def parse_args(argv: list[str]) -> Options:
     parser.add_argument("--remote-hex", default="tt.hex", help="Remote temporary hex file for --mode cmd-hex/zip-hex")
     parser.add_argument("--remote-zip", default="tt.zip", help="Remote temporary zip file for --mode zip-hex")
     parser.add_argument(
+        "--output-encoding",
+        choices=("utf8", "utf8-bom", "preserve"),
+        default="utf8",
+        help="Bytes recreated by cmd-hex/zip-hex. preserve requires file input.",
+    )
+    parser.add_argument("--commands-out", type=Path, help="Write the generated complex-mode command stream to PATH")
+    parser.add_argument(
         "--hex-chunk-bytes",
         type=bounded_int("--hex-chunk-bytes", 1, MAX_HEX_CHUNK_BYTES),
         default=DEFAULT_HEX_CHUNK_BYTES,
-        help=f"UTF-8/zip bytes per generated hex line. Default: {DEFAULT_HEX_CHUNK_BYTES}",
+        help=f"Output/zip bytes per generated hex line. Default: {DEFAULT_HEX_CHUNK_BYTES}",
     )
     parser.add_argument("--ascii-only", action="store_true")
     parser.add_argument("--ascii-keys", action="store_true")
     parser.add_argument("--legacy-keys", action="store_true", help="Type ASCII through legacy keybd_event instead of SendInput")
-    parser.add_argument("--sendinput", action="store_true", help="Use the original SendInput Unicode mode instead of default legacy keybd_event")
+    parser.add_argument(
+        "--sendinput",
+        action="store_true",
+        help="Use Unicode SendInput for validated simple text/diagnostics; does not enable complex characters",
+    )
     parser.add_argument("--no-focus-check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--diagnose", action="store_true", help="Report the focused target window and integrity levels without typing")
-    parser.add_argument("--self-test", action="store_true", help="Test whether the selected input mode can send a harmless Shift key event")
+    parser.add_argument("--self-test", action="store_true", help="Test whether the selected input mode can send a harmless F24 key event")
     parser.add_argument("--debug-input", action="store_true", help="Run visible SendInput diagnostics against the focused target window")
     parser.add_argument("--enter-mode", choices=("key", "unicode"), default="key")
     args = parser.parse_args(argv)
@@ -164,6 +181,8 @@ def parse_args(argv: list[str]) -> Options:
         remote_output=args.remote_output,
         remote_hex=args.remote_hex,
         remote_zip=args.remote_zip,
+        output_encoding=args.output_encoding,
+        commands_out=args.commands_out,
         hex_chunk_bytes=args.hex_chunk_bytes,
         ascii_only=args.ascii_only,
         ascii_keys=args.ascii_keys,
@@ -275,7 +294,7 @@ def read_trans_file(path: Path, opt: Options) -> TextData:
     if not text:
         raise RuntimeError("Input file decoded to empty text.")
 
-    return TextData(path=path, text=text, byte_count=len(raw), encoding=encoding)
+    return TextData(path=path, text=text, byte_count=len(raw), encoding=encoding, raw_bytes=raw)
 
 
 def read_text_source(opt: Options) -> TextData:
@@ -355,11 +374,16 @@ def line_col(text: str, index: int) -> tuple[int, int]:
 
 
 def is_safe_cmd_hex_path(path: str) -> bool:
-    if not path or path[0] in "/\\" or path[-1] in "/\\":
+    if not path or len(path) > 240 or path[0] in "/\\" or path[-1] in "/\\":
         return False
     normalized = path.replace("\\", "/")
     for part in normalized.split("/"):
-        if part in ("", ".", ".."):
+        if part in ("", ".", "..") or part.startswith("-") or part.endswith("."):
+            return False
+        base = part.split(".", 1)[0]
+        if base in {"con", "prn", "aux", "nul"}:
+            return False
+        if len(base) == 4 and base[:3] in {"com", "lpt"} and base[3] in "123456789":
             return False
     for ch in path:
         if "a" <= ch <= "z" or "0" <= ch <= "9":
@@ -368,6 +392,36 @@ def is_safe_cmd_hex_path(path: str) -> bool:
             continue
         return False
     return True
+
+
+SHIFT_FREE_SIMPLE_PUNCTUATION = set(" `-=[]\\;',./")
+GENERATED_COMMAND_PUNCTUATION = set(" \r\n-./\\'")
+
+
+def is_shift_free_simple_char(ch: str) -> bool:
+    return "a" <= ch <= "z" or "0" <= ch <= "9" or ch in SHIFT_FREE_SIMPLE_PUNCTUATION
+
+
+def validate_generated_command_stream(text: str) -> None:
+    for index, ch in enumerate(text):
+        if "a" <= ch <= "z" or "0" <= ch <= "9" or ch in GENERATED_COMMAND_PUNCTUATION:
+            continue
+        line, col = line_col(text, index)
+        raise RuntimeError(
+            f"Generated command stream contains forbidden character U+{ord(ch):04X} "
+            f"at line {line}, column {col}."
+        )
+
+
+def output_bytes(data: TextData, opt: Options) -> bytes:
+    if opt.output_encoding == "preserve":
+        if data.raw_bytes is None:
+            raise RuntimeError("--output-encoding preserve requires --source file or --file.")
+        return data.raw_bytes
+    encoded = data.text.encode("utf-8", errors="strict")
+    if opt.output_encoding == "utf8-bom":
+        return b"\xef\xbb\xbf" + encoded
+    return encoded
 
 
 def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
@@ -389,6 +443,8 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
             f"First one at line {line}, column {col}."
         )
     if opt.mode in ("cmd-hex", "zip-hex"):
+        if opt.output_encoding == "preserve" and data.raw_bytes is None:
+            raise RuntimeError("--output-encoding preserve requires file input; clipboard text has no original byte encoding.")
         if not is_safe_cmd_hex_path(opt.remote_output):
             raise RuntimeError(
                 "--remote-output must be a relative cmd-safe path using only lowercase letters, "
@@ -411,11 +467,16 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
         elif opt.remote_output.lower().replace("\\", "/") == opt.remote_hex.lower().replace("\\", "/"):
             raise RuntimeError("--remote-output and --remote-hex must be different files.")
         return
-    if (opt.ascii_keys or opt.legacy_keys) and stats.non_ascii_count:
-        line, col = line_col(data.text, stats.first_non_ascii)
+    if opt.commands_out is not None:
+        raise RuntimeError("--commands-out is only valid with --mode cmd-hex or --mode zip-hex.")
+    for index, ch in enumerate(data.text):
+        if ch in "\r\n\t" or is_shift_free_simple_char(ch):
+            continue
+        line, col = line_col(data.text, index)
         raise RuntimeError(
-            f"Legacy/ASCII key modes cannot type non-ASCII characters. First one at line {line}, column {col}. "
-            "Use --sendinput for Unicode input if this Windows session allows SendInput."
+            f"Simple mode only accepts lowercase, digits, and unmodified US-keyboard characters. "
+            f"Character U+{ord(ch):04X} at line {line}, column {col} would require a modifier or Unicode input. "
+            "Use --mode cmd-hex or --mode zip-hex."
         )
 
 
@@ -430,11 +491,13 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
     print(f"Focus check: {'off' if opt.no_focus_check else 'on'}")
     if opt.mode == "cmd-hex":
         print("Mode: cmd-hex transfer through remote cmd/certutil")
+        print(f"Output encoding: {opt.output_encoding}")
         print(f"Remote output: {opt.remote_output}")
         print(f"Remote temporary hex: {opt.remote_hex}")
         print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line")
     elif opt.mode == "zip-hex":
         print("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive")
+        print(f"Output encoding: {opt.output_encoding}")
         print(f"Remote output: {opt.remote_output}")
         print(f"Remote temporary hex: {opt.remote_hex}")
         print(f"Remote temporary zip: {opt.remote_zip}")
@@ -448,7 +511,9 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
     else:
         input_mode = "Unicode SendInput"
         print(f"Input mode: {input_mode}")
-    if opt.legacy_keys:
+    if opt.mode in ("cmd-hex", "zip-hex"):
+        enter_mode = "physical Return key (forced for complex mode)"
+    elif opt.legacy_keys:
         enter_mode = "legacy VK_RETURN"
     else:
         enter_mode = "Unicode CR" if opt.enter_mode == "unicode" else "VK_RETURN"
@@ -523,6 +588,8 @@ class WinKeyboard:
         self.user32.keybd_event.restype = None
         self.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
         self.user32.GetAsyncKeyState.restype = ctypes.c_short
+        self.user32.GetKeyState.argtypes = [ctypes.c_int]
+        self.user32.GetKeyState.restype = ctypes.c_short
         self.user32.GetForegroundWindow.argtypes = []
         self.user32.GetForegroundWindow.restype = wintypes.HWND
         self.user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -591,22 +658,12 @@ class WinKeyboard:
 
         vk = vk_scan & 0xFF
         shift_state = (vk_scan >> 8) & 0xFF
-
-        if shift_state & 1:
-            self.user32.keybd_event(VK_SHIFT, 0, 0, 0)
-        if shift_state & 2:
-            self.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-        if shift_state & 4:
-            self.user32.keybd_event(VK_MENU, 0, 0, 0)
-
+        if shift_state != 0:
+            raise RuntimeError(
+                f"Character U+{ord(ch):04X} requires Shift/Ctrl/Alt in the current keyboard layout. "
+                "Use cmd-hex or zip-hex."
+            )
         self.legacy_vk(vk)
-
-        if shift_state & 4:
-            self.user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-        if shift_state & 2:
-            self.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        if shift_state & 1:
-            self.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
 
     def send_vk(self, vk: int, what: str) -> None:
         self.send_inputs(
@@ -639,29 +696,26 @@ class WinKeyboard:
 
         vk = vk_scan & 0xFF
         shift_state = (vk_scan >> 8) & 0xFF
-        inputs = []
-
-        if shift_state & 1:
-            inputs.append(self.key_input(vk=VK_SHIFT))
-        if shift_state & 2:
-            inputs.append(self.key_input(vk=VK_CONTROL))
-        if shift_state & 4:
-            inputs.append(self.key_input(vk=VK_MENU))
-
-        inputs.append(self.key_input(vk=vk))
-        inputs.append(self.key_input(vk=vk, flags=KEYEVENTF_KEYUP))
-
-        if shift_state & 4:
-            inputs.append(self.key_input(vk=VK_MENU, flags=KEYEVENTF_KEYUP))
-        if shift_state & 2:
-            inputs.append(self.key_input(vk=VK_CONTROL, flags=KEYEVENTF_KEYUP))
-        if shift_state & 1:
-            inputs.append(self.key_input(vk=VK_SHIFT, flags=KEYEVENTF_KEYUP))
-
-        self.send_inputs(inputs, "ASCII character")
+        if shift_state != 0:
+            raise RuntimeError(
+                f"Character U+{ord(ch):04X} requires Shift/Ctrl/Alt in the current keyboard layout. "
+                "Use cmd-hex or zip-hex."
+            )
+        self.send_inputs(
+            [self.key_input(vk=vk), self.key_input(vk=vk, flags=KEYEVENTF_KEYUP)],
+            "ASCII character",
+        )
 
     def get_async_key_state(self, vk: int) -> int:
         return self.user32.GetAsyncKeyState(vk)
+
+    def keyboard_state_error(self) -> str | None:
+        if self.user32.GetKeyState(VK_CAPITAL) & 0x0001:
+            return "Caps Lock is on. Turn it off before typing."
+        for vk, name in ((VK_SHIFT, "Shift"), (VK_CONTROL, "Ctrl"), (VK_MENU, "Alt")):
+            if self.get_async_key_state(vk) & 0x8000:
+                return f"{name} is currently held. Release all modifier keys before typing."
+        return None
 
     def foreground_window(self) -> TargetWindow:
         hwnd = self.user32.GetForegroundWindow()
@@ -826,6 +880,13 @@ def prepare_target_window(win: WinKeyboard, opt: Options) -> tuple[int, TargetWi
         target = win.foreground_window()
         print_target(target)
 
+        state_error = win.keyboard_state_error()
+        if state_error:
+            rc = wait_for_console_enter_or_esc(state_error)
+            if rc != EXIT_OK:
+                return rc, None
+            continue
+
         if not target.hwnd:
             rc = wait_for_console_enter_or_esc("No foreground window was detected.")
             if rc != EXIT_OK:
@@ -857,6 +918,10 @@ def check_runtime_controls(win: WinKeyboard, opt: Options, target: TargetWindow)
     if win.get_async_key_state(VK_PAUSE) & 0x0001:
         return pause_and_recapture(win, opt, "Pause/Break was pressed.")
 
+    state_error = win.keyboard_state_error()
+    if state_error:
+        return pause_and_recapture(win, opt, state_error)
+
     if not opt.no_focus_check:
         current = win.foreground_window()
         if current.hwnd != target.hwnd:
@@ -871,7 +936,7 @@ def sleep_ms(ms: int) -> None:
 
 
 def self_test_sendinput(win: WinKeyboard) -> int:
-    print("Running SendInput self-test with a harmless Shift key press.")
+    print("Running SendInput self-test with a harmless F24 key press.")
     print("This does not type visible text.")
     print(f"Python: {sys.version.split()[0]} ({'64-bit' if ctypes.sizeof(ctypes.c_void_p) == 8 else '32-bit'})")
     print(f"ctypes INPUT size: {ctypes.sizeof(win.INPUT)} bytes")
@@ -882,22 +947,22 @@ def self_test_sendinput(win: WinKeyboard) -> int:
     if target.hwnd:
         print_integrity_report(win, target)
     try:
-        win.send_vk(VK_SHIFT, "self-test Shift")
+        win.send_vk(VK_F24, "self-test F24")
     except RuntimeError as exc:
         print(f"Self-test failed: {exc}", file=sys.stderr)
-        print("Trying legacy keybd_event Shift test. This API has no reliable success return value.")
+        print("Trying legacy keybd_event F24 test. This API has no reliable success return value.")
         try:
-            win.legacy_vk(VK_SHIFT)
+            win.legacy_vk(VK_F24)
             print("Legacy keybd_event call completed. If this also has no effect, the system/session is blocking synthetic input.")
         except Exception as legacy_exc:
             print(f"Legacy keybd_event call raised an exception: {legacy_exc}", file=sys.stderr)
         return EXIT_INPUT
-    print("Self-test passed: SendInput accepted the Shift key events.")
+    print("Self-test passed: SendInput accepted the F24 key events.")
     return EXIT_OK
 
 
 def self_test_legacy(win: WinKeyboard) -> int:
-    print("Running legacy keybd_event self-test with a harmless Shift key press.")
+    print("Running legacy keybd_event self-test with a harmless F24 key press.")
     print("This does not type visible text.")
     print("Note: keybd_event does not report whether the target accepted the event.")
     print(f"Python: {sys.version.split()[0]} ({'64-bit' if ctypes.sizeof(ctypes.c_void_p) == 8 else '32-bit'})")
@@ -907,7 +972,7 @@ def self_test_legacy(win: WinKeyboard) -> int:
     if target.hwnd:
         print_integrity_report(win, target)
     try:
-        win.legacy_vk(VK_SHIFT)
+        win.legacy_vk(VK_F24)
     except Exception as exc:
         print(f"Legacy self-test failed: {exc}", file=sys.stderr)
         return EXIT_INPUT
@@ -942,7 +1007,7 @@ def send_debug_legacy_ascii(win: WinKeyboard, text: str, delay_ms: int) -> None:
 def debug_input(win: WinKeyboard, opt: Options) -> int:
     print("Input debug mode.")
     print("It will type this visible marker into the focused target:")
-    print("  TTDBG_LEGACY TTDBG_ASCII TTDBG_UNICODE U+4E2D=中")
+    print("  ttdbg-legacy ttdbg-ascii ttdbg-unicode unicode-chinese=中")
     print("Open a safe text field, Notepad, or a scratch shell before the countdown ends.")
 
     rc, target = prepare_target_window(win, opt)
@@ -950,11 +1015,11 @@ def debug_input(win: WinKeyboard, opt: Options) -> int:
         return rc
 
     tests = [
-        ("Legacy keybd_event ASCII", lambda: send_debug_legacy_ascii(win, "TTDBG_LEGACY ", opt.delay_ms)),
-        ("SendInput no-visible Shift key", lambda: win.send_vk(VK_SHIFT, "debug Shift")),
-        ("ASCII virtual keys", lambda: send_debug_ascii(win, "TTDBG_ASCII ", opt.delay_ms)),
-        ("Unicode ASCII", lambda: send_debug_unicode(win, "TTDBG_UNICODE ", opt.delay_ms)),
-        ("Unicode Chinese", lambda: send_debug_unicode(win, "U+4E2D=中", opt.delay_ms)),
+        ("Legacy keybd_event ASCII", lambda: send_debug_legacy_ascii(win, "ttdbg-legacy ", opt.delay_ms)),
+        ("SendInput no-visible F24 key", lambda: win.send_vk(VK_F24, "debug F24")),
+        ("ASCII virtual keys", lambda: send_debug_ascii(win, "ttdbg-ascii ", opt.delay_ms)),
+        ("Unicode ASCII", lambda: send_debug_unicode(win, "ttdbg-unicode ", opt.delay_ms)),
+        ("Unicode Chinese", lambda: send_debug_unicode(win, "unicode-chinese=中", opt.delay_ms)),
     ]
 
     failed = False
@@ -983,7 +1048,7 @@ def debug_input(win: WinKeyboard, opt: Options) -> int:
         return EXIT_INPUT
 
     print("Debug input completed. If all markers are visible in the target, all input modes work in this session.")
-    print("If only TTDBG_LEGACY appears, use the default mode and keep trans.txt ASCII.")
+    print("If only ttdbg-legacy appears, use the default key mode or a complex transfer mode.")
     return EXIT_OK
 
 
@@ -1084,8 +1149,7 @@ def normalized_zip_entry_name(remote_output: str) -> str:
     return remote_output.replace("\\", "/")
 
 
-def zip_payload(text: str, opt: Options) -> tuple[bytes, int]:
-    raw = text.encode("utf-8", errors="strict")
+def zip_payload(raw: bytes, opt: Options) -> bytes:
     entry_name = normalized_zip_entry_name(opt.remote_output)
     buffer = io.BytesIO()
     info = zipfile.ZipInfo(entry_name)
@@ -1093,44 +1157,73 @@ def zip_payload(text: str, opt: Options) -> tuple[bytes, int]:
     info.date_time = (1980, 1, 1, 0, 0, 0)
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr(info, raw)
-    return buffer.getvalue(), len(raw)
+    return buffer.getvalue()
 
 
 def generated_ascii_data(text: str, label: str) -> TextData:
     return TextData(path=Path(label), text=text, byte_count=len(text), encoding="generated ASCII command stream")
 
 
+def quote_powershell_literal(value: str) -> str:
+    if "'" in value:
+        raise RuntimeError("Internal error: PowerShell literal contains a single quote.")
+    return f"'{value}'"
+
+
 def build_hex_writer_commands(payload: str, remote_hex: str) -> list[str]:
     lines = [line for line in payload.splitlines() if line]
-    commands = ["powershell -nop"]
+    commands = ["powershell -noprofile"]
     for index, line in enumerate(lines):
         writer = "set-content" if index == 0 else "add-content"
-        commands.append(f"{writer} -encoding ascii {remote_hex} {line}")
+        commands.append(
+            f"{writer} -encoding ascii {quote_powershell_literal(remote_hex)} {quote_powershell_literal(line)}"
+        )
     return commands
 
 
 def build_cmd_hex_commands(payload: str, opt: Options) -> str:
     commands = build_hex_writer_commands(payload, opt.remote_hex)
-    commands.append(f"certutil -f -decodehex {opt.remote_hex} {opt.remote_output}")
-    commands.append(f"del {opt.remote_hex}")
+    commands.append(
+        f"certutil -f -decodehex {quote_powershell_literal(opt.remote_hex)} "
+        f"{quote_powershell_literal(opt.remote_output)}"
+    )
+    commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_output)} sha256")
     commands.append("exit")
     return "\n".join(commands) + "\n"
 
 
 def build_zip_hex_commands(payload: str, opt: Options) -> str:
     commands = build_hex_writer_commands(payload, opt.remote_hex)
-    commands.append(f"certutil -f -decodehex {opt.remote_hex} {opt.remote_zip}")
-    commands.append(f"expand-archive -force {opt.remote_zip} .")
-    commands.append(f"del {opt.remote_hex}")
-    commands.append(f"del {opt.remote_zip}")
+    commands.append(
+        f"certutil -f -decodehex {quote_powershell_literal(opt.remote_hex)} "
+        f"{quote_powershell_literal(opt.remote_zip)}"
+    )
+    commands.append(f"expand-archive -force {quote_powershell_literal(opt.remote_zip)} .")
+    commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_output)} sha256")
     commands.append("exit")
     return "\n".join(commands) + "\n"
 
 
 def keyboard_opt_for_generated_ascii(opt: Options) -> Options:
     if opt.ascii_keys:
-        return replace(opt, mode="simple", ascii_keys=True, legacy_keys=False, sendinput=False)
-    return replace(opt, mode="simple", ascii_keys=False, legacy_keys=True, sendinput=False)
+        return replace(
+            opt,
+            mode="simple",
+            ascii_keys=True,
+            legacy_keys=False,
+            sendinput=False,
+            commands_out=None,
+            enter_mode="key",
+        )
+    return replace(
+        opt,
+        mode="simple",
+        ascii_keys=False,
+        legacy_keys=True,
+        sendinput=False,
+        commands_out=None,
+        enter_mode="key",
+    )
 
 
 def type_generated_ascii(win: WinKeyboard, text: str, label: str, opt: Options, target: TargetWindow) -> int:
@@ -1145,6 +1238,18 @@ def type_generated_ascii(win: WinKeyboard, text: str, label: str, opt: Options, 
     return type_text(win, generated, stats, key_opt, target)
 
 
+def prepare_generated_commands(commands: str, opt: Options) -> int:
+    try:
+        validate_generated_command_stream(commands)
+        if opt.commands_out is not None:
+            opt.commands_out.write_text(commands, encoding="ascii", newline="\n")
+            print(f"Generated commands written to: {opt.commands_out}")
+    except (OSError, RuntimeError) as exc:
+        print(f"Generated command validation/output failed: {exc}", file=sys.stderr)
+        return EXIT_CONTENT
+    return EXIT_OK
+
+
 def send_enter_key(win: WinKeyboard, opt: Options) -> None:
     if opt.legacy_keys:
         win.legacy_vk(VK_RETURN)
@@ -1156,19 +1261,28 @@ def send_enter_key(win: WinKeyboard, opt: Options) -> None:
 
 def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
     try:
-        payload, byte_count, line_count = hex_payload(data.text, opt.hex_chunk_bytes)
+        raw = output_bytes(data, opt)
+        payload, byte_count, line_count = hex_payload_from_bytes(raw, opt.hex_chunk_bytes)
     except UnicodeEncodeError as exc:
         print(f"Input text could not be encoded as UTF-8: {exc}", file=sys.stderr)
         return EXIT_ENCODING
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_ENCODING
 
     print("cmd-hex transfer mode.")
-    print(f"UTF-8 bytes to transfer: {byte_count}")
+    print(f"Output bytes to transfer: {byte_count}")
     print(f"Remote output: {opt.remote_output}")
     print(f"Remote temporary hex: {opt.remote_hex}")
     print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line ({line_count} line(s))")
+    print(f"Expected SHA-256: {hashlib.sha256(raw).hexdigest()}")
+    print("Remote temporary hex is retained for recovery and inspection.")
     print("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.")
 
     commands = build_cmd_hex_commands(payload, opt)
+    rc = prepare_generated_commands(commands, opt)
+    if rc != EXIT_OK:
+        return rc
     if opt.dry_run:
         print(f"Generated hex characters: {sum(len(line) for line in payload.splitlines())}")
         print(f"Generated command characters: {len(commands)}")
@@ -1195,7 +1309,9 @@ def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
 
 def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
     try:
-        zipped, raw_byte_count = zip_payload(data.text, opt)
+        raw = output_bytes(data, opt)
+        zipped = zip_payload(raw, opt)
+        raw_byte_count = len(raw)
         payload, zip_byte_count, line_count = hex_payload_from_bytes(zipped, opt.hex_chunk_bytes)
     except UnicodeEncodeError as exc:
         print(f"Input text could not be encoded as UTF-8: {exc}", file=sys.stderr)
@@ -1206,15 +1322,20 @@ def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
 
     ratio = (zip_byte_count / raw_byte_count) if raw_byte_count else 0.0
     print("zip-hex transfer mode.")
-    print(f"UTF-8 bytes before zip: {raw_byte_count}")
-    print(f"Zip bytes to transfer: {zip_byte_count} ({ratio:.2%} of UTF-8 size)")
+    print(f"Output bytes before zip: {raw_byte_count}")
+    print(f"Zip bytes to transfer: {zip_byte_count} ({ratio:.2%} of output size)")
     print(f"Remote output: {opt.remote_output}")
     print(f"Remote temporary hex: {opt.remote_hex}")
     print(f"Remote temporary zip: {opt.remote_zip}")
     print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line ({line_count} line(s))")
+    print(f"Expected SHA-256: {hashlib.sha256(raw).hexdigest()}")
+    print("Remote temporary hex and zip files are retained for recovery and inspection.")
     print("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.")
 
     commands = build_zip_hex_commands(payload, opt)
+    rc = prepare_generated_commands(commands, opt)
+    if rc != EXIT_OK:
+        return rc
     if opt.dry_run:
         print(f"Generated hex characters: {sum(len(line) for line in payload.splitlines())}")
         print(f"Generated command characters: {len(commands)}")
@@ -1290,11 +1411,6 @@ def run(argv: list[str]) -> int:
     if os.name != "nt":
         print("Keyboard input and Windows exe packaging must run on Windows. Use GitHub Actions or a Windows machine.", file=sys.stderr)
         return EXIT_INPUT
-
-    if stats.non_ascii_count:
-        print()
-        print(f"Warning: trans.txt contains {stats.non_ascii_count} non-ASCII character(s).")
-        print("Unicode input usually works through RDP, but some target applications may reject it.")
 
     win = WinKeyboard()
     rc, target = prepare_target_window(win, opt)

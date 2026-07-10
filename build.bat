@@ -15,10 +15,10 @@ exit /b 1
 
 :build_msvc
 echo Building with MSVC...
-cl /nologo /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS trans_type.c user32.lib
+cl /nologo /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 trans_type.c user32.lib bcrypt.lib
 exit /b %ERRORLEVEL%
 
 :build_gcc
 echo Building with GCC/MinGW...
-gcc -Os -s -Wall -Wextra -o trans_type.exe trans_type.c -luser32
+gcc -Os -s -Wall -Wextra -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -o trans_type.exe trans_type.c -luser32 -lbcrypt
 exit /b %ERRORLEVEL%

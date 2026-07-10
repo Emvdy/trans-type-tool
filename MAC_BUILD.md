@@ -1,8 +1,16 @@
-# Building from macOS
+# Building and testing on macOS
 
-This directory can build a native macOS typing tool locally. Windows `.exe` files should still be produced on Windows or GitHub Actions.
+macOS can build the native Mac tool and validate the shared protocol. It cannot
+directly produce the Windows PyInstaller executable; Windows artifacts are built
+on Windows or GitHub Actions.
 
-## Native macOS tool
+## Native universal build
+
+Requirements:
+
+- Xcode Command Line Tools with `clang++`
+- macOS SDK containing Intel and Apple-silicon targets
+- `/usr/bin/zip` for `zip-hex`
 
 Build:
 
@@ -10,128 +18,155 @@ Build:
 ./build_mac.sh
 ```
 
-Output:
+Default output:
 
-- `trans_type_mac`: native macOS command-line tool for the current Mac architecture.
+- file: `trans_type_mac`
+- architectures: `arm64` and `x86_64`
+- minimum runtime: macOS 11.0
 
-Default behavior:
+Verify it:
+
+```sh
+lipo -info trans_type_mac
+xcrun vtool -show-build trans_type_mac
+```
+
+Override architectures or deployment target when needed:
+
+```sh
+TRANS_TYPE_MAC_ARCHS="arm64" ./build_mac.sh
+MACOSX_DEPLOYMENT_TARGET=12.0 ./build_mac.sh
+```
+
+Sign with an installed identity:
+
+```sh
+CODESIGN_IDENTITY="Developer ID Application: Example" ./build_mac.sh
+codesign --verify --deep --strict --verbose=2 trans_type_mac
+```
+
+Signing does not replace Apple notarization for public distribution.
+
+## macOS behavior
+
+The default source is the local clipboard. The default mode is strict `simple`:
 
 ```sh
 ./trans_type_mac
 ```
 
-By default, `trans_type_mac` reads the macOS clipboard and uses simple direct keyboard typing.
+Simple mode types only lowercase letters, digits, tabs/newlines, spaces, and
+unmodified US-keyboard punctuation. It rejects uppercase, Unicode, `@#$`, and
+all Shift-dependent characters before requesting Accessibility permission or
+starting the countdown.
 
-It has two transfer modes:
-
-- `--mode simple`: directly type the source text through keyboard events.
-- `--mode cmd-hex`: type a remote PowerShell + `certutil -decodehex` sequence that recreates the source text as a file on Windows.
-
-In simple mode:
-
-- Simple ASCII text is typed as real virtual key presses. Use this path for RDP.
-- Non-ASCII text is typed through Unicode `CGEvent` payloads. This is useful for local macOS apps, but some RDP clients ignore the Unicode payload and forward only the underlying keycode, which can appear remotely as repeated `a`.
-
-For RDP, keep the input to ASCII text without the excluded symbols, then use:
-
-```sh
-./trans_type_mac --input-mode keys
-```
-
-This simplified key mode intentionally does not handle `@`, `#`, `%`, or currency symbols. `--dry-run` reports the first unsupported character before typing starts.
-
-For text that contains complex symbols, Chinese, or anything unreliable through direct keyboard typing, focus a remote `cmd.exe` or PowerShell prompt and use complex mode:
-
-```sh
-./trans_type_mac --mode cmd-hex --remote-output trans.txt
-```
-
-This starts PowerShell without a profile, writes the temporary hex file with `set-content` and `add-content`, then runs:
-
-```bat
-certutil -f -decodehex tt.hex trans.txt
-```
-
-It avoids `>`, `>>`, Ctrl+Z, and F6, which can be unreliable through macOS RDP.
-
-Use `--remote-output trans.ps1` or another simple lowercase relative filename when needed.
-
-For local Unicode testing in TextEdit:
-
-```sh
-./trans_type_mac --input-mode unicode
-```
-
-Useful checks that do not type:
-
-```sh
-./trans_type_mac --dry-run
-./trans_type_mac --dry-run --source file
-./trans_type_mac --diagnose
-./trans_type_mac --input-mode keys --dry-run
-./trans_type_mac --input-mode unicode --dry-run
-./trans_type_mac --mode cmd-hex --dry-run
-```
-
-Use `trans.txt` instead of the clipboard:
+Use file input:
 
 ```sh
 ./trans_type_mac --source file
 ./trans_type_mac --file /path/to/input.txt
 ```
 
-Mode, input source, and speed can be combined:
+Use a complex mode for scripts, symbols, or Unicode. Focus a remote `cmd.exe` or
+PowerShell prompt during the countdown:
 
 ```sh
-./trans_type_mac --mode simple --source file --delay-ms 50 --line-delay-ms 300
-./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.ps1 --delay-ms 20 --line-delay-ms 300 --start-delay-sec 10
+./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode zip-hex --file /path/to/input.txt --remote-output trans.txt
 ```
 
-For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in:
+Both modes type a validated stream containing no uppercase and no Shift-required
+characters. `cmd-hex` sends source bytes directly as hex. `zip-hex` uses the
+macOS system `/usr/bin/zip` first and is useful only when compression saves enough
+typing.
+
+Simple mode does not automatically switch to Unicode. `--input-mode unicode` is
+retained for explicit diagnostics and does not bypass strict simple validation.
+
+## Encoding and auditing
+
+```sh
+./trans_type_mac --mode cmd-hex --output-encoding utf8
+./trans_type_mac --mode cmd-hex --output-encoding utf8-bom
+./trans_type_mac --mode zip-hex --file /path/to/input.txt --output-encoding preserve
+```
+
+`preserve` requires file input and recreates the original decoded file bytes.
+
+Export and inspect the exact generated stream without typing:
+
+```sh
+./trans_type_mac --mode cmd-hex --source file --dry-run --commands-out cmd.commands
+./trans_type_mac --mode zip-hex --source file --dry-run --commands-out zip.commands
+python3 tests/verify_command_files.py cmd.commands zip.commands
+```
+
+The tool displays the expected source SHA-256. After remote reconstruction,
+compare it with the SHA-256 printed by remote `certutil`.
+
+## Accessibility and focus
+
+Actual typing requires Accessibility permission for the terminal or binary:
 
 ```text
 System Settings > Privacy & Security > Accessibility
 ```
 
-You can ask macOS to show the permission prompt:
+Request the prompt and test a harmless F20 event:
 
 ```sh
 ./trans_type_mac --request-accessibility --self-test
 ```
 
-Visible input debug:
+Visible diagnostics:
 
 ```sh
 ./trans_type_mac --debug-input
 ```
 
-Run this against a safe target such as TextEdit first. If `--self-test` reports `Accessibility trusted: no`, enable Accessibility permission before expecting typing to work.
+Run visible diagnostics only against a disposable TextEdit document or another
+safe field. The debug command tests both virtual keys and Unicode event payloads;
+it is not a transfer mode.
 
-## Recommended path: GitHub Actions
+The program records both foreground application PID and window ID. It aborts if
+either changes while typing. Before starting, turn Caps Lock off, release Shift,
+Control, Option, and Command, select an English input method, and align the local
+and remote keyboard layouts.
 
-1. Create a GitHub repository and push this directory.
-2. Open the repository's **Actions** tab.
-3. Run **Build Windows exes**.
-4. Download the `trans_type-windows` artifact.
+## Local verification
 
-The artifact contains:
-
-- `trans_type.exe`: native WinAPI C build, smallest.
-- `trans_type_cpp.exe`: C++ wrapper build, same native behavior.
-- `trans_type_py.exe`: Python/PyInstaller build, larger.
-
-## Why macOS cannot directly package the Python exe
-
-PyInstaller packages for the platform it runs on. Running PyInstaller on macOS creates a macOS binary, not a Windows `.exe`. For a Windows exe, run PyInstaller on Windows, or let GitHub Actions do it on `windows-latest`.
-
-## Local Windows-source checks on macOS
-
-These checks validate the Windows Python source and do not type anything:
+Run the protocol unit tests, compile, and validate all native payload variants:
 
 ```sh
-python3 -m py_compile trans_type.py
-python3 trans_type.py --dry-run
-python3 trans_type.py --dry-run --ascii-only
+python3 -m unittest discover -s tests -v
+./build_mac.sh
+python3 tests/verify_macos_binary.py ./trans_type_mac
+git diff --check
 ```
 
-The Windows tools use the Windows `SendInput`/`keybd_event` APIs. The native macOS tool uses macOS `CGEvent` APIs and requires Accessibility permission for actual typing.
+The binary verifier checks:
+
+- strict simple acceptance and rejection
+- lowercase/no-Shift generated command streams
+- `cmd-hex` payload reconstruction
+- `zip-hex` archive contents
+- UTF-8, UTF-8 BOM, and byte-preserving output
+
+These dry-run tests do not post keyboard events.
+
+## Windows builds from macOS
+
+PyInstaller packages for its host operating system. Running PyInstaller on macOS
+does not create a supported Windows `.exe`. Use the repository's Windows workflow:
+
+```text
+.github/workflows/build-windows.yml
+```
+
+It runs on Windows Server 2022 x64, builds all three Windows executables, verifies
+their PE architecture, and executes the generated protocols using Windows
+PowerShell 5.1 and `certutil`. See `GITHUB_BUILD.md` for the complete procedure.
+
+The hosted runner validates Windows compatibility but is not an actual Windows
+10 RDP client. Perform the final attended simple/cmd-hex/zip-hex smoke test on the
+intended Windows 10 machine before operational deployment.

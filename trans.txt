@@ -1,2 +1,2 @@
-Write-Host "trans_type sample"
-Get-Date
+trans-type sample
+line 2

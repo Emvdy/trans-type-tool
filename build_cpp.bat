@@ -15,10 +15,10 @@ exit /b 1
 
 :build_msvc
 echo Building C++ wrapper with MSVC...
-cl /nologo /TP /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:trans_type_cpp.exe /Fo:trans_type_cpp.obj trans_type.cpp /link user32.lib
+cl /nologo /TP /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /Fe:trans_type_cpp.exe /Fo:trans_type_cpp.obj trans_type.cpp /link user32.lib bcrypt.lib
 exit /b %ERRORLEVEL%
 
 :build_gcc
 echo Building C++ wrapper with GCC/MinGW...
-g++ -Os -s -Wall -Wextra -o trans_type_cpp.exe trans_type.cpp -luser32
+g++ -Os -s -Wall -Wextra -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -o trans_type_cpp.exe trans_type.cpp -luser32 -lbcrypt
 exit /b %ERRORLEVEL%

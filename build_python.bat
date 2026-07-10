@@ -12,11 +12,11 @@ if errorlevel 1 goto no_python
 set "PYTHON=py -3"
 
 :have_python
-%PYTHON% -m PyInstaller --version >nul 2>nul
+%PYTHON% -c "from importlib.metadata import version; raise SystemExit(0 if version('pyinstaller') == '6.21.0' and version('pyinstaller-hooks-contrib') == '2026.6' else 1)" >nul 2>nul
 if not errorlevel 1 goto build_pyinstaller
 
-echo PyInstaller is not installed. Installing it now...
-%PYTHON% -m pip install --upgrade -r requirements-build.txt
+echo Installing the pinned PyInstaller build dependencies...
+%PYTHON% -m pip install --disable-pip-version-check --upgrade -r requirements-build.txt
 if errorlevel 1 exit /b %ERRORLEVEL%
 
 :build_pyinstaller

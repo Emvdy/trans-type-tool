@@ -1,252 +1,264 @@
 # trans_type
 
-This project provides three Windows 10 tools with the same behavior:
+`trans_type` types local text into a foreground window, including an RDP client,
+without using remote clipboard or network transfer. It is intended for attended,
+authorized administration of Windows systems.
 
-- `trans_type.exe`: native Win32 C/C++-style implementation. Smallest exe.
-- `trans_type_cpp.exe`: C++ build wrapper for the same native implementation.
-- `trans_type_py.exe`: Python implementation packaged by PyInstaller. Easier to edit, but much larger.
+The repository contains four implementations:
 
-All three tools can read `trans.txt`, another local file, or the local Windows clipboard, then type into the current foreground Windows window through simulated keyboard input. They are designed for Windows 10 + RDP cases where the target server has no network access and remote clipboard transfer is disabled.
+- `trans_type.exe`: native Win32 C build and the smallest Windows executable.
+- `trans_type_cpp.exe`: C++ wrapper around the same native implementation.
+- `trans_type_py.exe`: Python implementation packaged with PyInstaller.
+- `trans_type_mac`: native Objective-C++ macOS implementation.
 
-The Windows tools do not use the network or inject into the remote host. Clipboard mode only reads the local Windows clipboard as an input source; it still types through keyboard simulation.
+The Windows tools read `trans.txt` beside the executable by default. The macOS
+tool reads the local clipboard by default. Clipboard input is only a local source;
+the tools do not paste the clipboard into the remote session.
 
-It also includes a macOS command-line tool:
+## Supported systems
 
-- `trans_type_mac`: native Objective-C++/C++ macOS build. It reads the clipboard by default and types through macOS `CGEvent` keyboard input.
+- Windows runtime target: Windows 10 x64 or newer.
+- Windows complex-mode requirements: Windows PowerShell 5.1 and `certutil`.
+- `zip-hex` additionally requires PowerShell `Expand-Archive`.
+- macOS runtime target: macOS 11 or newer, Intel or Apple silicon.
+- The target RDP session should use an English/US-like keyboard layout and an
+  English input method while typing.
 
-The macOS tool reads the local clipboard as an input source, but it does not paste into the target. It still types characters through simulated keyboard events.
+The Windows GitHub workflow builds on Windows Server 2022 because GitHub does not
+provide a Windows 10 hosted runner. It compiles for the Windows 10 API target and
+tests x64 PE files, PowerShell 5.1, `certutil`, and both complex protocols. A final
+RDP smoke test on the intended Windows 10 environment is still recommended.
 
-## Build On Windows
+## Transfer modes
 
-Native WinAPI version:
+### `simple`
+
+Simple mode sends direct, unmodified key presses. It deliberately accepts only:
+
+```text
+a-z 0-9 space tab newline ` - = [ ] \ ; ' , . /
+```
+
+Uppercase letters, Unicode, `_`, `@`, `#`, `$`, `%`, and every other character
+that needs Shift, Ctrl, Alt, or a Unicode payload are rejected before the
+countdown. Use this mode only for text that fits the list above.
+
+Tab is sent as a real Tab key. In a shell it may trigger completion or move focus
+instead of inserting a tab character; use a complex mode when exact file bytes
+matter.
+
+The tools also stop or pause if Caps Lock is on or Shift/Ctrl/Alt is held. macOS
+also checks Option and Command. This keeps the generated key stream independent
+of modifier timing, which was unreliable in the tested RDP environment.
+
+### `cmd-hex`
+
+`cmd-hex` is the reliable mode for scripts, complex ASCII such as `@#$`, Chinese,
+emoji, and other Unicode. It converts the selected output bytes to lowercase hex,
+then types commands that reconstruct the file on remote Windows.
+
+The generated outer stream is validated immediately before typing. It contains
+only lowercase letters, digits, whitespace, and these unmodified characters:
+
+```text
+- . / \ '
+```
+
+It contains no uppercase letters and no character that requires Shift on a
+US-style keyboard. Complex modes always send line endings with a physical Return
+key, even if a Unicode Enter diagnostic option was supplied. A typical stream has
+this shape:
+
+```powershell
+powershell -noprofile
+set-content -encoding ascii 'tt.hex' '...lowercase hex...'
+add-content -encoding ascii 'tt.hex' '...lowercase hex...'
+certutil -f -decodehex 'tt.hex' 'trans.txt'
+certutil -hashfile 'trans.txt' sha256
+exit
+```
+
+Single quotes are intentional. They preserve leading zeroes in numeric-looking
+hex chunks and are an unmodified key on the required keyboard layout.
+
+### `zip-hex`
+
+`zip-hex` first compresses the selected output bytes, then sends the zip through
+the same validated lowercase hex channel. Remote Windows runs:
+
+```powershell
+certutil -f -decodehex 'tt.hex' 'tt.zip'
+expand-archive -force 'tt.zip' .
+certutil -hashfile 'trans.txt' sha256
+```
+
+Compression is useful for longer or repetitive content. It is normally slower
+than `cmd-hex` for very small or already-compressed input. Run `--dry-run` and
+compare the reported source and zip sizes before choosing it.
+
+Neither complex mode executes the reconstructed file. The temporary `.hex` and
+`.zip` files are retained for inspection and recovery. Delete them manually only
+after verifying the output.
+
+## Windows use
+
+Put an executable beside `trans.txt`, open the RDP session, and run one of:
+
+```bat
+trans_type.exe --mode simple
+trans_type_cpp.exe --mode simple
+trans_type_py.exe --mode simple
+```
+
+During the five-second countdown, focus the intended target window.
+
+Read another file or the local Windows clipboard:
+
+```bat
+trans_type.exe --mode simple --file C:\path\to\input.txt
+trans_type.exe --mode simple --source clipboard
+```
+
+Use a complex mode for unrestricted text:
+
+```bat
+trans_type.exe --mode cmd-hex --file C:\path\to\input.txt --remote-output trans.txt
+trans_type.exe --mode zip-hex --source clipboard --remote-output trans.txt
+```
+
+The local `--file` path may be a normal Windows path. Remote paths are more
+restricted because they become part of the typed command stream: use only
+lowercase letters, digits, `.`, `-`, `/`, and `\` in a relative path. Reserved
+Windows device names, traversal, leading `-`, and paths longer than 240 characters
+are rejected. Parent directories used by temporary or `cmd-hex` output paths must
+already exist; a simple filename in the current remote directory is the safest
+choice.
+
+## macOS use
+
+Build and run the native universal binary:
+
+```sh
+./build_mac.sh
+./trans_type_mac --mode simple
+```
+
+macOS defaults to local clipboard input. Use `trans.txt` or another file with:
+
+```sh
+./trans_type_mac --mode simple --source file
+./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.txt
+./trans_type_mac --mode zip-hex --file /path/to/input.txt --remote-output trans.txt
+```
+
+Simple mode never automatically switches to Unicode. `--input-mode unicode` is
+kept only as an explicit diagnostic transport and does not bypass simple-mode
+character validation. Use `cmd-hex` or `zip-hex` for real Unicode transfer.
+
+Actual macOS typing requires Accessibility permission for the terminal or binary:
+
+```text
+System Settings > Privacy & Security > Accessibility
+```
+
+Request the prompt and run a non-visible key test with:
+
+```sh
+./trans_type_mac --request-accessibility --self-test
+```
+
+## Output encoding
+
+Complex modes support:
+
+- `--output-encoding utf8`: decode the input text and recreate UTF-8 without a
+  BOM. This is the default.
+- `--output-encoding utf8-bom`: recreate UTF-8 with a BOM.
+- `--output-encoding preserve`: recreate the original file bytes exactly. This
+  requires file input; clipboard text has no original byte encoding.
+
+`preserve` is not an arbitrary binary mode. The source must still decode as one
+of the supported text encodings so content validation can run.
+
+Supported file decoding includes UTF-8 and UTF-16 LE/BE with BOM. Windows uses
+the active ANSI code page as its final fallback; macOS uses Windows-1252.
+
+Examples:
+
+```bat
+trans_type.exe --mode cmd-hex --output-encoding utf8-bom
+trans_type.exe --mode zip-hex --file C:\path\to\input.txt --output-encoding preserve
+```
+
+Each complex transfer prints the expected local SHA-256. The generated remote
+command prints the reconstructed file's SHA-256 with `certutil`. Compare the two
+values; the program cannot read remote console output back through the keyboard
+channel automatically.
+
+## Speed and command auditing
+
+```bat
+trans_type.exe --delay-ms 50 --line-delay-ms 300 --start-delay-sec 10
+trans_type.exe --mode cmd-hex --hex-chunk-bytes 240
+```
+
+- `--delay-ms`: delay after each typed character, from 0 to 5000 ms.
+- `--line-delay-ms`: delay after each Enter, from 0 to 5000 ms.
+- `--start-delay-sec`: focus countdown, from 0 to 3600 seconds.
+- `--hex-chunk-bytes`: bytes encoded per generated hex line, from 1 to 2048.
+
+Larger chunks reduce command overhead but create longer RDP input lines. Start at
+the default 240. For unstable or high-latency sessions, increase both typing
+delays before increasing chunk size.
+
+Inspect the exact complex stream without typing:
+
+```bat
+trans_type.exe --mode cmd-hex --dry-run --commands-out commands.txt
+trans_type.exe --mode zip-hex --dry-run --commands-out commands.txt
+```
+
+The exporter writes the same stream that the program validates and would type.
+
+## Build
+
+On Windows with MSVC or MinGW:
 
 ```bat
 build.bat
-```
-
-`build.bat` uses MSVC `cl` when available, otherwise MinGW `gcc`.
-
-C++ wrapper version:
-
-```bat
 build_cpp.bat
-```
-
-`build_cpp.bat` compiles `trans_type.cpp`, which reuses the native WinAPI implementation and outputs `trans_type_cpp.exe`.
-
-Python/PyInstaller version:
-
-```bat
 build_python.bat
 ```
 
-`build_python.bat` installs PyInstaller if needed, then creates `trans_type_py.exe`.
-
-All versions:
+Build all three Windows executables:
 
 ```bat
 build_all.bat
 ```
 
-## Build From macOS
+`build_python.bat` uses the pinned versions in `requirements-build.txt` and
+creates a PyInstaller one-file executable. PyInstaller embeds Python, so this
+artifact is much larger and can receive more antivirus false positives than the
+native C build. UPX and code obfuscation are not used.
 
-You can edit and dry-run the Python source on macOS, but you should not expect PyInstaller on macOS to produce a Windows `.exe`. PyInstaller does not provide reliable cross-compilation from macOS to Windows.
+PyInstaller is not a Windows cross-compiler. Running it on macOS produces a
+macOS application, not a Windows `.exe`. Build Windows artifacts on Windows or
+use `.github/workflows/build-windows.yml`.
 
-Recommended macOS workflow:
-
-1. Put this project in a GitHub repository.
-2. Run the included GitHub Actions workflow.
-3. Download the `trans_type-windows` artifact.
-
-See `MAC_BUILD.md` for the exact macOS workflow and local dry-run checks.
-See `GITHUB_BUILD.md` for step-by-step GitHub Actions instructions in Chinese.
-
-The workflow builds all three:
-
-- `trans_type.exe`
-- `trans_type_cpp.exe`
-- `trans_type_py.exe`
-
-Expected size difference:
-
-- Native WinAPI exe: usually tens to hundreds of KB.
-- Python/PyInstaller exe: usually several MB to tens of MB because it embeds Python.
-
-Native macOS tool:
+The macOS build defaults to a universal `arm64 + x86_64` binary with a macOS 11
+deployment target:
 
 ```sh
 ./build_mac.sh
 ```
 
-This creates `trans_type_mac` for the current Mac architecture.
+See `MAC_BUILD.md` and `GITHUB_BUILD.md` for platform-specific instructions.
 
-## Basic Use On macOS
+## Diagnostics and controls
 
-The macOS tool supports three transfer modes:
-
-- Simple mode: directly types the source text through keyboard events.
-- Complex mode: types a `cmd.exe` + `certutil -decodehex` sequence that recreates the source text as a file on the remote Windows side.
-- Zip-hex mode: zips the source locally, types the zip as hex, then expands it on the remote Windows side.
-
-All modes support clipboard input, file input, and speed controls.
-
-The macOS tool defaults to clipboard input and simple mode:
-
-```sh
-./trans_type_mac
-```
-
-Simple mode uses `--input-mode auto`. ASCII text is typed as real virtual key presses. If the input contains non-ASCII characters, the tool switches to Unicode `CGEvent` payloads. Some RDP clients ignore those Unicode payloads and forward only the underlying keycode; that makes the remote side see repeated `a`. For RDP, keep the clipboard/input to ASCII text without the excluded symbols, then use:
-
-```sh
-./trans_type_mac --mode simple --input-mode keys
-```
-
-The simplified macOS RDP key mode intentionally does not handle `@`, `#`, `%`, or currency symbols. `--dry-run` reports the first unsupported character before typing starts.
-
-Complex mode is for scripts or text containing symbols, Chinese, or other characters that are unreliable through direct keyboard simulation. Focus a remote `cmd.exe` or PowerShell prompt, then run:
-
-```sh
-./trans_type_mac --mode cmd-hex --remote-output trans.txt
-```
-
-It starts PowerShell without a profile, writes the temporary hex file with `set-content` and `add-content`, then runs:
+Windows:
 
 ```bat
-certutil -f -decodehex tt.hex trans.txt
-```
-
-This avoids `>`, `>>`, Ctrl+Z, and F6, which can be unreliable through macOS RDP.
-
-For larger or repetitive text, try zip-hex mode:
-
-```sh
-./trans_type_mac --mode zip-hex --remote-output trans.txt
-```
-
-It creates a local zip with `/usr/bin/zip`, types the zip bytes as hex, then runs remote Windows built-ins:
-
-```bat
-certutil -f -decodehex tt.hex tt.zip
-expand-archive -force tt.zip .
-```
-
-For small files the zip header can be larger than the original text, so run `--dry-run` first and compare the reported byte counts.
-
-Use file input instead of the clipboard:
-
-```sh
-./trans_type_mac --mode simple --source file
-./trans_type_mac --mode cmd-hex --source file --remote-output trans.txt
-./trans_type_mac --mode zip-hex --source file --remote-output trans.txt
-./trans_type_mac --mode cmd-hex --file /path/to/input.txt --remote-output trans.ps1
-```
-
-Speed controls apply to all modes:
-
-```sh
-./trans_type_mac --mode simple --delay-ms 50 --line-delay-ms 300
-./trans_type_mac --mode cmd-hex --delay-ms 20 --line-delay-ms 300 --start-delay-sec 10
-./trans_type_mac --mode zip-hex --hex-chunk-bytes 512 --delay-ms 10
-```
-
-For local macOS apps such as TextEdit, Unicode payload mode can type non-ASCII:
-
-```sh
-./trans_type_mac --input-mode unicode
-```
-
-Useful macOS options:
-
-```sh
-./trans_type_mac --dry-run
-./trans_type_mac --delay-ms 50 --line-delay-ms 300
-./trans_type_mac --mode simple
-./trans_type_mac --mode cmd-hex
-./trans_type_mac --mode zip-hex
-./trans_type_mac --input-mode keys
-./trans_type_mac --input-mode unicode
-./trans_type_mac --source file
-./trans_type_mac --file /path/to/input.txt
-./trans_type_mac --remote-output trans.ps1
-./trans_type_mac --remote-zip tt.zip
-./trans_type_mac --hex-chunk-bytes 512
-./trans_type_mac --diagnose
-./trans_type_mac --self-test
-./trans_type_mac --debug-input
-```
-
-For actual typing, macOS must allow the terminal app or the `trans_type_mac` binary in **System Settings > Privacy & Security > Accessibility**. Use `--request-accessibility` if you want macOS to show the permission prompt.
-
-## Basic Use On Windows
-
-1. Put one of `trans_type.exe`, `trans_type_cpp.exe`, or `trans_type_py.exe` and `trans.txt` in the same directory, or prepare text in the Windows clipboard.
-2. Open the RDP session and place the cursor in the target editor, shell, or input box.
-3. Run:
-
-```bat
-trans_type.exe
-```
-
-or:
-
-```bat
-trans_type_cpp.exe
-```
-
-or:
-
-```bat
-trans_type_py.exe
-```
-
-4. During the countdown, focus the target RDP window.
-
-Windows simple mode directly types the source text through keyboard events:
-
-```bat
-trans_type.exe --mode simple --source file
-trans_type.exe --mode simple --source clipboard
-trans_type.exe --mode simple --file C:\path\to\input.txt
-```
-
-Windows complex mode types a PowerShell + `certutil -decodehex` sequence. Focus a remote `cmd.exe` or PowerShell prompt:
-
-```bat
-trans_type.exe --mode cmd-hex --source file --remote-output trans.txt
-trans_type.exe --mode cmd-hex --source clipboard --remote-output trans.txt
-trans_type.exe --mode cmd-hex --file C:\path\to\input.txt --remote-output trans.ps1
-```
-
-Complex mode is the safer choice for scripts containing symbols such as `@`, `#`, `%`, quotes, Chinese, or other text that direct keyboard simulation may corrupt. It creates the remote file but does not run it.
-
-For larger text, zip-hex mode can reduce the number of typed characters:
-
-```bat
-trans_type.exe --mode zip-hex --source file --remote-output trans.txt
-trans_type_py.exe --mode zip-hex --source clipboard --remote-output trans.txt
-```
-
-Zip-hex mode creates a zip locally, sends that zip as hex, then uses remote `certutil` and PowerShell `Expand-Archive`. The Windows C/C++ builds use local PowerShell/.NET to create the zip; the Python build uses the Python standard library. Use `--dry-run` first because very small files may become larger after zip headers.
-
-Useful options:
-
-```bat
-trans_type.exe --dry-run
-trans_type.exe --delay-ms 50 --line-delay-ms 300
-trans_type.exe --mode simple
-trans_type.exe --mode cmd-hex
-trans_type.exe --mode zip-hex
-trans_type.exe --source clipboard
-trans_type.exe --file C:\path\to\input.txt
-trans_type.exe --remote-output trans.ps1
-trans_type.exe --remote-zip tt.zip
-trans_type.exe --hex-chunk-bytes 512
-trans_type.exe --ascii-only
-trans_type.exe --ascii-keys
-trans_type.exe --sendinput
-trans_type.exe --start-delay-sec 10
-trans_type.exe --no-focus-check
 trans_type.exe --self-test
 trans_type_cpp.exe --self-test
 trans_type_py.exe --self-test
@@ -254,63 +266,35 @@ trans_type_py.exe --diagnose
 trans_type_py.exe --debug-input
 ```
 
-The Python exe accepts the same options:
+- `--self-test` uses F24 on Windows and F20 on macOS, not Shift.
+- Windows `--diagnose` reports foreground-window and integrity information.
+- Windows `--debug-input` visibly compares legacy keys, SendInput virtual keys,
+  and Unicode SendInput. Run it only in a disposable text field.
+- `Esc` aborts. Windows `Pause/Break` pauses and requires a new countdown.
+- Windows pauses when focus changes; macOS aborts when the foreground app/window
+  changes. `--no-focus-check` disables this protection and should be used only
+  for a target whose window identity cannot remain stable.
 
-```bat
-trans_type_py.exe --dry-run
-trans_type_py.exe --delay-ms 50 --line-delay-ms 300
-trans_type_py.exe --mode cmd-hex --source clipboard --remote-output trans.txt
-trans_type_py.exe --mode zip-hex --dry-run --remote-output trans.txt
-```
+Normal medium-integrity RDP operation does not require administrator rights. If
+the target application itself is elevated, Windows may block synthetic input
+from a non-elevated tool. Reopen the target normally instead of bypassing the
+integrity boundary.
 
-## Safety And Robustness
+Before typing, turn Caps Lock off, release all modifiers, select an English input
+method, and verify that local and remote keyboard layouts match.
 
-- `Esc` aborts typing.
-- `Pause/Break` pauses typing and starts a new countdown before resuming.
-- If the foreground window changes, typing pauses by default.
-- The tools refuse to type into their own console.
-- `--dry-run` parses `trans.txt`, reports encoding, line count, character count, non-ASCII count, and exits without typing.
-- `--self-test` checks the selected input mode. By default it calls legacy `keybd_event`; use `--sendinput --self-test` to retest `SendInput`.
-- Python-only `--diagnose` prints the focused target window and integrity levels without typing.
-- Python-only `--debug-input` runs visible ASCII and Unicode input tests against a safe target field.
-- Unsupported control characters are rejected. Tabs and newlines are allowed.
-- Default maximum file size is 1 MiB. Use `--max-bytes N` only when you intentionally need more.
+## Operational security
 
-## Encoding
+This project does not use the network, inject into another process, elevate,
+hide execution, establish persistence, or bypass endpoint policy. Complex modes
+do invoke visible Windows built-ins, so enterprise controls such as AppLocker,
+WDAC, or EDR may block or alert on them. Do not bypass those controls; obtain an
+allowlist or approved transfer method from the system owner.
 
-Supported inputs:
+For internal distribution, retain source, record release SHA-256 values, and use
+an organizational Authenticode/code-signing certificate when available.
 
-- UTF-8 with BOM
-- UTF-8 without BOM
-- UTF-16 LE with BOM
-- UTF-16 BE with BOM
-- Windows ANSI code page fallback
-
-For scripts, ASCII text is the safest. The default mode is legacy ASCII key input because some locked-down Windows environments block `SendInput`. If `trans.txt` contains Chinese or other non-ASCII characters, use `--sendinput`; that mode depends on the Windows session allowing `SendInput`.
-
-## Input Modes
-
-`--mode simple` directly types the source text into the focused window. On Windows, default simple mode uses legacy `keybd_event` and supports ASCII text only. It works in some environments where `SendInput` is blocked, but it depends on the local keyboard layout.
-
-`--mode cmd-hex` types only safe command/hex text, then uses remote PowerShell and Windows `certutil -decodehex` to recreate the source as a file. It avoids `>`, `>>`, Ctrl+Z, and F6. Use it for scripts, symbols, Chinese, or any text that direct keyboard simulation corrupts.
-
-`--mode zip-hex` uses the same safe typing path, but sends a compressed zip and expands it remotely with `Expand-Archive`. It is usually better for larger or repetitive files and worse for tiny files.
-
-`--hex-chunk-bytes N` controls how many source or zip bytes are placed on each generated hex command line. The default is 240. Larger values reduce `add-content` command overhead; if an RDP session drops long lines, lower it.
-
-`--ascii-only` only validates that `trans.txt` contains ASCII. It does not change the input method.
-
-`--ascii-keys` switches to virtual-key input through `SendInput` for ASCII characters. Use it only for comparison/debugging.
-
-`--sendinput` switches to Unicode `SendInput`. Use it for non-ASCII text if the Windows session allows `SendInput`.
-
-Enter is sent as `VK_RETURN` by default. If `--sendinput` is enabled and a target behaves better with Unicode carriage return, use:
-
-```bat
-trans_type.exe --sendinput --enter-mode unicode
-```
-
-## Exit Codes
+## Exit codes
 
 - `0`: success
 - `2`: invalid arguments
@@ -319,13 +303,3 @@ trans_type.exe --sendinput --enter-mode unicode
 - `5`: content validation error
 - `6`: user aborted
 - `7`: keyboard input failed
-
-## Practical Notes
-
-Use a slower speed for high-latency RDP, KVM, or IPMI sessions:
-
-```bat
-trans_type.exe --delay-ms 80 --line-delay-ms 500
-```
-
-For PowerShell or CMD, prefer typing into a text editor first when possible, then review the content before execution. This tool does not understand or validate the script content; it only types the bytes from `trans.txt` after decoding them.

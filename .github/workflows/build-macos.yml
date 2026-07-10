@@ -1,0 +1,51 @@
+name: Build macOS universal binary
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run protocol tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Build universal binary
+        run: ./build_mac.sh
+
+      - name: Verify architectures and deployment target
+        run: |
+          lipo trans_type_mac -verify_arch x86_64 arm64
+          xcrun vtool -show-build trans_type_mac
+
+      - name: Verify all modes and generated streams
+        run: |
+          ./trans_type_mac --mode simple --source file --dry-run
+          ./trans_type_mac --mode cmd-hex --source file --dry-run --commands-out mac-cmd.commands
+          ./trans_type_mac --mode zip-hex --source file --dry-run --commands-out mac-zip.commands
+          python3 tests/verify_command_files.py mac-cmd.commands mac-zip.commands
+          python3 tests/verify_macos_binary.py ./trans_type_mac
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trans-type-macos-universal
+          retention-days: 14
+          path: |
+            trans_type_mac
+            README.md
+            MAC_BUILD.md

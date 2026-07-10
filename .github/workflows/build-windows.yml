@@ -4,9 +4,13 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -14,15 +18,20 @@ jobs:
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: x64
 
       - name: Python syntax check
         shell: cmd
-        run: python -m py_compile trans_type.py
+        run: |
+          python -m py_compile trans_type.py
+          python -m unittest discover -s tests -v
 
       - name: Python dry run
         shell: cmd
@@ -56,10 +65,15 @@ jobs:
           trans_type_py.exe --mode cmd-hex --dry-run --hex-chunk-bytes 240
           trans_type_py.exe --mode zip-hex --dry-run --hex-chunk-bytes 240
 
+      - name: Execute emitted protocols with Windows PowerShell 5.1
+        shell: cmd
+        run: python tests\verify_windows_exes.py trans_type.exe trans_type_cpp.exe trans_type_py.exe
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: trans_type-windows
+          retention-days: 14
           path: |
             trans_type.exe
             trans_type_cpp.exe
@@ -76,3 +90,4 @@ jobs:
             requirements-build.txt
             MAC_BUILD.md
             GITHUB_BUILD.md
+            tests/*.py

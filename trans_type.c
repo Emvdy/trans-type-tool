@@ -1,5 +1,12 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER 0x0A00
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <bcrypt.h>
 #include <conio.h>
 #include <ctype.h>
 #include <limits.h>
@@ -42,12 +49,19 @@ enum TransferMode {
     TRANSFER_ZIP_HEX = 2
 };
 
+enum OutputEncoding {
+    OUTPUT_UTF8 = 0,
+    OUTPUT_UTF8_BOM = 1,
+    OUTPUT_PRESERVE = 2
+};
+
 typedef struct Options {
     int delay_ms;
     int line_delay_ms;
     int start_delay_sec;
     int source;
     int transfer_mode;
+    int output_encoding;
     int ascii_only;
     int ascii_keys;
     int legacy_keys;
@@ -58,7 +72,9 @@ typedef struct Options {
     int max_bytes;
     int hex_chunk_bytes;
     int has_file_path;
+    int has_commands_out;
     wchar_t file_path[32768];
+    wchar_t commands_out[32768];
     char remote_output[260];
     char remote_hex[260];
     char remote_zip[260];
@@ -69,6 +85,8 @@ typedef struct TextData {
     int chars;
     int bytes;
     const char *encoding;
+    unsigned char *raw_bytes;
+    int raw_count;
     wchar_t source_label[32768];
 } TextData;
 
@@ -94,6 +112,7 @@ static void init_options(Options *opt) {
     opt->start_delay_sec = DEFAULT_START_DELAY_SEC;
     opt->source = SOURCE_FILE;
     opt->transfer_mode = TRANSFER_SIMPLE;
+    opt->output_encoding = OUTPUT_UTF8;
     opt->ascii_only = 0;
     opt->ascii_keys = 0;
     opt->legacy_keys = 1;
@@ -104,7 +123,9 @@ static void init_options(Options *opt) {
     opt->max_bytes = DEFAULT_MAX_BYTES;
     opt->hex_chunk_bytes = DEFAULT_HEX_CHUNK_BYTES;
     opt->has_file_path = 0;
+    opt->has_commands_out = 0;
     opt->file_path[0] = L'\0';
+    opt->commands_out[0] = L'\0';
     strcpy(opt->remote_output, "trans.txt");
     strcpy(opt->remote_hex, "tt.hex");
     strcpy(opt->remote_zip, "tt.zip");
@@ -126,6 +147,8 @@ static void print_usage(void) {
     puts("  --remote-output PATH  Remote output file for --mode cmd-hex/zip-hex. Default: trans.txt");
     puts("  --remote-hex PATH     Remote temporary hex file for --mode cmd-hex/zip-hex. Default: tt.hex");
     puts("  --remote-zip PATH     Remote temporary zip file for --mode zip-hex. Default: tt.zip");
+    puts("  --output-encoding E   utf8, utf8-bom, or preserve. Default: utf8");
+    puts("  --commands-out PATH   Write generated complex-mode commands to a local file");
     puts("  --delay-ms N          Delay after each character. Default: 20");
     puts("  --line-delay-ms N     Delay after each line. Default: 100");
     puts("  --start-delay-sec N   Countdown before typing. Default: 5");
@@ -134,12 +157,13 @@ static void print_usage(void) {
     puts("  --ascii-only          Refuse to type non-ASCII characters");
     puts("  --ascii-keys          Type ASCII through SendInput virtual keys");
     puts("  --legacy-keys         Type ASCII through legacy keybd_event. Default");
-    puts("  --sendinput           Use Unicode SendInput instead of default legacy keybd_event");
+    puts("  --sendinput           Use Unicode SendInput for validated simple text/diagnostics");
+    puts("                         Does not enable uppercase, symbols, or non-ASCII in simple mode");
     puts("  --enter-mode key      Send Enter as VK_RETURN. Default");
     puts("  --enter-mode unicode  Send Enter as Unicode carriage return");
     puts("  --no-focus-check      Do not pause when the foreground window changes");
     puts("  --dry-run             Parse and validate the source text without typing");
-    puts("  --self-test           Test whether the selected input mode can send a harmless Shift key event");
+    puts("  --self-test           Test whether the selected input mode can send a harmless F24 key event");
     puts("  --help                Show this help");
     puts("");
     puts("Controls while running:");
@@ -363,6 +387,35 @@ static int parse_args(int argc, char **argv, Options *opt) {
             return 0;
         }
 
+        matched = get_option_value(&i, argc, argv, "--output-encoding", &value);
+        if (matched == 1) {
+            if (strcmp(value, "utf8") == 0) {
+                opt->output_encoding = OUTPUT_UTF8;
+            } else if (strcmp(value, "utf8-bom") == 0) {
+                opt->output_encoding = OUTPUT_UTF8_BOM;
+            } else if (strcmp(value, "preserve") == 0) {
+                opt->output_encoding = OUTPUT_PRESERVE;
+            } else {
+                fprintf(stderr, "Invalid --output-encoding value: %s\n", value);
+                return 0;
+            }
+            continue;
+        } else if (matched == 0) {
+            return 0;
+        }
+
+        matched = get_option_value(&i, argc, argv, "--commands-out", &value);
+        if (matched == 1) {
+            opt->has_commands_out = 1;
+            if (!arg_to_wide_path(value, opt->commands_out, sizeof(opt->commands_out) / sizeof(opt->commands_out[0]))) {
+                fprintf(stderr, "Invalid --commands-out path: %s\n", value);
+                return 0;
+            }
+            continue;
+        } else if (matched == 0) {
+            return 0;
+        }
+
         matched = get_option_value(&i, argc, argv, "--enter-mode", &value);
         if (matched == 1) {
             if (strcmp(value, "key") == 0) {
@@ -417,6 +470,38 @@ static void print_windows_error_a(const char *prefix, DWORD err) {
         LocalFree(message);
     } else {
         fprintf(stderr, "%s: Windows error %lu\n", prefix, (unsigned long)err);
+    }
+}
+
+static char *wide_to_utf8_alloc(const wchar_t *value) {
+    int needed;
+    char *utf8;
+
+    if (value == NULL) {
+        return NULL;
+    }
+    needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0) {
+        return NULL;
+    }
+    utf8 = (char *)malloc((size_t)needed);
+    if (utf8 == NULL) {
+        return NULL;
+    }
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, utf8, needed, NULL, NULL) != needed) {
+        free(utf8);
+        return NULL;
+    }
+    return utf8;
+}
+
+static void print_wide_line(FILE *stream, const char *prefix, const wchar_t *value) {
+    char *utf8 = wide_to_utf8_alloc(value);
+    if (utf8 != NULL) {
+        fprintf(stream, "%s%s\n", prefix, utf8);
+        free(utf8);
+    } else {
+        fprintf(stream, "%s<unprintable Unicode text>\n", prefix);
     }
 }
 
@@ -546,7 +631,7 @@ static int read_trans_file(const wchar_t *path, const Options *opt, TextData *da
     file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) {
         print_windows_error_a("Cannot open input file", GetLastError());
-        fwprintf(stderr, L"Path: %ls\n", path);
+        print_wide_line(stderr, "Path: ", path);
         return EXIT_FILE;
     }
 
@@ -624,7 +709,8 @@ static int read_trans_file(const wchar_t *path, const Options *opt, TextData *da
         return EXIT_ENCODING;
     }
 
-    free(bytes);
+    data->raw_bytes = bytes;
+    data->raw_count = data->bytes;
     return EXIT_OK;
 }
 
@@ -703,6 +789,13 @@ static int read_text_source(const Options *opt, TextData *data, wchar_t *path, D
         return EXIT_FILE;
     }
     return read_trans_file(path, opt, data);
+}
+
+static void free_text_data(TextData *data) {
+    free(data->text);
+    free(data->raw_bytes);
+    data->text = NULL;
+    data->raw_bytes = NULL;
 }
 
 static void index_to_line_col(const wchar_t *text, int chars, int index, int *line, int *col) {
@@ -790,7 +883,7 @@ static int is_safe_cmd_hex_path(const char *path) {
     const unsigned char *p = (const unsigned char *)path;
     const char *segment_start;
 
-    if (path == NULL || *path == '\0' || path[0] == '/' || path[0] == '\\') {
+    if (path == NULL || *path == '\0' || strlen(path) > 240 || path[0] == '/' || path[0] == '\\') {
         return 0;
     }
     if (path[strlen(path) - 1] == '/' || path[strlen(path) - 1] == '\\') {
@@ -799,13 +892,29 @@ static int is_safe_cmd_hex_path(const char *path) {
     segment_start = path;
     while (*segment_start) {
         const char *segment_end = segment_start;
+        const char *dot;
         size_t len;
+        size_t base_len;
         while (*segment_end && *segment_end != '/' && *segment_end != '\\') {
             ++segment_end;
         }
         len = (size_t)(segment_end - segment_start);
         if (len == 0 || (len == 1 && segment_start[0] == '.') ||
             (len == 2 && segment_start[0] == '.' && segment_start[1] == '.')) {
+            return 0;
+        }
+        if (segment_start[0] == '-' || segment_start[len - 1] == '.') {
+            return 0;
+        }
+        dot = (const char *)memchr(segment_start, '.', len);
+        base_len = dot != NULL ? (size_t)(dot - segment_start) : len;
+        if ((base_len == 3 && (strncmp(segment_start, "con", 3) == 0 ||
+                              strncmp(segment_start, "prn", 3) == 0 ||
+                              strncmp(segment_start, "aux", 3) == 0 ||
+                              strncmp(segment_start, "nul", 3) == 0)) ||
+            (base_len == 4 &&
+             (strncmp(segment_start, "com", 3) == 0 || strncmp(segment_start, "lpt", 3) == 0) &&
+             segment_start[3] >= '1' && segment_start[3] <= '9')) {
             return 0;
         }
         if (*segment_end == '\0') {
@@ -845,26 +954,108 @@ static int remote_paths_equal(const char *a, const char *b) {
     return strcmp(norm_a, norm_b) == 0;
 }
 
-static int text_to_utf8_bytes(const TextData *data, unsigned char **out_bytes, int *out_count) {
+static const char *output_encoding_name(int encoding) {
+    if (encoding == OUTPUT_UTF8_BOM) {
+        return "utf8-bom";
+    }
+    if (encoding == OUTPUT_PRESERVE) {
+        return "preserve";
+    }
+    return "utf8";
+}
+
+static int make_output_bytes(const TextData *data, const Options *opt, unsigned char **out_bytes, int *out_count) {
     int needed;
     unsigned char *bytes;
+
+    if (opt->output_encoding == OUTPUT_PRESERVE) {
+        if (data->raw_bytes == NULL || data->raw_count <= 0) {
+            fprintf(stderr, "--output-encoding preserve requires file input.\n");
+            return 0;
+        }
+        bytes = (unsigned char *)malloc((size_t)data->raw_count);
+        if (bytes == NULL) {
+            return 0;
+        }
+        memcpy(bytes, data->raw_bytes, (size_t)data->raw_count);
+        *out_bytes = bytes;
+        *out_count = data->raw_count;
+        return 1;
+    }
 
     needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, data->text, data->chars, NULL, 0, NULL, NULL);
     if (needed <= 0) {
         return 0;
     }
-    bytes = (unsigned char *)malloc((size_t)needed);
+    bytes = (unsigned char *)malloc((size_t)needed + (opt->output_encoding == OUTPUT_UTF8_BOM ? 3U : 0U));
     if (bytes == NULL) {
         return 0;
     }
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, data->text, data->chars, (LPSTR)bytes, needed, NULL, NULL) != needed) {
+    if (opt->output_encoding == OUTPUT_UTF8_BOM) {
+        bytes[0] = 0xEF;
+        bytes[1] = 0xBB;
+        bytes[2] = 0xBF;
+    }
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, data->text, data->chars,
+                            (LPSTR)(bytes + (opt->output_encoding == OUTPUT_UTF8_BOM ? 3 : 0)),
+                            needed, NULL, NULL) != needed) {
         free(bytes);
         return 0;
     }
 
     *out_bytes = bytes;
-    *out_count = needed;
+    *out_count = needed + (opt->output_encoding == OUTPUT_UTF8_BOM ? 3 : 0);
     return 1;
+}
+
+static int sha256_bytes(const unsigned char *bytes, int count, unsigned char digest[32]) {
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    PUCHAR object = NULL;
+    DWORD object_size = 0;
+    DWORD result_size = 0;
+    NTSTATUS status;
+    int ok = 0;
+
+    status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (status < 0) {
+        goto cleanup;
+    }
+    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, (PUCHAR)&object_size,
+                               sizeof(object_size), &result_size, 0);
+    if (status < 0 || object_size == 0) {
+        goto cleanup;
+    }
+    object = (PUCHAR)malloc(object_size);
+    if (object == NULL) {
+        goto cleanup;
+    }
+    status = BCryptCreateHash(algorithm, &hash, object, object_size, NULL, 0, 0);
+    if (status < 0 || BCryptHashData(hash, (PUCHAR)bytes, (ULONG)count, 0) < 0 ||
+        BCryptFinishHash(hash, digest, 32, 0) < 0) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (hash != NULL) {
+        BCryptDestroyHash(hash);
+    }
+    if (algorithm != NULL) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    free(object);
+    return ok;
+}
+
+static void digest_to_hex(const unsigned char digest[32], char out[65]) {
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    for (i = 0; i < 32; ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0F];
+    }
+    out[64] = '\0';
 }
 
 static char *bytes_to_plain_hex(const unsigned char *bytes, int count, int chunk_bytes) {
@@ -952,7 +1143,7 @@ static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
         }
     }
 
-    cap = hex_len + line_count * (remote_hex_len + 40) + remote_hex_len * 2 + remote_output_len + 256;
+    cap = hex_len + line_count * (remote_hex_len + 48) + remote_hex_len + remote_output_len * 2 + 512;
     commands = (char *)malloc(cap);
     if (commands == NULL) {
         return NULL;
@@ -967,7 +1158,7 @@ static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
         pos += (size_t)written; \
     } while (0)
 
-    APPEND_FMT("powershell -nop\n");
+    APPEND_FMT("powershell -noprofile\n");
 
     while (start < hex_len) {
         size_t end = start;
@@ -975,7 +1166,7 @@ static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
             ++end;
         }
         if (end > start) {
-            APPEND_FMT("%s -encoding ascii %s %.*s\n",
+            APPEND_FMT("%s -encoding ascii '%s' '%.*s'\n",
                        first_line ? "set-content" : "add-content",
                        opt->remote_hex,
                        (int)(end - start),
@@ -985,7 +1176,8 @@ static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
         start = end + 1;
     }
 
-    APPEND_FMT("certutil -f -decodehex %s %s\ndel %s\nexit\n", opt->remote_hex, opt->remote_output, opt->remote_hex);
+    APPEND_FMT("certutil -f -decodehex '%s' '%s'\ncertutil -hashfile '%s' sha256\nexit\n",
+               opt->remote_hex, opt->remote_output, opt->remote_output);
 #undef APPEND_FMT
 
     return commands;
@@ -1009,7 +1201,8 @@ static char *build_zip_hex_commands(const char *hex_text, const Options *opt) {
         }
     }
 
-    cap = hex_len + line_count * (remote_hex_len + 40) + remote_hex_len * 2 + remote_zip_len * 3 + 320;
+    cap = hex_len + line_count * (remote_hex_len + 48) + remote_hex_len + remote_zip_len * 2 +
+          strlen(opt->remote_output) + 640;
     commands = (char *)malloc(cap);
     if (commands == NULL) {
         return NULL;
@@ -1024,7 +1217,7 @@ static char *build_zip_hex_commands(const char *hex_text, const Options *opt) {
         pos += (size_t)written; \
     } while (0)
 
-    APPEND_FMT("powershell -nop\n");
+    APPEND_FMT("powershell -noprofile\n");
 
     while (start < hex_len) {
         size_t end = start;
@@ -1032,7 +1225,7 @@ static char *build_zip_hex_commands(const char *hex_text, const Options *opt) {
             ++end;
         }
         if (end > start) {
-            APPEND_FMT("%s -encoding ascii %s %.*s\n",
+            APPEND_FMT("%s -encoding ascii '%s' '%.*s'\n",
                        first_line ? "set-content" : "add-content",
                        opt->remote_hex,
                        (int)(end - start),
@@ -1042,15 +1235,81 @@ static char *build_zip_hex_commands(const char *hex_text, const Options *opt) {
         start = end + 1;
     }
 
-    APPEND_FMT("certutil -f -decodehex %s %s\nexpand-archive -force %s .\ndel %s\ndel %s\nexit\n",
+    APPEND_FMT("certutil -f -decodehex '%s' '%s'\nexpand-archive -force '%s' .\n"
+               "certutil -hashfile '%s' sha256\nexit\n",
                opt->remote_hex,
                opt->remote_zip,
                opt->remote_zip,
-               opt->remote_hex,
-               opt->remote_zip);
+               opt->remote_output);
 #undef APPEND_FMT
 
     return commands;
+}
+
+static int generated_command_char_allowed(unsigned char ch) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+        return 1;
+    }
+    return ch == ' ' || ch == '\r' || ch == '\n' || ch == '-' || ch == '.' ||
+           ch == '/' || ch == '\\' || ch == '\'';
+}
+
+static int validate_generated_commands(const char *commands) {
+    int line = 1;
+    int col = 1;
+    const unsigned char *p = (const unsigned char *)commands;
+    while (*p != '\0') {
+        if (!generated_command_char_allowed(*p)) {
+            fprintf(stderr, "Generated command stream contains forbidden character U+%04X at line %d, column %d.\n",
+                    (unsigned int)*p, line, col);
+            return EXIT_CONTENT;
+        }
+        if (*p == '\n') {
+            ++line;
+            col = 1;
+        } else {
+            ++col;
+        }
+        ++p;
+    }
+    return EXIT_OK;
+}
+
+static int write_commands_file(const wchar_t *path, const char *commands) {
+    HANDLE file;
+    DWORD written = 0;
+    size_t len = strlen(commands);
+    if (len > MAXDWORD) {
+        fprintf(stderr, "Generated command stream is too large to write.\n");
+        return EXIT_FILE;
+    }
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        print_windows_error_a("Cannot create --commands-out file", GetLastError());
+        return EXIT_FILE;
+    }
+    if (!WriteFile(file, commands, (DWORD)len, &written, NULL) || written != (DWORD)len) {
+        print_windows_error_a("Cannot write --commands-out file", GetLastError());
+        CloseHandle(file);
+        return EXIT_FILE;
+    }
+    CloseHandle(file);
+    return EXIT_OK;
+}
+
+static int prepare_generated_commands(const char *commands, const Options *opt) {
+    int rc = validate_generated_commands(commands);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+    if (opt->has_commands_out) {
+        rc = write_commands_file(opt->commands_out, commands);
+        if (rc != EXIT_OK) {
+            return rc;
+        }
+        print_wide_line(stdout, "Generated commands written to: ", opt->commands_out);
+    }
+    return EXIT_OK;
 }
 
 static int ascii_to_wide(const char *src, wchar_t *dest, size_t dest_len) {
@@ -1137,7 +1396,7 @@ static int run_local_zip_command(const wchar_t *working_dir, const wchar_t *entr
     written = _snwprintf(
         command,
         sizeof(command) / sizeof(command[0]),
-        L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
+        L"powershell.exe -NoProfile -NonInteractive -Command "
         L"\"Add-Type -AssemblyName System.IO.Compression.FileSystem; "
         L"$z=[System.IO.Compression.ZipFile]::Open('tt.zip','Create'); "
         L"[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z,'tt.raw','%ls'); "
@@ -1230,7 +1489,15 @@ static int make_local_zip_payload(const unsigned char *bytes,
     return ok;
 }
 
+static int shift_free_simple_char(wchar_t ch) {
+    if ((ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9')) {
+        return 1;
+    }
+    return wcschr(L" `-=[]\\;',./", ch) != NULL;
+}
+
 static int validate_text(const TextData *data, const TextStats *stats, const Options *opt) {
+    int i;
     int line;
     int col;
 
@@ -1259,6 +1526,10 @@ static int validate_text(const TextData *data, const TextStats *stats, const Opt
     }
 
     if (opt->transfer_mode == TRANSFER_CMD_HEX || opt->transfer_mode == TRANSFER_ZIP_HEX) {
+        if (opt->output_encoding == OUTPUT_PRESERVE && data->raw_bytes == NULL) {
+            fprintf(stderr, "--output-encoding preserve requires file input; clipboard text has no original bytes.\n");
+            return EXIT_ARGS;
+        }
         if (!is_safe_cmd_hex_path(opt->remote_output)) {
             fprintf(stderr, "--remote-output must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
             fprintf(stderr, "Example: trans.txt\n");
@@ -1288,10 +1559,20 @@ static int validate_text(const TextData *data, const TextStats *stats, const Opt
         return EXIT_OK;
     }
 
-    if ((opt->ascii_keys || opt->legacy_keys) && stats->non_ascii_count > 0) {
-        index_to_line_col(data->text, data->chars, stats->first_non_ascii, &line, &col);
-        fprintf(stderr, "Legacy/ASCII key modes cannot type non-ASCII characters. First one at line %d, column %d.\n", line, col);
-        fprintf(stderr, "Use --sendinput for Unicode input if this Windows session allows SendInput.\n");
+    if (opt->has_commands_out) {
+        fprintf(stderr, "--commands-out is only valid with --mode cmd-hex or --mode zip-hex.\n");
+        return EXIT_ARGS;
+    }
+
+    for (i = 0; i < data->chars; ++i) {
+        wchar_t ch = data->text[i];
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t' || shift_free_simple_char(ch)) {
+            continue;
+        }
+        index_to_line_col(data->text, data->chars, i, &line, &col);
+        fprintf(stderr, "Simple mode rejects U+%04X at line %d, column %d because it is uppercase, Unicode, or requires a modifier.\n",
+                (unsigned int)ch, line, col);
+        fprintf(stderr, "Use --mode cmd-hex or --mode zip-hex.\n");
         return EXIT_CONTENT;
     }
 
@@ -1299,7 +1580,7 @@ static int validate_text(const TextData *data, const TextStats *stats, const Opt
 }
 
 static void print_summary(const TextData *data, const TextStats *stats, const Options *opt) {
-    fwprintf(stdout, L"Source: %ls\n", data->source_label);
+    print_wide_line(stdout, "Source: ", data->source_label);
     printf("Encoding: %s\n", data->encoding);
     printf("Bytes: %d\n", data->bytes);
     printf("Characters: %d\n", data->chars);
@@ -1309,11 +1590,13 @@ static void print_summary(const TextData *data, const TextStats *stats, const Op
     printf("Focus check: %s\n", opt->no_focus_check ? "off" : "on");
     if (opt->transfer_mode == TRANSFER_CMD_HEX) {
         printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
+        printf("Output encoding: %s\n", output_encoding_name(opt->output_encoding));
         printf("Remote output: %s\n", opt->remote_output);
         printf("Remote temporary hex: %s\n", opt->remote_hex);
         printf("Hex chunk: %d bytes per generated line\n", opt->hex_chunk_bytes);
     } else if (opt->transfer_mode == TRANSFER_ZIP_HEX) {
         printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
+        printf("Output encoding: %s\n", output_encoding_name(opt->output_encoding));
         printf("Remote output: %s\n", opt->remote_output);
         printf("Remote temporary hex: %s\n", opt->remote_hex);
         printf("Remote temporary zip: %s\n", opt->remote_zip);
@@ -1325,7 +1608,9 @@ static void print_summary(const TextData *data, const TextStats *stats, const Op
     } else {
         printf("Input mode: Unicode SendInput\n");
     }
-    if (opt->legacy_keys) {
+    if (opt->transfer_mode == TRANSFER_CMD_HEX || opt->transfer_mode == TRANSFER_ZIP_HEX) {
+        printf("Enter mode: physical Return key (forced for complex mode)\n");
+    } else if (opt->legacy_keys) {
         printf("Enter mode: legacy VK_RETURN\n");
     } else {
         printf("Enter mode: %s\n", opt->enter_unicode ? "Unicode CR" : "VK_RETURN");
@@ -1407,7 +1692,13 @@ static void print_target_window(const TargetWindow *target) {
     }
 
     if (target->title[0] != L'\0') {
-        fwprintf(stdout, L"Target window: \"%ls\" (pid %lu)\n", target->title, (unsigned long)target->pid);
+        char *title = wide_to_utf8_alloc(target->title);
+        if (title != NULL) {
+            printf("Target window: \"%s\" (pid %lu)\n", title, (unsigned long)target->pid);
+            free(title);
+        } else {
+            printf("Target window: <unprintable Unicode title> (pid %lu)\n", (unsigned long)target->pid);
+        }
     } else {
         printf("Target window: <untitled> (pid %lu)\n", (unsigned long)target->pid);
     }
@@ -1424,6 +1715,22 @@ static int prepare_target_window(const Options *opt, TargetWindow *target) {
 
         capture_foreground_window(target);
         print_target_window(target);
+
+        if (GetKeyState(VK_CAPITAL) & 0x0001) {
+            rc = wait_for_console_enter_or_esc("Caps Lock is on. Turn it off before typing.");
+            if (rc != EXIT_OK) {
+                return rc;
+            }
+            continue;
+        }
+        if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000) ||
+            (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+            rc = wait_for_console_enter_or_esc("A modifier key is held. Release Shift, Ctrl, and Alt before typing.");
+            if (rc != EXIT_OK) {
+                return rc;
+            }
+            continue;
+        }
 
         if (target->hwnd == NULL) {
             rc = wait_for_console_enter_or_esc("No foreground window was detected.");
@@ -1486,34 +1793,34 @@ static int run_sendinput_self_test(void) {
     TargetWindow target;
     int rc;
 
-    puts("Running native SendInput self-test with a harmless Shift key press.");
+    puts("Running native SendInput self-test with a harmless F24 key press.");
     puts("This does not type visible text.");
     printf("sizeof(INPUT): %u bytes\n", (unsigned int)sizeof(INPUT));
     printf("sizeof(KEYBDINPUT): %u bytes\n", (unsigned int)sizeof(KEYBDINPUT));
     capture_foreground_window(&target);
     print_target_window(&target);
 
-    rc = send_vk(VK_SHIFT, "self-test Shift");
+    rc = send_vk(VK_F24, "self-test F24");
     if (rc != EXIT_OK) {
-        puts("Trying legacy keybd_event Shift test. This API has no reliable success return value.");
-        (void)send_legacy_vk(VK_SHIFT);
+        puts("Trying legacy keybd_event F24 test. This API has no reliable success return value.");
+        (void)send_legacy_vk(VK_F24);
         puts("Legacy keybd_event call completed. If it also has no effect, the system/session is blocking synthetic input.");
         return rc;
     }
 
-    puts("Self-test passed: SendInput accepted the Shift key events.");
+    puts("Self-test passed: SendInput accepted the F24 key events.");
     return EXIT_OK;
 }
 
 static int run_legacy_self_test(void) {
     TargetWindow target;
 
-    puts("Running legacy keybd_event self-test with a harmless Shift key press.");
+    puts("Running legacy keybd_event self-test with a harmless F24 key press.");
     puts("This does not type visible text.");
     puts("Note: keybd_event does not report whether the target accepted the event.");
     capture_foreground_window(&target);
     print_target_window(&target);
-    (void)send_legacy_vk(VK_SHIFT);
+    (void)send_legacy_vk(VK_F24);
     puts("Legacy self-test completed. To verify visible typing, run the Python --debug-input mode against Notepad or the RDP target.");
     return EXIT_OK;
 }
@@ -1553,24 +1860,13 @@ static int send_ascii_char(wchar_t ch) {
 
     vk = (BYTE)(vk_scan & 0xFF);
     shift_state = (BYTE)((vk_scan >> 8) & 0xFF);
+    if (shift_state != 0) {
+        fprintf(stderr, "Character U+%04X requires Shift/Ctrl/Alt in the current keyboard layout. Use cmd-hex or zip-hex.\n",
+                (unsigned int)ch);
+        return EXIT_INPUT;
+    }
 
     ZeroMemory(inputs, sizeof(inputs));
-
-    if (shift_state & 1) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_SHIFT;
-        ++count;
-    }
-    if (shift_state & 2) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_CONTROL;
-        ++count;
-    }
-    if (shift_state & 4) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_MENU;
-        ++count;
-    }
 
     inputs[count].type = INPUT_KEYBOARD;
     inputs[count].ki.wVk = vk;
@@ -1579,25 +1875,6 @@ static int send_ascii_char(wchar_t ch) {
     inputs[count] = inputs[count - 1];
     inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
     ++count;
-
-    if (shift_state & 4) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_MENU;
-        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
-        ++count;
-    }
-    if (shift_state & 2) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_CONTROL;
-        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
-        ++count;
-    }
-    if (shift_state & 1) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_SHIFT;
-        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
-        ++count;
-    }
 
     return send_input_checked(inputs, count, "ASCII character");
 }
@@ -1615,28 +1892,13 @@ static int send_legacy_ascii_char(wchar_t ch) {
 
     vk = (BYTE)(vk_scan & 0xFF);
     shift_state = (BYTE)((vk_scan >> 8) & 0xFF);
-
-    if (shift_state & 1) {
-        keybd_event(VK_SHIFT, 0, 0, 0);
-    }
-    if (shift_state & 2) {
-        keybd_event(VK_CONTROL, 0, 0, 0);
-    }
-    if (shift_state & 4) {
-        keybd_event(VK_MENU, 0, 0, 0);
+    if (shift_state != 0) {
+        fprintf(stderr, "Character U+%04X requires Shift/Ctrl/Alt in the current keyboard layout. Use cmd-hex or zip-hex.\n",
+                (unsigned int)ch);
+        return EXIT_INPUT;
     }
 
     (void)send_legacy_vk(vk);
-
-    if (shift_state & 4) {
-        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
-    }
-    if (shift_state & 2) {
-        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-    }
-    if (shift_state & 1) {
-        keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
-    }
 
     return EXIT_OK;
 }
@@ -1669,6 +1931,14 @@ static int check_runtime_controls(const Options *opt, TargetWindow *target) {
 
     if (GetAsyncKeyState(VK_PAUSE) & 0x0001) {
         return pause_and_recapture(opt, target, "Pause/Break was pressed.");
+    }
+
+    if (GetKeyState(VK_CAPITAL) & 0x0001) {
+        return pause_and_recapture(opt, target, "Caps Lock was enabled.");
+    }
+    if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000) ||
+        (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+        return pause_and_recapture(opt, target, "A modifier key is held. Release Shift, Ctrl, and Alt.");
     }
 
     if (!opt->no_focus_check) {
@@ -1782,6 +2052,8 @@ static int type_generated_ascii(const char *text, const char *label, const Optio
     }
 
     opt.transfer_mode = TRANSFER_SIMPLE;
+    opt.has_commands_out = 0;
+    opt.enter_unicode = 0;
     if (!opt.ascii_keys) {
         opt.legacy_keys = 1;
         opt.ascii_keys = 0;
@@ -1792,7 +2064,7 @@ static int type_generated_ascii(const char *text, const char *label, const Optio
     if (rc == EXIT_OK) {
         rc = type_text(&generated, &stats, &opt, target);
     }
-    free(generated.text);
+    free_text_data(&generated);
     return rc;
 }
 
@@ -1802,14 +2074,22 @@ static int run_cmd_hex_transfer(const TextData *data, const Options *opt) {
     char *commands = NULL;
     TargetWindow target;
     Options key_opt = *opt;
+    unsigned char digest[32];
+    char digest_hex[65];
     int byte_count = 0;
     size_t hex_line_count = 0;
     int rc;
 
-    if (!text_to_utf8_bytes(data, &bytes, &byte_count)) {
-        fprintf(stderr, "Input text could not be encoded as UTF-8.\n");
+    if (!make_output_bytes(data, opt, &bytes, &byte_count)) {
+        fprintf(stderr, "Input could not be converted to the selected output encoding.\n");
         return EXIT_ENCODING;
     }
+    if (!sha256_bytes(bytes, byte_count, digest)) {
+        fprintf(stderr, "Could not calculate SHA-256.\n");
+        free(bytes);
+        return EXIT_FILE;
+    }
+    digest_to_hex(digest, digest_hex);
 
     hex_text = bytes_to_plain_hex(bytes, byte_count, opt->hex_chunk_bytes);
     free(bytes);
@@ -1820,10 +2100,12 @@ static int run_cmd_hex_transfer(const TextData *data, const Options *opt) {
     hex_line_count = count_hex_lines(hex_text);
 
     printf("cmd-hex transfer mode.\n");
-    printf("UTF-8 bytes to transfer: %d\n", byte_count);
+    printf("Output bytes to transfer: %d\n", byte_count);
     printf("Remote output: %s\n", opt->remote_output);
     printf("Remote temporary hex: %s\n", opt->remote_hex);
     printf("Hex chunk: %d bytes per generated line (%u line(s))\n", opt->hex_chunk_bytes, (unsigned int)hex_line_count);
+    printf("Expected SHA-256: %s\n", digest_hex);
+    printf("Remote temporary hex is retained for recovery and inspection.\n");
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.\n");
 
     if (!key_opt.ascii_keys) {
@@ -1836,6 +2118,13 @@ static int run_cmd_hex_transfer(const TextData *data, const Options *opt) {
         free(hex_text);
         fprintf(stderr, "Not enough memory to build cmd-hex commands.\n");
         return EXIT_FILE;
+    }
+
+    rc = prepare_generated_commands(commands, opt);
+    if (rc != EXIT_OK) {
+        free(hex_text);
+        free(commands);
+        return rc;
     }
 
     if (opt->dry_run) {
@@ -1872,16 +2161,24 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
     char *commands = NULL;
     TargetWindow target;
     Options key_opt = *opt;
+    unsigned char digest[32];
+    char digest_hex[65];
     int byte_count = 0;
     int zip_count = 0;
     size_t hex_line_count = 0;
     double ratio;
     int rc;
 
-    if (!text_to_utf8_bytes(data, &bytes, &byte_count)) {
-        fprintf(stderr, "Input text could not be encoded as UTF-8.\n");
+    if (!make_output_bytes(data, opt, &bytes, &byte_count)) {
+        fprintf(stderr, "Input could not be converted to the selected output encoding.\n");
         return EXIT_ENCODING;
     }
+    if (!sha256_bytes(bytes, byte_count, digest)) {
+        fprintf(stderr, "Could not calculate SHA-256.\n");
+        free(bytes);
+        return EXIT_FILE;
+    }
+    digest_to_hex(digest, digest_hex);
 
     if (!make_local_zip_payload(bytes, byte_count, opt->remote_output, &zip_bytes, &zip_count)) {
         free(bytes);
@@ -1899,12 +2196,14 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
     ratio = byte_count > 0 ? ((double)zip_count / (double)byte_count) * 100.0 : 0.0;
 
     printf("zip-hex transfer mode.\n");
-    printf("UTF-8 bytes before zip: %d\n", byte_count);
-    printf("Zip bytes to transfer: %d (%.2f%% of UTF-8 size)\n", zip_count, ratio);
+    printf("Output bytes before zip: %d\n", byte_count);
+    printf("Zip bytes to transfer: %d (%.2f%% of output size)\n", zip_count, ratio);
     printf("Remote output: %s\n", opt->remote_output);
     printf("Remote temporary hex: %s\n", opt->remote_hex);
     printf("Remote temporary zip: %s\n", opt->remote_zip);
     printf("Hex chunk: %d bytes per generated line (%u line(s))\n", opt->hex_chunk_bytes, (unsigned int)hex_line_count);
+    printf("Expected SHA-256: %s\n", digest_hex);
+    printf("Remote temporary hex and zip files are retained for recovery and inspection.\n");
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.\n");
 
     if (!key_opt.ascii_keys) {
@@ -1917,6 +2216,13 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
         free(hex_text);
         fprintf(stderr, "Not enough memory to build zip-hex commands.\n");
         return EXIT_FILE;
+    }
+
+    rc = prepare_generated_commands(commands, opt);
+    if (rc != EXIT_OK) {
+        free(hex_text);
+        free(commands);
+        return rc;
     }
 
     if (opt->dry_run) {
@@ -1978,31 +2284,25 @@ int main(int argc, char **argv) {
 
     rc = validate_text(&data, &stats, &opt);
     if (rc != EXIT_OK) {
-        free(data.text);
+        free_text_data(&data);
         return rc;
     }
 
     if (opt.transfer_mode == TRANSFER_CMD_HEX) {
         rc = run_cmd_hex_transfer(&data, &opt);
-        free(data.text);
+        free_text_data(&data);
         return rc;
     }
     if (opt.transfer_mode == TRANSFER_ZIP_HEX) {
         rc = run_zip_hex_transfer(&data, &opt);
-        free(data.text);
+        free_text_data(&data);
         return rc;
     }
 
     if (opt.dry_run) {
         puts("Dry run passed. No typing was performed.");
-        free(data.text);
+        free_text_data(&data);
         return EXIT_OK;
-    }
-
-    if (stats.non_ascii_count > 0) {
-        puts("");
-        printf("Warning: trans.txt contains %d non-ASCII character(s).\n", stats.non_ascii_count);
-        puts("Unicode input usually works through RDP, but some target applications may reject it.");
     }
 
     rc = prepare_target_window(&opt, &target);
@@ -2010,6 +2310,6 @@ int main(int argc, char **argv) {
         rc = type_text(&data, &stats, &opt, &target);
     }
 
-    free(data.text);
+    free_text_data(&data);
     return rc;
 }
