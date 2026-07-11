@@ -49,7 +49,8 @@ def verify_help(executable: Path, root: Path) -> None:
         "--mode cmd-hex --source PATH --output-encoding preserve",
         "--mode zip-hex --source FOLDER [--remote-output TARGET]",
         "运行控制 / runtime controls:",
-        "Space",
+        "Esc     倒计时中止；输入时请求行尾暂停；暂停时结束",
+        "Space   暂停后继续 / resume while paused",
     )
     missing = [text for text in required if text not in help_text]
     if missing:
@@ -60,6 +61,17 @@ def verify_help(executable: Path, root: Path) -> None:
     for verbose in ("模式、内容与文件", "允许/allowed", "intermediates:"):
         if verbose in help_text:
             raise AssertionError(f"macOS help still contains verbose section {verbose}")
+    for stale in ("Space pauses or resumes", "Paused. Press Space again"):
+        if stale in help_text:
+            raise AssertionError(f"macOS help still advertises stale pause behavior: {stale}")
+
+
+def verify_control_state_machine(executable: Path, root: Path) -> None:
+    result = run_checked([str(executable), "--self-test", "--dry-run"], root)
+    if "Control state self-test passed" not in result.stdout:
+        raise AssertionError("macOS Esc/Space control state self-test did not run")
+    if "No key events were posted" not in result.stdout:
+        raise AssertionError("macOS dry-run control test unexpectedly posted key events")
 
 
 def verify_removed_options(executable: Path, root: Path) -> None:
@@ -269,6 +281,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         verify_help(executable, root)
+        verify_control_state_machine(executable, root)
         verify_removed_options(executable, root)
         inputs = root / "inputs"
         inputs.mkdir()

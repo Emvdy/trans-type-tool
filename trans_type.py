@@ -42,14 +42,12 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 
 VK_TAB = 0x09
-VK_BACK = 0x08
 VK_RETURN = 0x0D
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_CAPITAL = 0x14
 VK_ESCAPE = 0x1B
-VK_SPACE = 0x20
 VK_F24 = 0x87
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL = 25
@@ -173,7 +171,6 @@ def parse_args(argv: list[str]) -> Options:
             "    trans_type_py.exe --mode cmd-hex --dry-run --commands-out commands.txt\n\n"
             "运行控制 / runtime controls:\n"
             "  Esc    中止 / abort\n"
-            "  Space  暂停或继续 / pause or resume\n"
             "  Enter  倒计时期间立即开始 / start immediately during countdown"
         ),
     )
@@ -1226,60 +1223,6 @@ def pause_and_recapture(win: WinKeyboard, opt: Options, reason: str) -> tuple[in
     return prepare_target_window(win, opt)
 
 
-def send_pause_backspace(win: WinKeyboard, opt: Options) -> None:
-    if opt.legacy_keys:
-        win.legacy_vk(VK_BACK)
-    else:
-        win.send_vk(VK_BACK, "pause Space cleanup Backspace")
-
-
-def wait_for_space_release(win: WinKeyboard, target: TargetWindow, opt: Options) -> int:
-    while win.get_async_key_state(VK_SPACE) & 0x8000:
-        if win.get_async_key_state(VK_ESCAPE) & 0x8000:
-            return EXIT_ABORTED
-        if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
-            return EXIT_ABORTED
-        time.sleep(0.01)
-    return EXIT_OK
-
-
-def pause_until_space(win: WinKeyboard, opt: Options, target: TargetWindow) -> tuple[int, TargetWindow]:
-    rc = wait_for_space_release(win, target, opt)
-    if rc != EXIT_OK:
-        return rc, target
-    if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
-        print("\nForeground window changed while handling Space; aborting.", file=sys.stderr)
-        return EXIT_ABORTED, target
-    try:
-        send_pause_backspace(win, opt)
-    except RuntimeError as exc:
-        print(f"\nCould not erase the pause Space from the target: {exc}", file=sys.stderr)
-        return EXIT_INPUT, target
-
-    print("\nPaused. Press Space again to continue; Esc aborts.")
-    while True:
-        if win.get_async_key_state(VK_ESCAPE) & 0x8000:
-            return EXIT_ABORTED, target
-        if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
-            print("\nForeground window changed while paused; aborting.", file=sys.stderr)
-            return EXIT_ABORTED, target
-        if win.get_async_key_state(VK_SPACE) & 0x8000:
-            rc = wait_for_space_release(win, target, opt)
-            if rc != EXIT_OK:
-                return rc, target
-            if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
-                print("\nForeground window changed while paused; aborting.", file=sys.stderr)
-                return EXIT_ABORTED, target
-            try:
-                send_pause_backspace(win, opt)
-            except RuntimeError as exc:
-                print(f"\nCould not erase the resume Space from the target: {exc}", file=sys.stderr)
-                return EXIT_INPUT, target
-            print("Resuming.")
-            return EXIT_OK, target
-        time.sleep(0.01)
-
-
 def check_runtime_controls(win: WinKeyboard, opt: Options, target: TargetWindow) -> tuple[int, TargetWindow | None]:
     if win.get_async_key_state(VK_ESCAPE) & 0x8000:
         return EXIT_ABORTED, target
@@ -1288,9 +1231,6 @@ def check_runtime_controls(win: WinKeyboard, opt: Options, target: TargetWindow)
         current = win.foreground_window()
         if current.hwnd != target.hwnd:
             return pause_and_recapture(win, opt, "Foreground window changed.")
-
-    if win.get_async_key_state(VK_SPACE) & 0x8000:
-        return pause_until_space(win, opt, target)
 
     state_error = win.keyboard_state_error()
     if state_error:
@@ -1444,7 +1384,7 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
     i = 0
 
     print()
-    print("Typing started. Esc aborts. Space pauses or resumes.")
+    print("Typing started. Esc aborts.")
     print(f"Progress: line {line}/{stats.lines}")
 
     while i < len(data.text):

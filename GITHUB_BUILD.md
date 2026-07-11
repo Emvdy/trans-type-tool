@@ -197,7 +197,8 @@ trans_type_py.exe --debug-input
    `--remote-output "C:/Drop Folder/output.bin"`，确认复杂路径通过 helper 正确恢复。
 10. 确认完成后远端没有残留 `tt.hex`、`tt.zip`、`tt.out`、`tt.cmd.hex` 或
     `tt.cmd`；中止时则在重试前清理残留。
-11. 短按 Space 测试暂停/继续，并确认自动 Backspace 没有留下控制空格。
+11. Windows 测试 Esc 中止且普通 Space 不触发暂停；macOS 测试 Esc 行尾暂停、
+    暂停后 Space 继续和第二次 Esc 结束的状态机。
 
 正常 medium integrity 的 RDP 不要求管理员权限。如果目标窗口本身以管理员身份
 运行，Windows 可能阻止低完整性进程发送输入。应把目标窗口重新以普通权限打开，

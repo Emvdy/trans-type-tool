@@ -177,9 +177,18 @@ either changes while typing. Before starting, turn Caps Lock off, release Shift,
 Control, Option, and Command, select an English input method, and align the local
 and remote keyboard layouts.
 
-Press Esc to abort. Tap physical Space to pause and tap it again to resume. The
-Space reaches the target first, then the tool sends one Delete/Backspace after
-key release to remove it. Do not hold Space long enough to trigger key repeat.
+During typing, the first physical Esc requests a pause after the current line
+and Return are complete. While paused, Space resumes and Esc ends the transfer.
+Ctrl-C ends it when the terminal is focused or receives SIGINT. The local event
+tap consumes physical Esc/Space control keys before they reach RDP; synthetic
+command spaces carry an internal marker and remain ordinary transfer data.
+During the countdown, Esc still aborts.
+
+Validate the control state machine without posting keys:
+
+```sh
+./trans_type_mac --self-test --dry-run
+```
 
 ## Local verification
 

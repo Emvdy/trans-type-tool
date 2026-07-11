@@ -376,10 +376,13 @@ trans_type_py.exe --debug-input
 - Windows `--diagnose` reports foreground-window and integrity information.
 - Windows `--debug-input` visibly compares legacy keys, SendInput virtual keys,
   and Unicode SendInput. Run it only in a disposable text field.
-- `Esc` aborts. Physical Space pauses; press Space again to resume.
-- The physical pause/resume Space reaches the target first. The tool waits for
-  key release and sends one Backspace to remove it. Tap Space briefly to avoid
-  keyboard auto-repeat; verify the current line after resuming.
+- Windows/Python: `Esc` aborts; there is no global pause hotkey.
+- macOS: the first physical `Esc` is consumed locally and requests a pause after
+  the current line and Return are complete. While paused, Space resumes and Esc
+  ends the transfer. `Ctrl-C` ends it when the terminal is focused or receives
+  SIGINT.
+- macOS marks its synthetic events so command spaces bypass control handling;
+  physical Esc/Space control events are consumed locally and do not enter RDP.
 - Windows pauses when focus changes; macOS aborts when the foreground app/window
   changes. `--no-focus-check` disables this protection and should be used only
   for a target whose window identity cannot remain stable.

@@ -6,6 +6,8 @@
 #include <mach-o/dyld.h>
 
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -42,6 +45,7 @@ static constexpr const char *REMOTE_ZIP = "tt.zip";
 static constexpr const char *REMOTE_STAGE = "tt.out";
 static constexpr const char *REMOTE_HELPER_HEX = "tt.cmd.hex";
 static constexpr const char *REMOTE_HELPER = "tt.cmd";
+static constexpr int64_t SYNTHETIC_EVENT_MARKER = INT64_C(0x7472616e735f7479);
 
 enum class SourceKind {
     Clipboard,
@@ -162,7 +166,7 @@ static void print_usage() {
     print_help_option("--request-accessibility", "请求辅助功能权限 / request permission (default: off)");
     print_help_option("--dry-run", "只验证，不输入 / validate without typing (default: off)");
     print_help_option("--diagnose", "显示来源、窗口和权限 / report status (default: off)");
-    print_help_option("--self-test", "发送无害 F20 测试键 / harmless F20 test (default: off)");
+    print_help_option("--self-test", "控制状态和无害 F20 测试 / control state and harmless F20 test");
     print_help_option("--debug-input", "可见输入诊断 / visible diagnostics (default: off)");
     print_help_option("-h, --help", "显示帮助并退出 / show help and exit");
     puts("");
@@ -187,9 +191,10 @@ static void print_usage() {
     puts("    " PROGRAM_NAME " --mode cmd-hex --dry-run --commands-out commands.txt");
     puts("");
     puts("运行控制 / runtime controls:");
-    puts("  Ctrl-C  立即中止 / abort immediately");
-    puts("  Esc    中止 / abort");
-    puts("  Space  暂停或继续 / pause or resume");
+    puts("  Ctrl-C  终端前台时立即结束 / end when the terminal is focused");
+    puts("  Esc     倒计时中止；输入时请求行尾暂停；暂停时结束");
+    puts("          abort countdown; pause after the current line; end while paused");
+    puts("  Space   暂停后继续 / resume while paused");
 }
 
 static bool parse_int_range(const char *value, int min_value, int max_value, int *out) {
@@ -1824,10 +1829,6 @@ static bool escape_pressed() {
     return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, kVK_Escape);
 }
 
-static bool space_pressed() {
-    return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, kVK_Space);
-}
-
 static std::string keyboard_state_error() {
     CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
     if ((flags & kCGEventFlagMaskAlphaShift) != 0) {
@@ -1838,6 +1839,10 @@ static std::string keyboard_state_error() {
         return "A modifier key is held. Release Shift, Control, Option, and Command before typing.";
     }
     return {};
+}
+
+static void mark_synthetic_event(CGEventRef event) {
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, SYNTHETIC_EVENT_MARKER);
 }
 
 class MacKeyboard {
@@ -1874,6 +1879,8 @@ public:
             }
             return false;
         }
+        mark_synthetic_event(down);
+        mark_synthetic_event(up);
         CGEventPost(kCGHIDEventTap, down);
         CGEventPost(kCGHIDEventTap, up);
         CFRelease(down);
@@ -1904,6 +1911,8 @@ public:
             }
             return false;
         }
+        mark_synthetic_event(down);
+        mark_synthetic_event(up);
         CGEventKeyboardSetUnicodeString(down, static_cast<UniCharCount>(len), reinterpret_cast<const UniChar *>(units));
         CGEventKeyboardSetUnicodeString(up, static_cast<UniCharCount>(len), reinterpret_cast<const UniChar *>(units));
         CGEventPost(kCGHIDEventTap, down);
@@ -1927,75 +1936,277 @@ static bool target_changed(const FrontApp &target, FrontApp *current_out = nullp
     return app_changed || window_changed;
 }
 
-static bool target_app_changed(const FrontApp &target) {
-    @autoreleasepool {
-        NSRunningApplication *running = [[NSWorkspace sharedWorkspace] frontmostApplication];
-        return target.pid != 0 && (running == nil || [running processIdentifier] != target.pid);
-    }
-}
+class MacControlTap {
+public:
+    MacControlTap() = default;
 
-static int wait_for_space_release(const Options &opt, const FrontApp &target) {
-    while (space_pressed()) {
-        if (escape_pressed()) {
+    ~MacControlTap() {
+        stop();
+    }
+
+    MacControlTap(const MacControlTap &) = delete;
+    MacControlTap &operator=(const MacControlTap &) = delete;
+
+    bool start() {
+        CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp);
+        tap_ = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                kCGEventTapOptionDefault, mask, event_callback, this);
+        if (tap_ == nullptr) {
+            return false;
+        }
+        source_ = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap_, 0);
+        if (source_ == nullptr) {
+            CFRelease(tap_);
+            tap_ = nullptr;
+            return false;
+        }
+
+        worker_ = std::thread([this] {
+            CFRunLoopRef loop = CFRunLoopGetCurrent();
+            CFRetain(loop);
+            CFRunLoopAddSource(loop, source_, kCFRunLoopCommonModes);
+            CGEventTapEnable(tap_, true);
+            {
+                std::lock_guard<std::mutex> lock(loop_mutex_);
+                run_loop_ = loop;
+                ready_ = true;
+            }
+            ready_cv_.notify_one();
+
+            while (!stop_requested_.load()) {
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
+            }
+
+            CFRunLoopRemoveSource(loop, source_, kCFRunLoopCommonModes);
+            {
+                std::lock_guard<std::mutex> lock(loop_mutex_);
+                run_loop_ = nullptr;
+            }
+            CFRelease(loop);
+        });
+
+        std::unique_lock<std::mutex> lock(loop_mutex_);
+        ready_cv_.wait(lock, [this] { return ready_; });
+        return true;
+    }
+
+    static bool state_machine_self_test(std::string *error) {
+        bool debug = getenv("TRANS_TYPE_DEBUG_CONTROLS") != nullptr;
+        auto trace = [debug](const char *stage) {
+            if (debug) {
+                fprintf(stderr, "control-self-test: %s\n", stage);
+            }
+        };
+        MacControlTap controls;
+        if (controls.pause_requested()) {
+            *error = "initial state is not active";
+            return false;
+        }
+
+        auto filter_event = [&controls](CGKeyCode keycode, bool synthetic,
+                                        bool expect_consumed) {
+            CGEventRef event = CGEventCreate(nullptr);
+            if (event == nullptr) {
+                return false;
+            }
+            CGEventSetType(event, kCGEventKeyDown);
+            CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, keycode);
+            CGEventSetIntegerValueField(event, kCGKeyboardEventAutorepeat, 0);
+            if (synthetic) {
+                mark_synthetic_event(event);
+            }
+            CGEventRef result = event_callback(nullptr, kCGEventKeyDown, event, &controls);
+            bool matched = expect_consumed ? result == nullptr : result == event;
+            CFRelease(event);
+            return matched;
+        };
+
+        trace("filter synthetic Space");
+        if (!filter_event(kVK_Space, true, false) || controls.pause_requested()) {
+            *error = "a marked synthetic Space was treated as a control key";
+            return false;
+        }
+        trace("filter first Esc");
+        if (!filter_event(kVK_Escape, false, true)) {
+            *error = "a physical Esc was not consumed";
+            return false;
+        }
+        trace("enter paused state");
+        if (!controls.pause_requested() || !controls.begin_pause()) {
+            *error = "the first Esc did not enter the paused state";
+            return false;
+        }
+        trace("filter resume Space");
+        if (!filter_event(kVK_Space, false, true) || !controls.resume_requested()) {
+            *error = "a physical Space did not request resume while paused";
+            return false;
+        }
+        trace("finish resume");
+        controls.finish_resume();
+        if (controls.pause_requested()) {
+            *error = "resume did not restore the active state";
+            return false;
+        }
+        trace("filter double Esc");
+        if (!filter_event(kVK_Escape, false, true) ||
+            !filter_event(kVK_Escape, false, true) || !controls.end_requested()) {
+            *error = "a second Esc did not request end";
+            return false;
+        }
+        trace("passed");
+        return true;
+    }
+
+    bool pause_requested() const {
+        return state_.load() != ControlState::Active;
+    }
+
+    bool begin_pause() {
+        ControlState expected = ControlState::PauseRequested;
+        return state_.compare_exchange_strong(expected, ControlState::Paused);
+    }
+
+    bool end_requested() const {
+        return state_.load() == ControlState::EndRequested;
+    }
+
+    bool resume_requested() const {
+        return state_.load() == ControlState::ResumeRequested;
+    }
+
+    void finish_resume() {
+        state_.store(ControlState::Active);
+    }
+
+private:
+    enum class ControlState {
+        Active,
+        PauseRequested,
+        Paused,
+        EndRequested,
+        ResumeRequested,
+    };
+
+    static CGEventRef event_callback(CGEventTapProxy, CGEventType type,
+                                     CGEventRef event, void *user_info) {
+        auto *self = static_cast<MacControlTap *>(user_info);
+        if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+            CGEventTapEnable(self->tap_, true);
+            return event;
+        }
+        if (event == nullptr ||
+            CGEventGetIntegerValueField(event, kCGEventSourceUserData) == SYNTHETIC_EVENT_MARKER) {
+            return event;
+        }
+
+        auto keycode = static_cast<CGKeyCode>(
+            CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode));
+        if (keycode != kVK_Escape && keycode != kVK_Space) {
+            return event;
+        }
+        if (type == kCGEventKeyDown &&
+            CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) == 0) {
+            if (keycode == kVK_Escape) {
+                self->handle_escape();
+            } else {
+                self->handle_space();
+            }
+        }
+        return nullptr;
+    }
+
+    void handle_escape() {
+        ControlState current = state_.load();
+        for (;;) {
+            if (current == ControlState::EndRequested) {
+                return;
+            }
+            ControlState next = current == ControlState::Active
+                                    ? ControlState::PauseRequested
+                                    : ControlState::EndRequested;
+            if (state_.compare_exchange_weak(current, next)) {
+                return;
+            }
+        }
+    }
+
+    void handle_space() {
+        ControlState expected = ControlState::Paused;
+        (void)state_.compare_exchange_strong(expected, ControlState::ResumeRequested);
+    }
+
+    void stop() {
+        if (!worker_.joinable()) {
+            if (source_ != nullptr) {
+                CFRelease(source_);
+                source_ = nullptr;
+            }
+            if (tap_ != nullptr) {
+                CFRelease(tap_);
+                tap_ = nullptr;
+            }
+            return;
+        }
+
+        stop_requested_.store(true);
+        {
+            std::lock_guard<std::mutex> lock(loop_mutex_);
+            if (run_loop_ != nullptr) {
+                CFRunLoopWakeUp(run_loop_);
+            }
+        }
+        worker_.join();
+        CFRelease(source_);
+        CFRelease(tap_);
+        source_ = nullptr;
+        tap_ = nullptr;
+    }
+
+    std::atomic<ControlState> state_{ControlState::Active};
+    std::atomic<bool> stop_requested_{false};
+    CFMachPortRef tap_ = nullptr;
+    CFRunLoopSourceRef source_ = nullptr;
+    CFRunLoopRef run_loop_ = nullptr;
+    std::thread worker_;
+    std::mutex loop_mutex_;
+    std::condition_variable ready_cv_;
+    bool ready_ = false;
+};
+
+static int pause_at_line_boundary(MacControlTap &controls, const Options &opt,
+                                  const FrontApp &target, size_t completed_line) {
+    if (!controls.pause_requested()) {
+        return EXIT_OK;
+    }
+    if (!controls.begin_pause()) {
+        if (controls.end_requested()) {
+            puts("\nSecond Esc received. Typing ended after the completed line.");
             return EXIT_ABORTED;
         }
-        if (!opt.no_focus_check && target_app_changed(target)) {
-            fprintf(stderr, "\nForeground app changed while handling Space; aborting.\n");
-            return EXIT_ABORTED;
-        }
-        sleep_ms(10);
-    }
-    return EXIT_OK;
-}
-
-static int pause_until_space(MacKeyboard &keyboard, const Options &opt, const FrontApp &target) {
-    int rc = wait_for_space_release(opt, target);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-    if (!opt.no_focus_check && target_changed(target)) {
-        fprintf(stderr, "\nForeground target changed while handling Space; aborting.\n");
-        return EXIT_ABORTED;
-    }
-    if (!keyboard.send_key(kVK_Delete)) {
-        fprintf(stderr, "\nCould not erase the pause Space from the target.\n");
-        return EXIT_INPUT;
+        return EXIT_OK;
     }
 
-    puts("\nPaused. Press Space again to continue; Esc aborts.");
+    printf("\nPaused after line %zu. Space continues; Esc ends.\n", completed_line);
     for (;;) {
-        if (escape_pressed()) {
+        if (controls.end_requested()) {
+            puts("Typing ended while paused.");
             return EXIT_ABORTED;
         }
-        if (!opt.no_focus_check && target_app_changed(target)) {
-            fprintf(stderr, "\nForeground app changed while paused; aborting.\n");
-            return EXIT_ABORTED;
-        }
-        if (space_pressed()) {
-            rc = wait_for_space_release(opt, target);
-            if (rc != EXIT_OK) {
-                return rc;
-            }
-            if (!opt.no_focus_check && target_changed(target)) {
-                fprintf(stderr, "\nForeground target changed while paused; aborting.\n");
-                return EXIT_ABORTED;
-            }
-            if (!keyboard.send_key(kVK_Delete)) {
-                fprintf(stderr, "\nCould not erase the resume Space from the target.\n");
-                return EXIT_INPUT;
-            }
+        if (controls.resume_requested()) {
+            controls.finish_resume();
             puts("Resuming.");
             return EXIT_OK;
         }
+        if (!opt.no_focus_check && target_changed(target)) {
+            fprintf(stderr, "Foreground target changed while paused; aborting.\n");
+            return EXIT_ABORTED;
+        }
         sleep_ms(10);
     }
 }
 
-static int check_runtime_controls(MacKeyboard &keyboard, const Options &opt,
-                                  const FrontApp &target, bool check_focus) {
-    if (escape_pressed()) {
-        return EXIT_ABORTED;
-    }
+static int check_runtime_controls(const Options &opt, const FrontApp &target,
+                                  bool check_focus) {
     if (check_focus && !opt.no_focus_check) {
         FrontApp current;
         if (target_changed(target, &current)) {
@@ -2006,9 +2217,6 @@ static int check_runtime_controls(MacKeyboard &keyboard, const Options &opt,
             return EXIT_ABORTED;
         }
     }
-    if (space_pressed()) {
-        return pause_until_space(keyboard, opt, target);
-    }
     std::string state_error = keyboard_state_error();
     if (!state_error.empty()) {
         fprintf(stderr, "\n%s\n", state_error.c_str());
@@ -2017,12 +2225,11 @@ static int check_runtime_controls(MacKeyboard &keyboard, const Options &opt,
     return EXIT_OK;
 }
 
-static int wait_typing_delay(MacKeyboard &keyboard, const Options &opt,
-                             const FrontApp &target, int delay_ms) {
+static int wait_typing_delay(const Options &opt, const FrontApp &target, int delay_ms) {
     int remaining = delay_ms;
     while (remaining > 0) {
         int slice = remaining > 10 ? 10 : remaining;
-        int rc = check_runtime_controls(keyboard, opt, target, false);
+        int rc = check_runtime_controls(opt, target, false);
         if (rc != EXIT_OK) {
             return rc;
         }
@@ -2061,7 +2268,7 @@ static int prepare_target(const Options &opt, FrontApp *target) {
     }
 
     puts("Focus the target window now.");
-    puts("Ctrl-C or Esc aborts. Space pauses or resumes.");
+    puts("Esc aborts the countdown. Ctrl-C works when the terminal is focused.");
     int rc = run_countdown(opt.start_delay_sec);
     if (rc != EXIT_OK) {
         return rc;
@@ -2082,13 +2289,21 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
     size_t typed = 0;
     FrontApp target = initial_target;
     InputMode mode = effective_input_mode(opt);
+    MacControlTap controls;
+
+    if (!controls.start()) {
+        fprintf(stderr, "Cannot create the local Esc/Space control event tap.\n");
+        fprintf(stderr, "Check macOS Accessibility permission, then retry. No typing was performed.\n");
+        return EXIT_INPUT;
+    }
 
     puts("");
-    puts("Typing started. Ctrl-C or Esc aborts. Space pauses or resumes.");
+    puts("Typing started. Esc pauses after the current line; while paused, Space continues and Esc ends.");
+    puts("Ctrl-C in the terminal ends immediately.");
     printf("Progress: line %zu/%zu\n", line, stats.lines);
 
     for (size_t i = 0; i < data.text.size();) {
-        int rc = check_runtime_controls(keyboard, opt, target, true);
+        int rc = check_runtime_controls(opt, target, true);
         if (rc != EXIT_OK) {
             if (rc == EXIT_ABORTED) {
                 printf("\nAborted at line %zu, column %zu after %zu character/event unit(s).\n", line, col, typed);
@@ -2101,6 +2316,7 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
         bool invalid = false;
         next_scalar(data.text, i, &scalar, &units, &invalid);
         bool ok = false;
+        bool line_boundary = false;
         int event_delay_ms = opt.delay_ms;
 
         if (scalar == '\r') {
@@ -2118,6 +2334,7 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
             printf("\rProgress: line %zu/%zu", line <= stats.lines ? line : stats.lines, stats.lines);
             fflush(stdout);
             event_delay_ms = opt.line_delay_ms;
+            line_boundary = true;
         } else if (scalar == '\n') {
             if (opt.enter_mode == EnterMode::Unicode) {
                 char16_t cr = '\r';
@@ -2130,6 +2347,7 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
             printf("\rProgress: line %zu/%zu", line <= stats.lines ? line : stats.lines, stats.lines);
             fflush(stdout);
             event_delay_ms = opt.line_delay_ms;
+            line_boundary = true;
         } else if (scalar == '\t') {
             ok = keyboard.send_key(kVK_Tab);
             ++col;
@@ -2146,12 +2364,18 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
             fprintf(stderr, "\nInput failed at line %zu, column %zu.\n", line, col);
             return EXIT_INPUT;
         }
-        rc = wait_typing_delay(keyboard, opt, target, event_delay_ms);
+        rc = wait_typing_delay(opt, target, event_delay_ms);
         if (rc != EXIT_OK) {
             if (rc == EXIT_ABORTED) {
                 printf("\nAborted at line %zu, column %zu after %zu character/event unit(s).\n", line, col, typed + 1);
             }
             return rc;
+        }
+        if (line_boundary) {
+            rc = pause_at_line_boundary(controls, opt, target, line > 1 ? line - 1 : 1);
+            if (rc != EXIT_OK) {
+                return rc;
+            }
         }
         ++typed;
         i += units;
@@ -2163,6 +2387,17 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
 }
 
 static int run_self_test(const Options &opt) {
+    std::string control_error;
+    if (!MacControlTap::state_machine_self_test(&control_error)) {
+        fprintf(stderr, "Self-test failed: %s.\n", control_error.c_str());
+        return EXIT_INPUT;
+    }
+    puts("Control state self-test passed: Esc pauses/ends and Space resumes.");
+    if (opt.dry_run) {
+        puts("Dry run passed. No key events were posted.");
+        return EXIT_OK;
+    }
+
     printf("Accessibility trusted: %s\n", accessibility_trusted(opt.request_accessibility) ? "yes" : "no");
     print_front_app(frontmost_app());
     fflush(stdout);
@@ -2173,6 +2408,11 @@ static int run_self_test(const Options &opt) {
     MacKeyboard keyboard;
     if (!keyboard.ok()) {
         fprintf(stderr, "Self-test failed: cannot create CGEventSource.\n");
+        return EXIT_INPUT;
+    }
+    MacControlTap controls;
+    if (!controls.start()) {
+        fprintf(stderr, "Self-test failed: cannot create the local Esc/Space control event tap.\n");
         return EXIT_INPUT;
     }
     if (!keyboard.send_key(kVK_F20)) {

@@ -47,31 +47,26 @@ def execute_command_stream(commands: str, cwd: Path) -> subprocess.CompletedProc
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_space_pause_erases_control_keys_and_resumes(self) -> None:
+    def test_runtime_controls_do_not_poll_space(self) -> None:
         class FakeKeyboard:
             def __init__(self) -> None:
-                self.space_states = iter((0, 0x8000, 0))
-                self.backspaces = 0
+                self.queried_keys: list[int] = []
 
             def get_async_key_state(self, key: int) -> int:
-                if key == tool.VK_SPACE:
-                    return next(self.space_states, 0)
-                return 0
+                self.queried_keys.append(key)
+                return 0x8000 if key == 0x20 else 0
 
-            def foreground_window(self) -> tool.TargetWindow:
-                return tool.TargetWindow(1, 2, "target")
-
-            def legacy_vk(self, key: int) -> None:
-                if key == tool.VK_BACK:
-                    self.backspaces += 1
+            def keyboard_state_error(self) -> str:
+                return ""
 
         keyboard = FakeKeyboard()
-        rc, target = tool.pause_until_space(
-            keyboard, options("--mode", "simple"), tool.TargetWindow(1, 2, "target")
+        target = tool.TargetWindow(1, 2, "target")
+        rc, current = tool.check_runtime_controls(
+            keyboard, options("--mode", "simple", "--no-focus-check"), target
         )
         self.assertEqual(rc, tool.EXIT_OK)
-        self.assertEqual(target.hwnd, 1)
-        self.assertEqual(keyboard.backspaces, 2)
+        self.assertEqual(current, target)
+        self.assertNotIn(0x20, keyboard.queried_keys)
 
     def test_numeric_hex_payload_is_single_quoted(self) -> None:
         opt = options("--mode", "cmd-hex")

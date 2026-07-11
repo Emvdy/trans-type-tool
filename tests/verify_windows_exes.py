@@ -50,7 +50,7 @@ def verify_help(executable: Path, root: Path) -> None:
         "--mode cmd-hex --source PATH --output-encoding preserve",
         "--mode zip-hex --source FOLDER [--remote-output TARGET]",
         "运行控制 / runtime controls:",
-        "Space",
+        "Esc",
     )
     missing = [text for text in required if text not in help_text]
     if missing:
@@ -61,6 +61,8 @@ def verify_help(executable: Path, root: Path) -> None:
     for verbose in ("模式、内容与文件", "允许/allowed", "intermediates:"):
         if verbose in help_text:
             raise AssertionError(f"{executable.name} help still contains verbose section {verbose}")
+    if "Space" in help_text or "Paused. Press Space" in help_text:
+        raise AssertionError(f"{executable.name} help still advertises the removed Space pause control")
 
 
 def verify_removed_options(executable: Path, root: Path) -> None:

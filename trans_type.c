@@ -201,7 +201,6 @@ static void print_usage(void) {
     puts("");
     puts("运行控制 / runtime controls:");
     puts("  Esc    中止 / abort");
-    puts("  Space  暂停或继续 / pause or resume");
     puts("  Enter  倒计时期间立即开始 / start immediately during countdown");
 }
 
@@ -2695,72 +2694,6 @@ static int pause_and_recapture(const Options *opt, TargetWindow *target, const c
     return prepare_target_window(opt, target);
 }
 
-static int wait_for_space_release(const Options *opt, const TargetWindow *target) {
-    while (GetAsyncKeyState(VK_SPACE) & 0x8000) {
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-            return EXIT_ABORTED;
-        }
-        if (!opt->no_focus_check && GetForegroundWindow() != target->hwnd) {
-            fprintf(stderr, "\nForeground window changed while handling Space; aborting.\n");
-            return EXIT_ABORTED;
-        }
-        Sleep(10);
-    }
-    return EXIT_OK;
-}
-
-static int send_pause_backspace(const Options *opt) {
-    if (opt->legacy_keys) {
-        return send_legacy_vk(VK_BACK);
-    }
-    return send_vk(VK_BACK, "pause Space cleanup Backspace");
-}
-
-static int pause_until_space(const Options *opt, TargetWindow *target) {
-    int rc = wait_for_space_release(opt, target);
-    if (rc != EXIT_OK) {
-        return rc;
-    }
-    if (!opt->no_focus_check && GetForegroundWindow() != target->hwnd) {
-        fprintf(stderr, "\nForeground window changed while handling Space; aborting.\n");
-        return EXIT_ABORTED;
-    }
-    rc = send_pause_backspace(opt);
-    if (rc != EXIT_OK) {
-        fprintf(stderr, "\nCould not erase the pause Space from the target.\n");
-        return rc;
-    }
-
-    puts("\nPaused. Press Space again to continue; Esc aborts.");
-    for (;;) {
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-            return EXIT_ABORTED;
-        }
-        if (!opt->no_focus_check && GetForegroundWindow() != target->hwnd) {
-            fprintf(stderr, "\nForeground window changed while paused; aborting.\n");
-            return EXIT_ABORTED;
-        }
-        if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
-            rc = wait_for_space_release(opt, target);
-            if (rc != EXIT_OK) {
-                return rc;
-            }
-            if (!opt->no_focus_check && GetForegroundWindow() != target->hwnd) {
-                fprintf(stderr, "\nForeground window changed while paused; aborting.\n");
-                return EXIT_ABORTED;
-            }
-            rc = send_pause_backspace(opt);
-            if (rc != EXIT_OK) {
-                fprintf(stderr, "\nCould not erase the resume Space from the target.\n");
-                return rc;
-            }
-            puts("Resuming.");
-            return EXIT_OK;
-        }
-        Sleep(10);
-    }
-}
-
 static int check_runtime_controls(const Options *opt, TargetWindow *target) {
     if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
         return EXIT_ABORTED;
@@ -2768,10 +2701,6 @@ static int check_runtime_controls(const Options *opt, TargetWindow *target) {
 
     if (!opt->no_focus_check && GetForegroundWindow() != target->hwnd) {
         return pause_and_recapture(opt, target, "Foreground window changed.");
-    }
-
-    if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
-        return pause_until_space(opt, target);
     }
 
     if (GetKeyState(VK_CAPITAL) & 0x0001) {
@@ -2806,7 +2735,7 @@ static int type_text(const TextData *data, const TextStats *stats, const Options
     int typed_chars = 0;
     int rc;
 
-    printf("\nTyping started. Esc aborts. Space pauses or resumes.\n");
+    printf("\nTyping started. Esc aborts.\n");
     printf("Progress: line %d/%d\n", line, stats->lines);
 
     for (i = 0; i < data->chars; ++i) {
