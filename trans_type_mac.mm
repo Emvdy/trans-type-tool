@@ -15,6 +15,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -38,6 +39,9 @@ static constexpr int MAX_HEX_CHUNK_BYTES = 2048;
 static constexpr size_t MAX_DIRECTORY_ENTRIES = 10000;
 static constexpr const char *REMOTE_HEX = "tt.hex";
 static constexpr const char *REMOTE_ZIP = "tt.zip";
+static constexpr const char *REMOTE_STAGE = "tt.out";
+static constexpr const char *REMOTE_HELPER_HEX = "tt.cmd.hex";
+static constexpr const char *REMOTE_HELPER = "tt.cmd";
 
 enum class SourceKind {
     Clipboard,
@@ -92,8 +96,7 @@ struct Options {
     OutputEncoding output_encoding = OutputEncoding::Utf8;
     std::filesystem::path file_path;
     std::filesystem::path commands_out;
-    std::string remote_output = "trans.txt";
-    std::string remote_path = ".";
+    std::string remote_output = ".\\trans.txt";
     bool remote_output_set = false;
     int hex_chunk_bytes = DEFAULT_HEX_CHUNK_BYTES;
 };
@@ -129,7 +132,6 @@ struct FrontApp {
 };
 
 static bool simple_ascii_key_supported(char16_t ch);
-static bool normalize_remote_directory(std::string *path);
 
 static void print_help_option(const char *option, const char *description) {
     printf("  %-25s%s\n", option, description);
@@ -145,8 +147,7 @@ static void print_usage() {
     puts("选项 / options:");
     print_help_option("--source SOURCE", "来源：clipboard、file(trans.txt)或本地路径 / source (default: clipboard)");
     print_help_option("--mode MODE", "传输模式 / simple, cmd-hex, or zip-hex (default: simple)");
-    print_help_option("--remote-output NAME", "远端输出名称 / output name (default: clipboard=trans.txt, path=basename)");
-    print_help_option("--remote-path PATH", "远端当前驱动器绝对目录 / absolute directory (default: ./)");
+    print_help_option("--remote-output TARGET", "远端名称或路径 / name or relative/absolute path (default: ./basename)");
     print_help_option("--output-encoding E", "输出编码 / utf8, utf8-bom, or preserve (default: utf8)");
     print_help_option("--commands-out PATH", "导出复杂模式命令 / export command stream (default: unset)");
     print_help_option("--hex-chunk-bytes N", "每行 hex 原始字节数 / bytes per hex line (default: 240)");
@@ -179,11 +180,14 @@ static void print_usage() {
     puts("  zip-hex (目录 / directory):");
     puts("    内容/content : 一个真实目录，不允许链接 / one real directory; no links");
     puts("    文件/files   : 解压到来源同名目录；中间文件自动删除 / source-named folder; temp deleted");
-    puts("  clipboard 默认输出 trans.txt；路径来源默认输出本地 basename。");
-    puts("  Clipboard defaults to trans.txt; path sources default to the local basename.");
-    puts("  中间文件/intermediates: cmd-hex=tt.hex; zip-hex=tt.hex+tt.zip; 自动删除/deleted.");
-    puts("  remote-output 仅名称/name only；remote-path 仅 ./ 或 \\lowercase\\path。");
-    puts("  本地默认 / local defaults: source=clipboard, remote-path=./, commands-out=unset.");
+    puts("  clipboard 默认目标 .\\trans.txt；路径来源默认目标 .\\basename。");
+    puts("  Clipboard defaults to .\\trans.txt; path sources default to .\\basename.");
+    puts("  直接目标/direct intermediates: cmd-hex=tt.hex; zip-hex=tt.hex+tt.zip.");
+    puts("  复杂目标/helper adds: tt.cmd.hex+tt.cmd; cmd-hex also adds tt.out; 均自动删除/deleted.");
+    puts("  remote-output 是名称或完整目标/name or full target；目录结尾自动追加原名。");
+    puts("  A trailing directory appends the source name; default: ./source-name.");
+    puts("  示例/examples: name=.\\name, ../=..\\source-name, c:/dir/=c:\\dir\\source-name.");
+    puts("  本地默认 / local defaults: source=clipboard, remote-output=./basename, commands-out=unset.");
     puts("");
     puts("运行控制 / runtime controls:");
     puts("  Ctrl-C                 立即中止 / abort immediately");
@@ -353,15 +357,6 @@ static bool parse_args(int argc, char **argv, Options *opt) {
             return false;
         }
 
-        matched = get_option_value(&i, argc, argv, "--remote-path", &value);
-        if (matched == 1) {
-            opt->remote_path = value;
-            continue;
-        }
-        if (matched == 0) {
-            return false;
-        }
-
         matched = get_option_value(&i, argc, argv, "--output-encoding", &value);
         if (matched == 1) {
             if (strcmp(value, "utf8") == 0) {
@@ -437,14 +432,8 @@ static bool parse_args(int argc, char **argv, Options *opt) {
         fprintf(stderr, "--output-encoding preserve requires a file source, not clipboard text.\n");
         return false;
     }
-    if (!normalize_remote_directory(&opt->remote_path)) {
-        fprintf(stderr, "--remote-path must be ./ or a lowercase current-drive absolute path such as \\work\\drop.\n");
-        fprintf(stderr, "Drive-letter paths contain ':' and cannot be typed without Shift.\n");
-        return false;
-    }
-    if (opt->transfer_mode == TransferMode::Simple &&
-        (opt->remote_output_set || opt->remote_path != ".")) {
-        fprintf(stderr, "--remote-output and --remote-path are only valid with cmd-hex or zip-hex.\n");
+    if (opt->transfer_mode == TransferMode::Simple && opt->remote_output_set) {
+        fprintf(stderr, "--remote-output is only valid with cmd-hex or zip-hex.\n");
         return false;
     }
     if (opt->transfer_mode == TransferMode::Simple && !opt->commands_out.empty()) {
@@ -701,52 +690,184 @@ static bool read_text_source(const Options &opt, TextData *out, std::string *err
     return read_file_source(opt, out, error);
 }
 
-static bool apply_default_remote_output(Options *opt, const TextData &data, std::string *error) {
-    if (opt->remote_output_set) {
-        return true;
+static bool remote_separator(char ch) {
+    return ch == '/' || ch == '\\';
+}
+
+static std::string collapse_remote_separators(const std::string &path) {
+    bool unc = path.size() >= 2 && remote_separator(path[0]) && remote_separator(path[1]);
+    std::string out;
+    out.reserve(path.size());
+    for (char ch : path) {
+        char converted = remote_separator(ch) ? '\\' : ch;
+        if (converted == '\\' && !out.empty() && out.back() == '\\') {
+            continue;
+        }
+        out.push_back(converted);
     }
-    if (opt->source == SourceKind::Clipboard) {
-        opt->remote_output = "trans.txt";
-        return true;
+    if (unc && !out.empty() && out.front() == '\\') {
+        out.insert(out.begin(), '\\');
     }
-    opt->remote_output = data.source_path.filename().u8string();
-    if (opt->remote_output.empty()) {
-        *error = "Cannot derive --remote-output from the source path; specify --remote-output NAME.";
+    return out;
+}
+
+static bool normalize_remote_output(const std::string *value, const std::string &source_name,
+                                    std::string *out) {
+    if (source_name.empty()) {
         return false;
+    }
+    if (value == nullptr) {
+        *out = ".\\" + source_name;
+        return true;
+    }
+    if (value->empty()) {
+        return false;
+    }
+
+    bool directory_target = remote_separator(value->back()) || *value == "." || *value == "..";
+    *out = collapse_remote_separators(*value);
+    if (!directory_target) {
+        if (out->find('\\') == std::string::npos && out->find(':') == std::string::npos) {
+            *out = ".\\" + *out;
+        }
+        return !out->empty();
+    }
+    while (!out->empty() && out->back() == '\\') {
+        out->pop_back();
+    }
+    if (out->empty()) {
+        *out = "\\" + source_name;
+    } else {
+        *out += "\\" + source_name;
     }
     return true;
 }
 
-static bool is_safe_cmd_hex_path(const std::string &path) {
-    if (path.empty() || path.size() > 240 || path.front() == '/' || path.front() == '\\' ||
-        path.back() == '/' || path.back() == '\\') {
-        return false;
+static std::pair<std::string, std::string> remote_output_parts(const std::string &target) {
+    size_t split = target.rfind('\\');
+    if (split == std::string::npos) {
+        return {".", target};
     }
-    size_t start = 0;
-    while (start <= path.size()) {
-        size_t end = path.find_first_of("/\\", start);
-        std::string part = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
-        if (part.empty() || part == "." || part == ".." || part.front() == '-' || part.back() == '.') {
-            return false;
+    std::string name = target.substr(split + 1);
+    if (split == 0) {
+        return {"\\", name};
+    }
+    if (split == 2 && target.size() >= 3 && target[1] == ':') {
+        return {target.substr(0, 3), name};
+    }
+    return {target.substr(0, split), name};
+}
+
+static std::string ascii_lower(std::string value) {
+    for (char &ch : value) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
         }
-        std::string base = part.substr(0, part.find('.'));
-        if (base == "con" || base == "prn" || base == "aux" || base == "nul") {
-            return false;
-        }
-        if (base.size() == 4 && (base.compare(0, 3, "com") == 0 || base.compare(0, 3, "lpt") == 0) &&
-            base[3] >= '1' && base[3] <= '9') {
-            return false;
-        }
+    }
+    return value;
+}
+
+static bool remote_component_is_reserved(const std::string &component) {
+    std::string base = ascii_lower(component.substr(0, component.find('.')));
+    if (base == "con" || base == "prn" || base == "aux" || base == "nul") {
+        return true;
+    }
+    return base.size() == 4 && (base.compare(0, 3, "com") == 0 || base.compare(0, 3, "lpt") == 0) &&
+           base[3] >= '1' && base[3] <= '9';
+}
+
+static std::vector<std::string> remote_components(const std::string &target, size_t start) {
+    std::vector<std::string> components;
+    for (;;) {
+        size_t end = target.find('\\', start);
+        components.push_back(target.substr(start, end == std::string::npos ? std::string::npos : end - start));
         if (end == std::string::npos) {
             break;
         }
         start = end + 1;
     }
-    for (unsigned char ch : path) {
-        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+    return components;
+}
+
+static std::string remote_output_error(const std::string &target) {
+    if (target.empty()) {
+        return "--remote-output must not be empty";
+    }
+    NSString *decoded = [[NSString alloc] initWithBytes:target.data()
+                                                 length:target.size()
+                                               encoding:NSUTF8StringEncoding];
+    if (decoded == nil) {
+        return "--remote-output contains invalid Unicode";
+    }
+    if ([decoded length] > 240) {
+        return "--remote-output is longer than 240 UTF-16 code units";
+    }
+    for (unsigned char ch : target) {
+        if (ch < 32) {
+            return "--remote-output contains a control character";
+        }
+    }
+
+    bool unc = target.size() >= 2 && target[0] == '\\' && target[1] == '\\';
+    bool ascii_drive = !target.empty() &&
+                       ((target[0] >= 'a' && target[0] <= 'z') ||
+                        (target[0] >= 'A' && target[0] <= 'Z'));
+    bool drive_absolute = target.size() >= 3 && ascii_drive && target[1] == ':' && target[2] == '\\';
+    if (target.size() >= 2 && target[1] == ':' && !drive_absolute) {
+        return "--remote-output drive paths must be absolute, for example c:/work/file.txt";
+    }
+    size_t colon_start = drive_absolute ? 3 : 0;
+    if (target.find(':', colon_start) != std::string::npos) {
+        return "--remote-output contains ':' outside a drive prefix";
+    }
+
+    size_t component_start = unc ? 2 : (drive_absolute ? 3 : (!target.empty() && target[0] == '\\' ? 1 : 0));
+    std::vector<std::string> components = remote_components(target, component_start);
+    if (unc) {
+        if (components.size() < 3 || components[0].empty() || components[1].empty()) {
+            return "--remote-output UNC paths must include server, share, and output name";
+        }
+        for (const std::string &component : components) {
+            if (component == "." || component == "..") {
+                return "--remote-output UNC paths cannot contain '.' or '..' segments";
+            }
+        }
+    }
+
+    for (const std::string &component : components) {
+        if (component == "." || component == "..") {
             continue;
         }
-        if (ch == '.' || ch == '-' || ch == '/' || ch == '\\') {
+        if (component.empty()) {
+            return "--remote-output contains an empty path component";
+        }
+        if (component.back() == '.' || component.back() == ' ') {
+            return "--remote-output components cannot end with a dot or space";
+        }
+        if (component.find_first_of("<>\"|?*") != std::string::npos) {
+            return "--remote-output contains a Windows-invalid path character";
+        }
+        if (remote_component_is_reserved(component)) {
+            return "--remote-output contains a reserved Windows device name";
+        }
+        std::string folded = ascii_lower(component);
+        if (folded == REMOTE_HEX || folded == REMOTE_ZIP || folded == REMOTE_STAGE ||
+            folded == REMOTE_HELPER_HEX || folded == REMOTE_HELPER) {
+            return "--remote-output uses a reserved temporary name";
+        }
+    }
+
+    std::string name = remote_output_parts(target).second;
+    if (name.empty() || name == "." || name == "..") {
+        return "--remote-output must end with a file or directory name";
+    }
+    return {};
+}
+
+static bool remote_output_is_shift_free(const std::string &target) {
+    for (unsigned char ch : target) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+            ch == '.' || ch == '-' || ch == '\\') {
             continue;
         }
         return false;
@@ -754,39 +875,27 @@ static bool is_safe_cmd_hex_path(const std::string &path) {
     return true;
 }
 
-static bool normalize_remote_directory(std::string *path) {
-    if (*path == "." || *path == "./" || *path == ".\\") {
-        *path = ".";
-        return true;
-    }
-    for (char &ch : *path) {
-        if (ch == '/') {
-            ch = '\\';
-        }
-    }
-    if (path->empty() || path->front() != '\\' ||
-        (path->size() > 1 && (*path)[1] == '\\')) {
+static bool apply_default_remote_output(Options *opt, const TextData &data, std::string *error) {
+    std::string source_name = opt->source == SourceKind::Clipboard
+                                  ? "trans.txt"
+                                  : data.source_path.filename().u8string();
+    if (source_name.empty()) {
+        *error = "Cannot derive --remote-output from the source path; specify --remote-output TARGET.";
         return false;
     }
-    while (path->size() > 1 && path->back() == '\\') {
-        path->pop_back();
+    std::string requested = opt->remote_output;
+    if (!normalize_remote_output(opt->remote_output_set ? &requested : nullptr, source_name,
+                                 &opt->remote_output)) {
+        *error = "--remote-output is empty or cannot be normalized.";
+        return false;
     }
-    return path->size() == 1 || is_safe_cmd_hex_path(path->substr(1));
-}
-
-static bool is_safe_remote_output_name(const std::string &name) {
-    return name.find_first_of("/\\") == std::string::npos &&
-           name != REMOTE_HEX && name != REMOTE_ZIP && is_safe_cmd_hex_path(name);
-}
-
-static std::string remote_target_path(const Options &opt) {
-    if (opt.remote_path == ".") {
-        return opt.remote_output;
+    if (opt->transfer_mode != TransferMode::Simple) {
+        *error = remote_output_error(opt->remote_output);
+        if (!error->empty()) {
+            return false;
+        }
     }
-    if (opt.remote_path == "\\") {
-        return "\\" + opt.remote_output;
-    }
-    return opt.remote_path + "\\" + opt.remote_output;
+    return true;
 }
 
 static std::vector<unsigned char> text_to_utf8_bytes(const std::u16string &text) {
@@ -877,13 +986,7 @@ static size_t count_hex_lines(const std::string &hex_text) {
 }
 
 static std::string normalized_zip_entry_name(const std::string &remote_output) {
-    std::string out = remote_output;
-    for (char &ch : out) {
-        if (ch == '\\') {
-            ch = '/';
-        }
-    }
-    return out;
+    return remote_output_parts(remote_output).second;
 }
 
 static std::filesystem::path create_temp_directory() {
@@ -995,6 +1098,7 @@ static bool run_zip_tool(const std::filesystem::path &cwd,
             @"-q",
             @"-r",
             [NSString stringWithUTF8String:zip_path.string().c_str()],
+            @"--",
             [NSString stringWithUTF8String:entry_name.c_str()]
         ];
 
@@ -1146,9 +1250,8 @@ static std::string quote_powershell_literal(const std::string &value) {
     return "'" + value + "'";
 }
 
-static std::string build_hex_writer_commands(const std::string &hex_text) {
-    std::string commands = "powershell -noprofile\n";
-
+static void append_hex_writer_commands(std::string *commands, const std::string &hex_text,
+                                       const std::string &destination) {
     size_t start = 0;
     bool first_line = true;
     while (start < hex_text.size()) {
@@ -1157,37 +1260,118 @@ static std::string build_hex_writer_commands(const std::string &hex_text) {
             end = hex_text.size();
         }
         if (end > start) {
-            commands += first_line ? "set-content" : "add-content";
-            commands += " -encoding ascii ";
-            commands += quote_powershell_literal(REMOTE_HEX);
-            commands += " ";
-            commands += "'";
-            commands.append(hex_text, start, end - start);
-            commands += "'";
-            commands += "\n";
+            *commands += first_line ? "set-content" : "add-content";
+            *commands += " -encoding ascii ";
+            *commands += quote_powershell_literal(destination);
+            *commands += " '";
+            commands->append(hex_text, start, end - start);
+            *commands += "'\n";
             first_line = false;
         }
         start = end + 1;
     }
+}
 
+static std::string build_hex_writer_commands(const std::string &hex_text) {
+    std::string commands = "powershell -noprofile\n";
+    append_hex_writer_commands(&commands, hex_text, REMOTE_HEX);
     return commands;
+}
+
+static void append_remote_parent_command(std::string *commands, const std::string &target) {
+    std::string parent = remote_output_parts(target).first;
+    if (parent != ".") {
+        *commands += "new-item -itemtype directory -force " + quote_powershell_literal(parent) + "\n";
+    }
+}
+
+static std::string powershell_script_literal(const std::string &value) {
+    std::string literal = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            literal += '\'';
+        }
+        literal += ch;
+    }
+    literal += '\'';
+    return literal;
+}
+
+static std::vector<unsigned char> build_remote_helper(const Options &opt,
+                                                       TransferMode transfer_mode,
+                                                       bool directory_source = false) {
+    std::string parent = remote_output_parts(opt.remote_output).first;
+    std::string parent_literal = powershell_script_literal(parent);
+    std::string target_literal = powershell_script_literal(opt.remote_output);
+    std::string script = "[system.io.directory]::createdirectory(" + parent_literal + ");";
+    if (transfer_mode == TransferMode::CmdHex) {
+        script += "[system.io.file]::copy('" + std::string(REMOTE_STAGE) + "'," +
+                  target_literal + ",$true);certutil -hashfile " + target_literal + " sha256";
+    } else if (directory_source) {
+        script += "certutil -hashfile '" + std::string(REMOTE_ZIP) + "' sha256;";
+        script += "expand-archive -force -literalpath '" + std::string(REMOTE_ZIP) +
+                  "' -destinationpath " + target_literal;
+    } else {
+        script += "expand-archive -force -literalpath '" + std::string(REMOTE_ZIP) +
+                  "' -destinationpath " + parent_literal + ";";
+        script += "certutil -hashfile " + target_literal + " sha256";
+    }
+
+    std::string escaped;
+    escaped.reserve(script.size());
+    for (char ch : script) {
+        if (ch == '^' || ch == '%') {
+            escaped += ch;
+        }
+        escaped += ch;
+    }
+    std::string batch = "@echo off\r\n"
+                        "setlocal disabledelayedexpansion\r\n"
+                        "chcp 65001 >nul\r\n"
+                        "powershell -noprofile -noninteractive -command \"" +
+                        escaped + "\"\r\nexit /b %errorlevel%\r\n";
+    return {batch.begin(), batch.end()};
+}
+
+static void append_remote_helper_commands(std::string *commands, const Options &opt,
+                                          TransferMode transfer_mode,
+                                          bool directory_source = false) {
+    std::vector<unsigned char> helper = build_remote_helper(opt, transfer_mode, directory_source);
+    std::string helper_hex = bytes_to_plain_hex(helper, opt.hex_chunk_bytes);
+    append_hex_writer_commands(commands, helper_hex, REMOTE_HELPER_HEX);
+    *commands += "certutil -f -decodehex " + quote_powershell_literal(REMOTE_HELPER_HEX) + " " +
+                 quote_powershell_literal(REMOTE_HELPER) + "\n";
+    *commands += "cmd /d /c " + std::string(REMOTE_HELPER) + "\n";
+}
+
+static void append_cleanup_command(std::string *commands, const std::string &name) {
+    *commands += "remove-item -force " + quote_powershell_literal(name) + "\n";
 }
 
 static std::string build_cmd_hex_commands(const std::string &hex_text, const Options &opt) {
     std::string commands = build_hex_writer_commands(hex_text);
-    if (opt.remote_path != ".") {
-        commands += "new-item -itemtype directory -force " + quote_powershell_literal(opt.remote_path) + "\n";
+    bool helper = !remote_output_is_shift_free(opt.remote_output);
+    std::string decode_target = helper ? REMOTE_STAGE : opt.remote_output;
+    if (!helper) {
+        append_remote_parent_command(&commands, opt.remote_output);
     }
-    std::string remote_target = remote_target_path(opt);
     if (count_hex_lines(hex_text) > 0) {
         commands += "certutil -f -decodehex " + quote_powershell_literal(REMOTE_HEX) + " " +
-                    quote_powershell_literal(remote_target) + "\n";
+                    quote_powershell_literal(decode_target) + "\n";
     } else {
         commands += "set-content -nonewline " + quote_powershell_literal(REMOTE_HEX) + " ''\n";
-        commands += "set-content -nonewline " + quote_powershell_literal(remote_target) + " ''\n";
+        commands += "set-content -nonewline " + quote_powershell_literal(decode_target) + " ''\n";
     }
-    commands += "certutil -hashfile " + quote_powershell_literal(remote_target) + " sha256\n";
-    commands += "remove-item -force " + quote_powershell_literal(REMOTE_HEX) + "\n";
+    if (helper) {
+        append_remote_helper_commands(&commands, opt, TransferMode::CmdHex);
+        append_cleanup_command(&commands, REMOTE_HEX);
+        append_cleanup_command(&commands, REMOTE_STAGE);
+        append_cleanup_command(&commands, REMOTE_HELPER_HEX);
+        append_cleanup_command(&commands, REMOTE_HELPER);
+    } else {
+        commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
+        append_cleanup_command(&commands, REMOTE_HEX);
+    }
     commands += "exit\n";
     return commands;
 }
@@ -1195,22 +1379,30 @@ static std::string build_cmd_hex_commands(const std::string &hex_text, const Opt
 static std::string build_zip_hex_commands(const std::string &hex_text, const Options &opt,
                                           bool directory_source = false) {
     std::string commands = build_hex_writer_commands(hex_text);
-    if (opt.remote_path != ".") {
-        commands += "new-item -itemtype directory -force " + quote_powershell_literal(opt.remote_path) + "\n";
+    bool helper = !remote_output_is_shift_free(opt.remote_output);
+    if (!helper) {
+        append_remote_parent_command(&commands, opt.remote_output);
     }
     commands += "certutil -f -decodehex " + quote_powershell_literal(REMOTE_HEX) + " " +
                 quote_powershell_literal(REMOTE_ZIP) + "\n";
-    if (directory_source) {
+    if (helper) {
+        append_remote_helper_commands(&commands, opt, TransferMode::ZipHex, directory_source);
+    } else if (directory_source) {
         commands += "certutil -hashfile " + quote_powershell_literal(REMOTE_ZIP) + " sha256\n";
         commands += "expand-archive -force " + quote_powershell_literal(REMOTE_ZIP) + " " +
-                    quote_powershell_literal(remote_target_path(opt)) + "\n";
+                    quote_powershell_literal(opt.remote_output) + "\n";
     } else {
+        std::string parent = remote_output_parts(opt.remote_output).first;
         commands += "expand-archive -force " + quote_powershell_literal(REMOTE_ZIP) + " " +
-                    quote_powershell_literal(opt.remote_path) + "\n";
-        commands += "certutil -hashfile " + quote_powershell_literal(remote_target_path(opt)) + " sha256\n";
+                    quote_powershell_literal(parent) + "\n";
+        commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
     }
-    commands += "remove-item -force " + quote_powershell_literal(REMOTE_HEX) + "\n";
-    commands += "remove-item -force " + quote_powershell_literal(REMOTE_ZIP) + "\n";
+    append_cleanup_command(&commands, REMOTE_HEX);
+    append_cleanup_command(&commands, REMOTE_ZIP);
+    if (helper) {
+        append_cleanup_command(&commands, REMOTE_HELPER_HEX);
+        append_cleanup_command(&commands, REMOTE_HELPER);
+    }
     commands += "exit\n";
     return commands;
 }
@@ -1404,14 +1596,9 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
             fprintf(stderr, "--output-encoding preserve requires file input; clipboard text has no original bytes.\n");
             return EXIT_ARGS;
         }
-        if (!is_safe_remote_output_name(opt.remote_output)) {
-            fprintf(stderr, "--remote-output must be one cmd-safe name using only lowercase letters, digits, '.', or '-'.\n");
-            fprintf(stderr, "It cannot contain a directory or be named tt.hex or tt.zip.\n");
-            fprintf(stderr, "Example: trans.txt\n");
-            return EXIT_ARGS;
-        }
-        if (remote_target_path(opt).size() > 240) {
-            fprintf(stderr, "The combined --remote-path and --remote-output path is longer than 240 characters.\n");
+        std::string path_error = remote_output_error(opt.remote_output);
+        if (!path_error.empty()) {
+            fprintf(stderr, "%s.\n", path_error.c_str());
             return EXIT_ARGS;
         }
         return EXIT_OK;
@@ -1420,8 +1607,8 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
         fprintf(stderr, "--commands-out is only valid with --mode cmd-hex or --mode zip-hex.\n");
         return EXIT_ARGS;
     }
-    if (opt.remote_output_set || opt.remote_path != ".") {
-        fprintf(stderr, "--remote-output and --remote-path are only valid with cmd-hex or zip-hex.\n");
+    if (opt.remote_output_set) {
+        fprintf(stderr, "--remote-output is only valid with cmd-hex or zip-hex.\n");
         return EXIT_ARGS;
     }
     if (opt.debug_input && opt.input_mode == InputMode::Unicode) {
@@ -1533,19 +1720,19 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     if (opt.transfer_mode == TransferMode::CmdHex) {
         printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
         printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
-        printf("Remote path: %s\n", opt.remote_path.c_str());
-        printf("Remote output: %s\n", remote_target_path(opt).c_str());
+        printf("Remote output: %s\n", opt.remote_output.c_str());
+        printf("Path transport: %s\n", remote_output_is_shift_free(opt.remote_output) ? "direct" : "hex helper");
         printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
     } else if (opt.transfer_mode == TransferMode::ZipHex) {
         printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
-        printf("Remote path: %s\n", opt.remote_path.c_str());
         if (data.kind == DataKind::Directory) {
             printf("Output encoding: directory file bytes preserved\n");
-            printf("Remote destination directory: %s\n", remote_target_path(opt).c_str());
+            printf("Remote destination directory: %s\n", opt.remote_output.c_str());
         } else {
             printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
-            printf("Remote output: %s\n", remote_target_path(opt).c_str());
+            printf("Remote output: %s\n", opt.remote_output.c_str());
         }
+        printf("Path transport: %s\n", remote_output_is_shift_free(opt.remote_output) ? "direct" : "hex helper");
         printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
     } else if (opt.input_mode == InputMode::Auto) {
         printf("Input mode: Auto -> %s\n", input_mode_name(mode));
@@ -2059,7 +2246,6 @@ static int type_generated_ascii(MacKeyboard &keyboard, const std::string &text, 
     opt.enter_mode = EnterMode::Key;
     opt.commands_out.clear();
     opt.remote_output_set = false;
-    opt.remote_path = ".";
     int rc = validate_text(data, stats, opt);
     if (rc != EXIT_OK) {
         return rc;
@@ -2079,10 +2265,15 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
     size_t hex_line_count = count_hex_lines(hex_text);
     printf("cmd-hex transfer mode.\n");
     printf("Output bytes to transfer: %zu\n", bytes.size());
-    printf("Remote output: %s\n", remote_target_path(opt).c_str());
+    printf("Remote output: %s\n", opt.remote_output.c_str());
     printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
     printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
-    printf("Remote temporary %s is deleted after reconstruction.\n", REMOTE_HEX);
+    if (remote_output_is_shift_free(opt.remote_output)) {
+        printf("Remote temporary %s is deleted after reconstruction.\n", REMOTE_HEX);
+    } else {
+        printf("Remote temporary %s, %s, %s, and %s are deleted after reconstruction.\n",
+               REMOTE_HEX, REMOTE_STAGE, REMOTE_HELPER_HEX, REMOTE_HELPER);
+    }
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.\n");
     fflush(stdout);
 
@@ -2148,7 +2339,7 @@ static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
     printf("zip-hex transfer mode.\n");
     printf("Output bytes before zip: %zu\n", source_bytes);
     printf("Zip bytes to transfer: %zu (%.2f%% of output size)\n", zip_bytes.size(), ratio);
-    printf("Remote output: %s\n", remote_target_path(opt).c_str());
+    printf("Remote output: %s\n", opt.remote_output.c_str());
     printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
     if (directory_source) {
         printf("Expected archive SHA-256: %s\n", sha256_hex(zip_bytes).c_str());
@@ -2156,7 +2347,12 @@ static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
     } else {
         printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
     }
-    printf("Remote temporary %s and %s are deleted after extraction.\n", REMOTE_HEX, REMOTE_ZIP);
+    if (remote_output_is_shift_free(opt.remote_output)) {
+        printf("Remote temporary %s and %s are deleted after extraction.\n", REMOTE_HEX, REMOTE_ZIP);
+    } else {
+        printf("Remote temporary %s, %s, %s, and %s are deleted after extraction.\n",
+               REMOTE_HEX, REMOTE_ZIP, REMOTE_HELPER_HEX, REMOTE_HELPER);
+    }
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.\n");
     fflush(stdout);
 

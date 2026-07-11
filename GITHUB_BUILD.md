@@ -116,7 +116,8 @@ workflow 文件：
 8. 检查命令流只有小写、数字和无需 Shift 的白名单字符。
 9. 在 Windows PowerShell 5.1 中真实执行命令流，并使用 `certutil` 解码。
 10. 对 UTF-8、UTF-8 BOM、preserve 三种输出逐字节比对。
-11. 确认固定的 `tt.hex`/`tt.zip` 中间文件在恢复后自动删除。
+11. 实际执行小写相对目标和含空格/大写目标，确认后者通过 hex helper 恢复。
+12. 确认 `tt.hex`、`tt.zip`、`tt.out`、`tt.cmd.hex`、`tt.cmd` 不会在成功后残留。
 
 因此，Actions 不只是检查“程序能启动”，还会验证复杂协议确实恢复出相同字节。
 
@@ -192,8 +193,10 @@ trans_type_py.exe --debug-input
 7. 用可压缩的长文本测试 `zip-hex`，再次比较 SHA-256。
 8. 用临时目录测试 `zip-hex --source <目录>`，核对默认 basename 目标目录、
    `tt.zip` 的 SHA-256、嵌套文件、Unicode 文件名和空目录。
-9. 测试 `--remote-path \work\drop`，确认目录被创建且输出名与路径正确组合。
-10. 确认完成后远端 `tt.hex` 和 `tt.zip` 已自动删除；中止时则在重试前清理残留。
+9. 测试 `--remote-output ../`，确认自动追加来源 basename；再测试
+   `--remote-output "C:/Drop Folder/output.bin"`，确认复杂路径通过 helper 正确恢复。
+10. 确认完成后远端没有残留 `tt.hex`、`tt.zip`、`tt.out`、`tt.cmd.hex` 或
+    `tt.cmd`；中止时则在重试前清理残留。
 11. 短按 Space 测试暂停/继续，并确认自动 Backspace 没有留下控制空格。
 
 正常 medium integrity 的 RDP 不要求管理员权限。如果目标窗口本身以管理员身份

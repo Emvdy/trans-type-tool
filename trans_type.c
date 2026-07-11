@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <locale.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,10 @@
 #define MAX_DIRECTORY_ENTRIES 10000
 #define REMOTE_HEX "tt.hex"
 #define REMOTE_ZIP "tt.zip"
+#define REMOTE_STAGE "tt.out"
+#define REMOTE_HELPER_HEX "tt.cmd.hex"
+#define REMOTE_HELPER "tt.cmd"
+#define MAX_REMOTE_OUTPUT_UTF8 1024
 
 #ifndef PROGRAM_NAME
 #define PROGRAM_NAME "trans_type.exe"
@@ -84,8 +89,7 @@ typedef struct Options {
     int has_commands_out;
     wchar_t file_path[32768];
     wchar_t commands_out[32768];
-    char remote_output[260];
-    char remote_path[260];
+    char remote_output[MAX_REMOTE_OUTPUT_UTF8];
     int remote_output_set;
 } Options;
 
@@ -139,8 +143,7 @@ static void init_options(Options *opt) {
     opt->has_commands_out = 0;
     opt->file_path[0] = L'\0';
     opt->commands_out[0] = L'\0';
-    strcpy(opt->remote_output, "trans.txt");
-    strcpy(opt->remote_path, ".");
+    strcpy(opt->remote_output, ".\\trans.txt");
     opt->remote_output_set = 0;
 }
 
@@ -158,8 +161,7 @@ static void print_usage(void) {
     puts("选项 / options:");
     print_help_option("--source SOURCE", "来源：clipboard、file(trans.txt)或本地路径 / source (default: file)");
     print_help_option("--mode MODE", "传输模式 / simple, cmd-hex, or zip-hex (default: simple)");
-    print_help_option("--remote-output NAME", "远端输出名称 / output name (default: clipboard=trans.txt, path=basename)");
-    print_help_option("--remote-path PATH", "远端当前驱动器绝对目录 / absolute directory (default: ./)");
+    print_help_option("--remote-output TARGET", "远端名称或路径 / name or relative/absolute path (default: ./basename)");
     print_help_option("--output-encoding E", "输出编码 / utf8, utf8-bom, or preserve (default: utf8)");
     print_help_option("--commands-out PATH", "导出复杂模式命令 / export command stream (default: unset)");
     print_help_option("--hex-chunk-bytes N", "每行 hex 原始字节数 / bytes per hex line (default: 240)");
@@ -191,11 +193,14 @@ static void print_usage(void) {
     puts("  zip-hex (目录 / directory):");
     puts("    内容/content : 一个真实目录，不允许链接 / one real directory; no links");
     puts("    文件/files   : 解压到来源同名目录；中间文件自动删除 / source-named folder; temp deleted");
-    puts("  clipboard 默认输出 trans.txt；路径来源默认输出本地 basename。");
-    puts("  Clipboard defaults to trans.txt; path sources default to the local basename.");
-    puts("  中间文件/intermediates: cmd-hex=tt.hex; zip-hex=tt.hex+tt.zip; 自动删除/deleted.");
-    puts("  remote-output 仅名称/name only；remote-path 仅 ./ 或 \\lowercase\\path。");
-    puts("  本地默认 / local defaults: source=trans.txt, remote-path=./, commands-out=unset.");
+    puts("  clipboard 默认目标 .\\trans.txt；路径来源默认目标 .\\basename。");
+    puts("  Clipboard defaults to .\\trans.txt; path sources default to .\\basename.");
+    puts("  直接目标/direct intermediates: cmd-hex=tt.hex; zip-hex=tt.hex+tt.zip.");
+    puts("  复杂目标/helper adds: tt.cmd.hex+tt.cmd; cmd-hex also adds tt.out; 均自动删除/deleted.");
+    puts("  remote-output 是名称或完整目标/name or full target；目录结尾自动追加原名。");
+    puts("  A trailing directory appends the source name; default: ./source-name.");
+    puts("  示例/examples: name=.\\name, ../=..\\source-name, c:/dir/=c:\\dir\\source-name.");
+    puts("  本地默认 / local defaults: source=trans.txt, remote-output=./basename, commands-out=unset.");
     puts("");
     puts("运行控制 / runtime controls:");
     puts("  Esc                    中止 / abort");
@@ -256,23 +261,36 @@ static int arg_to_wide_path(const char *value, wchar_t *out, size_t out_len) {
     return needed > 0;
 }
 
-static int copy_remote_path(char *dest, size_t dest_len, const char *value, const char *name) {
+static char *wide_to_utf8_alloc(const wchar_t *value);
+
+static int copy_remote_argument(char *dest, size_t dest_len, const char *value, const char *name) {
+    wchar_t wide[MAX_REMOTE_OUTPUT_UTF8];
+    char *utf8;
     size_t len;
 
     if (value == NULL || *value == '\0') {
         fprintf(stderr, "%s must not be empty.\n", name);
         return 0;
     }
-    len = strlen(value);
-    if (len >= dest_len) {
-        fprintf(stderr, "%s is too long.\n", name);
+    if (!arg_to_wide_path(value, wide, sizeof(wide) / sizeof(wide[0]))) {
+        fprintf(stderr, "%s is not valid text.\n", name);
         return 0;
     }
-    memcpy(dest, value, len + 1);
+    utf8 = wide_to_utf8_alloc(wide);
+    if (utf8 == NULL) {
+        fprintf(stderr, "%s cannot be converted to UTF-8.\n", name);
+        return 0;
+    }
+    len = strlen(utf8);
+    if (len >= dest_len) {
+        fprintf(stderr, "%s is too long.\n", name);
+        free(utf8);
+        return 0;
+    }
+    memcpy(dest, utf8, len + 1);
+    free(utf8);
     return 1;
 }
-
-static int normalize_remote_directory(char *path, size_t path_len);
 
 static int parse_args(int argc, char **argv, Options *opt) {
     int i;
@@ -382,20 +400,10 @@ static int parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--remote-output", &value);
         if (matched == 1) {
-            if (!copy_remote_path(opt->remote_output, sizeof(opt->remote_output), value, "--remote-output")) {
+            if (!copy_remote_argument(opt->remote_output, sizeof(opt->remote_output), value, "--remote-output")) {
                 return 0;
             }
             opt->remote_output_set = 1;
-            continue;
-        } else if (matched == 0) {
-            return 0;
-        }
-
-        matched = get_option_value(&i, argc, argv, "--remote-path", &value);
-        if (matched == 1) {
-            if (!copy_remote_path(opt->remote_path, sizeof(opt->remote_path), value, "--remote-path")) {
-                return 0;
-            }
             continue;
         } else if (matched == 0) {
             return 0;
@@ -479,14 +487,8 @@ static int parse_args(int argc, char **argv, Options *opt) {
         fprintf(stderr, "--output-encoding preserve requires a file source, not clipboard text.\n");
         return 0;
     }
-    if (!normalize_remote_directory(opt->remote_path, sizeof(opt->remote_path))) {
-        fprintf(stderr, "--remote-path must be ./ or a lowercase current-drive absolute path such as \\work\\drop.\n");
-        fprintf(stderr, "Drive-letter paths contain ':' and cannot be typed without Shift.\n");
-        return 0;
-    }
-    if (opt->transfer_mode == TRANSFER_SIMPLE &&
-        (opt->remote_output_set || strcmp(opt->remote_path, ".") != 0)) {
-        fprintf(stderr, "--remote-output and --remote-path are only valid with cmd-hex or zip-hex.\n");
+    if (opt->transfer_mode == TRANSFER_SIMPLE && opt->remote_output_set) {
+        fprintf(stderr, "--remote-output is only valid with cmd-hex or zip-hex.\n");
         return 0;
     }
     if (opt->transfer_mode == TRANSFER_SIMPLE && opt->has_commands_out) {
@@ -541,18 +543,18 @@ static void print_wide_line(FILE *stream, const char *prefix, const wchar_t *val
     }
 }
 
-static int apply_default_remote_output(Options *opt, const TextData *data) {
+static int source_basename_utf8(const Options *opt, const TextData *data, char *out, size_t out_len) {
     const wchar_t *start;
     const wchar_t *end;
     const wchar_t *cursor;
     int chars;
     int needed;
 
-    if (opt->remote_output_set) {
-        return 1;
-    }
     if (opt->source == SOURCE_CLIPBOARD) {
-        strcpy(opt->remote_output, "trans.txt");
+        if (out_len < sizeof("trans.txt")) {
+            return 0;
+        }
+        strcpy(out, "trans.txt");
         return 1;
     }
 
@@ -567,20 +569,113 @@ static int apply_default_remote_output(Options *opt, const TextData *data) {
     }
     chars = (int)(end - cursor);
     if (chars <= 0) {
-        fprintf(stderr, "Cannot derive --remote-output from the source path; specify --remote-output NAME.\n");
+        fprintf(stderr, "Cannot derive --remote-output from the source path; specify --remote-output TARGET.\n");
         return 0;
     }
     needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, cursor, chars, NULL, 0, NULL, NULL);
-    if (needed <= 0 || needed >= (int)sizeof(opt->remote_output)) {
+    if (needed <= 0 || needed >= (int)out_len) {
         fprintf(stderr, "The source basename cannot be used as --remote-output.\n");
         return 0;
     }
     if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, cursor, chars,
-                            opt->remote_output, needed, NULL, NULL) != needed) {
+                            out, needed, NULL, NULL) != needed) {
         fprintf(stderr, "The source basename cannot be converted to UTF-8.\n");
         return 0;
     }
-    opt->remote_output[needed] = '\0';
+    out[needed] = '\0';
+    return 1;
+}
+
+static int is_path_separator(char ch) {
+    return ch == '/' || ch == '\\';
+}
+
+static int normalize_remote_output_value(const char *value, const char *source_name,
+                                         char *out, size_t out_len) {
+    size_t value_len;
+    size_t read_pos = 0;
+    size_t write_pos = 0;
+    int directory_target;
+    int is_unc;
+
+    if (value == NULL) {
+        int written = snprintf(out, out_len, ".\\%s", source_name);
+        return written >= 0 && (size_t)written < out_len;
+    }
+    value_len = strlen(value);
+    if (value_len == 0) {
+        return 0;
+    }
+    directory_target = is_path_separator(value[value_len - 1]) ||
+                       strcmp(value, ".") == 0 || strcmp(value, "..") == 0;
+    is_unc = value_len >= 2 && is_path_separator(value[0]) && is_path_separator(value[1]);
+
+    if (is_unc) {
+        if (out_len < 3) {
+            return 0;
+        }
+        out[write_pos++] = '\\';
+        out[write_pos++] = '\\';
+        while (read_pos < value_len && is_path_separator(value[read_pos])) {
+            ++read_pos;
+        }
+    }
+    while (read_pos < value_len) {
+        char ch = is_path_separator(value[read_pos]) ? '\\' : value[read_pos];
+        ++read_pos;
+        if (ch == '\\' && write_pos > 0 && out[write_pos - 1] == '\\') {
+            continue;
+        }
+        if (write_pos + 1 >= out_len) {
+            return 0;
+        }
+        out[write_pos++] = ch;
+    }
+    out[write_pos] = '\0';
+
+    if (directory_target) {
+        while (write_pos > 0 && out[write_pos - 1] == '\\') {
+            out[--write_pos] = '\0';
+        }
+        if (write_pos == 0) {
+            int written = snprintf(out, out_len, "\\%s", source_name);
+            return written >= 0 && (size_t)written < out_len;
+        }
+        if (write_pos + 1 + strlen(source_name) + 1 > out_len) {
+            return 0;
+        }
+        out[write_pos++] = '\\';
+        strcpy(out + write_pos, source_name);
+    } else if (strchr(out, '\\') == NULL && strchr(out, ':') == NULL) {
+        if (write_pos + 3 > out_len) {
+            return 0;
+        }
+        memmove(out + 2, out, write_pos + 1);
+        out[0] = '.';
+        out[1] = '\\';
+    }
+    return 1;
+}
+
+static int apply_default_remote_output(Options *opt, const TextData *data) {
+    char source_name[MAX_REMOTE_OUTPUT_UTF8];
+    char original[MAX_REMOTE_OUTPUT_UTF8];
+
+    if (!source_basename_utf8(opt, data, source_name, sizeof(source_name))) {
+        return 0;
+    }
+    if (opt->remote_output_set) {
+        strcpy(original, opt->remote_output);
+        if (!normalize_remote_output_value(original, source_name,
+                                           opt->remote_output, sizeof(opt->remote_output))) {
+            fprintf(stderr, "--remote-output is empty or cannot be normalized.\n");
+            return 0;
+        }
+    } else if (!normalize_remote_output_value(NULL, source_name,
+                                               opt->remote_output, sizeof(opt->remote_output))) {
+        fprintf(stderr, "The default remote output is too long.\n");
+        return 0;
+    }
     return 1;
 }
 
@@ -1110,117 +1205,171 @@ static TextStats analyze_text(const wchar_t *text, int chars) {
     return stats;
 }
 
-static int is_safe_cmd_hex_path(const char *path) {
-    const unsigned char *p = (const unsigned char *)path;
-    const char *segment_start;
+static int remote_component_is_reserved(const char *component, size_t len) {
+    const char *dot = (const char *)memchr(component, '.', len);
+    size_t base_len = dot != NULL ? (size_t)(dot - component) : len;
+    if (base_len == 3 && (_strnicmp(component, "con", 3) == 0 ||
+                          _strnicmp(component, "prn", 3) == 0 ||
+                          _strnicmp(component, "aux", 3) == 0 ||
+                          _strnicmp(component, "nul", 3) == 0)) {
+        return 1;
+    }
+    return base_len == 4 &&
+           (_strnicmp(component, "com", 3) == 0 || _strnicmp(component, "lpt", 3) == 0) &&
+           component[3] >= '1' && component[3] <= '9';
+}
 
-    if (path == NULL || *path == '\0' || strlen(path) > 240 || path[0] == '/' || path[0] == '\\') {
+static int remote_component_valid(const char *component, size_t len) {
+    size_t i;
+    if (len == 0) {
         return 0;
     }
-    if (path[strlen(path) - 1] == '/' || path[strlen(path) - 1] == '\\') {
+    if ((len == 1 && component[0] == '.') ||
+        (len == 2 && component[0] == '.' && component[1] == '.')) {
+        return 1;
+    }
+    if (component[len - 1] == '.' || component[len - 1] == ' ') {
         return 0;
     }
-    segment_start = path;
-    while (*segment_start) {
-        const char *segment_end = segment_start;
-        const char *dot;
-        size_t len;
-        size_t base_len;
-        while (*segment_end && *segment_end != '/' && *segment_end != '\\') {
-            ++segment_end;
-        }
-        len = (size_t)(segment_end - segment_start);
-        if (len == 0 || (len == 1 && segment_start[0] == '.') ||
-            (len == 2 && segment_start[0] == '.' && segment_start[1] == '.')) {
+    for (i = 0; i < len; ++i) {
+        unsigned char ch = (unsigned char)component[i];
+        if (ch < 32 || ch == '<' || ch == '>' || ch == '"' || ch == '|' || ch == '?' || ch == '*') {
             return 0;
         }
-        if (segment_start[0] == '-' || segment_start[len - 1] == '.') {
+    }
+    return !remote_component_is_reserved(component, len);
+}
+
+static int remote_component_is_temporary(const char *component, size_t len) {
+    return (len == strlen(REMOTE_HEX) && _strnicmp(component, REMOTE_HEX, len) == 0) ||
+           (len == strlen(REMOTE_ZIP) && _strnicmp(component, REMOTE_ZIP, len) == 0) ||
+           (len == strlen(REMOTE_STAGE) && _strnicmp(component, REMOTE_STAGE, len) == 0) ||
+           (len == strlen(REMOTE_HELPER_HEX) && _strnicmp(component, REMOTE_HELPER_HEX, len) == 0) ||
+           (len == strlen(REMOTE_HELPER) && _strnicmp(component, REMOTE_HELPER, len) == 0);
+}
+
+static const char *remote_output_name_ptr(const char *target) {
+    const char *slash = strrchr(target, '\\');
+    return slash != NULL ? slash + 1 : target;
+}
+
+static int remote_output_parts(const char *target, char *parent, size_t parent_len,
+                               char *name, size_t name_len) {
+    const char *slash = strrchr(target, '\\');
+    size_t prefix_len;
+    const char *name_start;
+    if (slash == NULL) {
+        if (parent_len < 2) {
             return 0;
         }
-        dot = (const char *)memchr(segment_start, '.', len);
-        base_len = dot != NULL ? (size_t)(dot - segment_start) : len;
-        if ((base_len == 3 && (strncmp(segment_start, "con", 3) == 0 ||
-                              strncmp(segment_start, "prn", 3) == 0 ||
-                              strncmp(segment_start, "aux", 3) == 0 ||
-                              strncmp(segment_start, "nul", 3) == 0)) ||
-            (base_len == 4 &&
-             (strncmp(segment_start, "com", 3) == 0 || strncmp(segment_start, "lpt", 3) == 0) &&
-             segment_start[3] >= '1' && segment_start[3] <= '9')) {
+        strcpy(parent, ".");
+        name_start = target;
+    } else {
+        prefix_len = (size_t)(slash - target);
+        name_start = slash + 1;
+        if (prefix_len == 0) {
+            prefix_len = 1;
+        } else if (prefix_len == 2 && target[1] == ':') {
+            prefix_len = 3;
+        }
+        if (prefix_len + 1 > parent_len) {
             return 0;
         }
-        if (*segment_end == '\0') {
+        memcpy(parent, target, prefix_len);
+        parent[prefix_len] = '\0';
+    }
+    if (strlen(name_start) + 1 > name_len) {
+        return 0;
+    }
+    strcpy(name, name_start);
+    return 1;
+}
+
+static int remote_output_valid(const char *target) {
+    const char *cursor;
+    const char *component;
+    const char *name;
+    size_t target_len;
+    int wide_units;
+    int is_unc;
+    int drive_absolute;
+    int component_count = 0;
+
+    if (target == NULL || *target == '\0') {
+        fprintf(stderr, "--remote-output must not be empty.\n");
+        return 0;
+    }
+    target_len = strlen(target);
+    wide_units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, target, -1, NULL, 0);
+    if (wide_units <= 0) {
+        fprintf(stderr, "--remote-output contains invalid Unicode.\n");
+        return 0;
+    }
+    if (wide_units - 1 > 240) {
+        fprintf(stderr, "--remote-output is longer than 240 UTF-16 code units.\n");
+        return 0;
+    }
+
+    is_unc = target_len >= 2 && target[0] == '\\' && target[1] == '\\';
+    drive_absolute = target_len >= 3 && isalpha((unsigned char)target[0]) &&
+                     target[1] == ':' && target[2] == '\\';
+    if (target_len >= 2 && target[1] == ':' && !drive_absolute) {
+        fprintf(stderr, "--remote-output drive paths must be absolute, for example c:/work/file.txt.\n");
+        return 0;
+    }
+    cursor = target + (is_unc ? 2 : (drive_absolute ? 3 : (target[0] == '\\' ? 1 : 0)));
+    if (strchr(cursor, ':') != NULL) {
+        fprintf(stderr, "--remote-output contains ':' outside a drive prefix.\n");
+        return 0;
+    }
+
+    component = cursor;
+    for (;;) {
+        const char *end = strchr(component, '\\');
+        size_t len = end != NULL ? (size_t)(end - component) : strlen(component);
+        if (!remote_component_valid(component, len)) {
+            fprintf(stderr, "--remote-output contains an invalid, empty, trailing-dot, or reserved path component.\n");
+            return 0;
+        }
+        if (remote_component_is_temporary(component, len)) {
+            fprintf(stderr, "--remote-output uses a reserved temporary name.\n");
+            return 0;
+        }
+        if (is_unc && ((len == 1 && component[0] == '.') ||
+                       (len == 2 && component[0] == '.' && component[1] == '.'))) {
+            fprintf(stderr, "--remote-output UNC paths cannot contain '.' or '..' segments.\n");
+            return 0;
+        }
+        ++component_count;
+        if (end == NULL) {
             break;
         }
-        segment_start = segment_end + 1;
+        component = end + 1;
     }
-    while (*p) {
-        unsigned char ch = *p++;
-        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
-            continue;
-        }
-        if (ch == '.' || ch == '-' || ch == '/' || ch == '\\') {
-            continue;
-        }
+    if (is_unc && component_count < 3) {
+        fprintf(stderr, "--remote-output UNC paths must include server, share, and output name.\n");
+        return 0;
+    }
+
+    name = remote_output_name_ptr(target);
+    if (*name == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        fprintf(stderr, "--remote-output must end with a file or directory name.\n");
         return 0;
     }
     return 1;
 }
 
-static int normalize_remote_directory(char *path, size_t path_len) {
-    size_t i;
-    size_t len;
-    if (path == NULL || path_len == 0) {
-        return 0;
-    }
-    if (strcmp(path, ".") == 0 || strcmp(path, "./") == 0 || strcmp(path, ".\\") == 0) {
-        strcpy(path, ".");
-        return 1;
-    }
-    for (i = 0; path[i] != '\0'; ++i) {
-        if (path[i] == '/') {
-            path[i] = '\\';
+static int remote_output_is_shift_free(const char *target) {
+    const unsigned char *p = (const unsigned char *)target;
+    while (*p != '\0') {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+            *p == '.' || *p == '-' || *p == '\\') {
+            ++p;
+            continue;
         }
-    }
-    if (path[0] != '\\' || path[1] == '\\') {
         return 0;
     }
-    len = strlen(path);
-    while (len > 1 && path[len - 1] == '\\') {
-        path[--len] = '\0';
-    }
-    if (len == 1) {
-        return 1;
-    }
-    return is_safe_cmd_hex_path(path + 1);
-}
-
-static int is_safe_remote_output_name(const char *name) {
-    return name != NULL && strchr(name, '/') == NULL && strchr(name, '\\') == NULL &&
-           strcmp(name, REMOTE_HEX) != 0 && strcmp(name, REMOTE_ZIP) != 0 &&
-           is_safe_cmd_hex_path(name);
-}
-
-static int build_remote_target_path(const Options *opt, char *out, size_t out_len) {
-    int written;
-    if (strcmp(opt->remote_path, ".") == 0) {
-        written = snprintf(out, out_len, "%s", opt->remote_output);
-    } else if (strcmp(opt->remote_path, "\\") == 0) {
-        written = snprintf(out, out_len, "\\%s", opt->remote_output);
-    } else {
-        written = snprintf(out, out_len, "%s\\%s", opt->remote_path, opt->remote_output);
-    }
-    return written >= 0 && (size_t)written < out_len && written <= 240;
-}
-
-static void normalize_remote_path(const char *src, char *dest, size_t dest_len) {
-    size_t i;
-    if (dest_len == 0) {
-        return;
-    }
-    for (i = 0; src[i] != '\0' && i + 1 < dest_len; ++i) {
-        dest[i] = (src[i] == '\\') ? '/' : src[i];
-    }
-    dest[i] = '\0';
+    return 1;
 }
 
 static const char *output_encoding_name(int encoding) {
@@ -1394,150 +1543,344 @@ static int text_data_from_ascii(const char *text, const char *label, TextData *d
     return 1;
 }
 
-static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
-    size_t hex_len = strlen(hex_text);
-    size_t line_count = 0;
-    size_t remote_hex_len = strlen(REMOTE_HEX);
+typedef struct CommandBuffer {
+    char *data;
     size_t cap;
-    size_t pos = 0;
+    size_t pos;
+} CommandBuffer;
+
+static int command_buffer_init(CommandBuffer *buffer, size_t cap) {
+    buffer->data = (char *)malloc(cap);
+    if (buffer->data == NULL) {
+        return 0;
+    }
+    buffer->cap = cap;
+    buffer->pos = 0;
+    buffer->data[0] = '\0';
+    return 1;
+}
+
+static int command_buffer_appendf(CommandBuffer *buffer, const char *format, ...) {
+    va_list args;
+    int written;
+    va_start(args, format);
+    written = vsnprintf(buffer->data + buffer->pos, buffer->cap - buffer->pos, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= buffer->cap - buffer->pos) {
+        return 0;
+    }
+    buffer->pos += (size_t)written;
+    return 1;
+}
+
+static int command_buffer_append_hex(CommandBuffer *buffer, const char *hex_text,
+                                     const char *destination) {
+    size_t hex_len = strlen(hex_text);
     size_t start = 0;
     int first_line = 1;
-    char remote_target[512];
-    char *commands;
-    const char *p;
-
-    if (!build_remote_target_path(opt, remote_target, sizeof(remote_target))) {
-        return NULL;
-    }
-
-    for (p = hex_text; *p != '\0'; ++p) {
-        if (*p == '\n') {
-            ++line_count;
-        }
-    }
-
-    cap = hex_len + line_count * (remote_hex_len + 64) + strlen(opt->remote_path) +
-          strlen(remote_target) * 3 + 1024;
-    commands = (char *)malloc(cap);
-    if (commands == NULL) {
-        return NULL;
-    }
-
-#define APPEND_FMT(...) do { \
-        int written = snprintf(commands + pos, cap - pos, __VA_ARGS__); \
-        if (written < 0 || (size_t)written >= cap - pos) { \
-            free(commands); \
-            return NULL; \
-        } \
-        pos += (size_t)written; \
-    } while (0)
-
-    APPEND_FMT("powershell -noprofile\n");
-
     while (start < hex_len) {
         size_t end = start;
         while (end < hex_len && hex_text[end] != '\n') {
             ++end;
         }
         if (end > start) {
-            APPEND_FMT("%s -encoding ascii '%s' '%.*s'\n",
-                       first_line ? "set-content" : "add-content",
-                       REMOTE_HEX,
-                       (int)(end - start),
-                       hex_text + start);
+            if (!command_buffer_appendf(buffer, "%s -encoding ascii '%s' '%.*s'\n",
+                                        first_line ? "set-content" : "add-content",
+                                        destination, (int)(end - start), hex_text + start)) {
+                return 0;
+            }
             first_line = 0;
         }
         start = end + 1;
     }
+    return 1;
+}
 
-    if (strcmp(opt->remote_path, ".") != 0) {
-        APPEND_FMT("new-item -itemtype directory -force '%s'\n", opt->remote_path);
+static char *powershell_script_literal_alloc(const char *value) {
+    size_t len = strlen(value);
+    char *literal = (char *)malloc(len * 2 + 3);
+    size_t read_pos;
+    size_t write_pos = 0;
+    if (literal == NULL) {
+        return NULL;
     }
-    if (first_line) {
-        APPEND_FMT("set-content -nonewline '%s' ''\nset-content -nonewline '%s' ''\n",
-                   REMOTE_HEX, remote_target);
+    literal[write_pos++] = '\'';
+    for (read_pos = 0; read_pos < len; ++read_pos) {
+        if (value[read_pos] == '\'') {
+            literal[write_pos++] = '\'';
+        }
+        literal[write_pos++] = value[read_pos];
+    }
+    literal[write_pos++] = '\'';
+    literal[write_pos] = '\0';
+    return literal;
+}
+
+static int build_remote_helper(const Options *opt, int transfer_mode, int directory_source,
+                               unsigned char **out_bytes, int *out_count) {
+    char parent[MAX_REMOTE_OUTPUT_UTF8];
+    char name[MAX_REMOTE_OUTPUT_UTF8];
+    char *parent_literal = NULL;
+    char *target_literal = NULL;
+    char *script = NULL;
+    char *escaped = NULL;
+    char *batch = NULL;
+    const char *prefix = "@echo off\r\nsetlocal disabledelayedexpansion\r\nchcp 65001 >nul\r\n"
+                         "powershell -noprofile -noninteractive -command \"";
+    const char *suffix = "\"\r\nexit /b %errorlevel%\r\n";
+    size_t script_cap;
+    size_t escaped_len = 0;
+    size_t batch_len;
+    size_t i;
+    int written;
+    int ok = 0;
+
+    if (!remote_output_parts(opt->remote_output, parent, sizeof(parent), name, sizeof(name))) {
+        return 0;
+    }
+    parent_literal = powershell_script_literal_alloc(parent);
+    target_literal = powershell_script_literal_alloc(opt->remote_output);
+    if (parent_literal == NULL || target_literal == NULL) {
+        goto cleanup;
+    }
+    script_cap = strlen(parent_literal) + strlen(target_literal) * 2 + 1024;
+    script = (char *)malloc(script_cap);
+    if (script == NULL) {
+        goto cleanup;
+    }
+    if (transfer_mode == TRANSFER_CMD_HEX) {
+        written = snprintf(script, script_cap,
+                           "[system.io.directory]::createdirectory(%s);"
+                           "[system.io.file]::copy('%s',%s,$true);"
+                           "certutil -hashfile %s sha256",
+                           parent_literal, REMOTE_STAGE, target_literal, target_literal);
+    } else if (directory_source) {
+        written = snprintf(script, script_cap,
+                           "[system.io.directory]::createdirectory(%s);"
+                           "certutil -hashfile '%s' sha256;"
+                           "expand-archive -force -literalpath '%s' -destinationpath %s",
+                           parent_literal, REMOTE_ZIP, REMOTE_ZIP, target_literal);
     } else {
-        APPEND_FMT("certutil -f -decodehex '%s' '%s'\n", REMOTE_HEX, remote_target);
+        written = snprintf(script, script_cap,
+                           "[system.io.directory]::createdirectory(%s);"
+                           "expand-archive -force -literalpath '%s' -destinationpath %s;"
+                           "certutil -hashfile %s sha256",
+                           parent_literal, REMOTE_ZIP, parent_literal, target_literal);
     }
-    APPEND_FMT("certutil -hashfile '%s' sha256\n", remote_target);
-    APPEND_FMT("remove-item -force '%s'\nexit\n", REMOTE_HEX);
-#undef APPEND_FMT
+    if (written < 0 || (size_t)written >= script_cap) {
+        goto cleanup;
+    }
+    for (i = 0; script[i] != '\0'; ++i) {
+        escaped_len += (script[i] == '^' || script[i] == '%') ? 2U : 1U;
+    }
+    escaped = (char *)malloc(escaped_len + 1);
+    if (escaped == NULL) {
+        goto cleanup;
+    }
+    escaped_len = 0;
+    for (i = 0; script[i] != '\0'; ++i) {
+        if (script[i] == '^' || script[i] == '%') {
+            escaped[escaped_len++] = script[i];
+        }
+        escaped[escaped_len++] = script[i];
+    }
+    escaped[escaped_len] = '\0';
+    batch_len = strlen(prefix) + escaped_len + strlen(suffix);
+    if (batch_len > INT_MAX) {
+        goto cleanup;
+    }
+    batch = (char *)malloc(batch_len + 1);
+    if (batch == NULL) {
+        goto cleanup;
+    }
+    written = snprintf(batch, batch_len + 1, "%s%s%s", prefix, escaped, suffix);
+    if (written < 0 || (size_t)written != batch_len) {
+        goto cleanup;
+    }
+    *out_bytes = (unsigned char *)batch;
+    *out_count = (int)batch_len;
+    batch = NULL;
+    ok = 1;
 
-    return commands;
+cleanup:
+    free(parent_literal);
+    free(target_literal);
+    free(script);
+    free(escaped);
+    free(batch);
+    return ok;
+}
+
+static int command_buffer_append_parent(CommandBuffer *buffer, const Options *opt) {
+    char parent[MAX_REMOTE_OUTPUT_UTF8];
+    char name[MAX_REMOTE_OUTPUT_UTF8];
+    if (!remote_output_parts(opt->remote_output, parent, sizeof(parent), name, sizeof(name))) {
+        return 0;
+    }
+    if (strcmp(parent, ".") == 0) {
+        return 1;
+    }
+    return command_buffer_appendf(buffer, "new-item -itemtype directory -force '%s'\n", parent);
+}
+
+static int command_buffer_append_cleanup(CommandBuffer *buffer, const char *name) {
+    return command_buffer_appendf(buffer, "remove-item -force '%s'\n", name);
+}
+
+static char *build_cmd_hex_commands(const char *hex_text, const Options *opt) {
+    int helper = !remote_output_is_shift_free(opt->remote_output);
+    unsigned char *helper_bytes = NULL;
+    int helper_count = 0;
+    char *helper_hex = NULL;
+    size_t line_count = count_hex_lines(hex_text);
+    size_t helper_lines = 0;
+    size_t cap;
+    CommandBuffer buffer;
+    int has_payload = line_count > 0;
+    int ok = 0;
+
+    if (helper) {
+        if (!build_remote_helper(opt, TRANSFER_CMD_HEX, 0, &helper_bytes, &helper_count)) {
+            return NULL;
+        }
+        helper_hex = bytes_to_plain_hex(helper_bytes, helper_count, opt->hex_chunk_bytes);
+        free(helper_bytes);
+        if (helper_hex == NULL) {
+            return NULL;
+        }
+        helper_lines = count_hex_lines(helper_hex);
+    }
+    cap = strlen(hex_text) + (helper_hex != NULL ? strlen(helper_hex) : 0) +
+          (line_count + helper_lines) * 128 + strlen(opt->remote_output) * 4 + 8192;
+    if (!command_buffer_init(&buffer, cap)) {
+        free(helper_hex);
+        return NULL;
+    }
+    if (!command_buffer_appendf(&buffer, "powershell -noprofile\n") ||
+        !command_buffer_append_hex(&buffer, hex_text, REMOTE_HEX)) {
+        goto cleanup;
+    }
+    if (!helper && !command_buffer_append_parent(&buffer, opt)) {
+        goto cleanup;
+    }
+    if (has_payload) {
+        if (!command_buffer_appendf(&buffer, "certutil -f -decodehex '%s' '%s'\n",
+                                    REMOTE_HEX, helper ? REMOTE_STAGE : opt->remote_output)) {
+            goto cleanup;
+        }
+    } else if (!command_buffer_appendf(&buffer,
+                                       "set-content -nonewline '%s' ''\n"
+                                       "set-content -nonewline '%s' ''\n",
+                                       REMOTE_HEX, helper ? REMOTE_STAGE : opt->remote_output)) {
+        goto cleanup;
+    }
+    if (helper) {
+        if (!command_buffer_append_hex(&buffer, helper_hex, REMOTE_HELPER_HEX) ||
+            !command_buffer_appendf(&buffer, "certutil -f -decodehex '%s' '%s'\n",
+                                    REMOTE_HELPER_HEX, REMOTE_HELPER) ||
+            !command_buffer_appendf(&buffer, "cmd /d /c %s\n", REMOTE_HELPER) ||
+            !command_buffer_append_cleanup(&buffer, REMOTE_HEX) ||
+            !command_buffer_append_cleanup(&buffer, REMOTE_STAGE) ||
+            !command_buffer_append_cleanup(&buffer, REMOTE_HELPER_HEX) ||
+            !command_buffer_append_cleanup(&buffer, REMOTE_HELPER)) {
+            goto cleanup;
+        }
+    } else if (!command_buffer_appendf(&buffer, "certutil -hashfile '%s' sha256\n",
+                                       opt->remote_output) ||
+               !command_buffer_append_cleanup(&buffer, REMOTE_HEX)) {
+        goto cleanup;
+    }
+    if (!command_buffer_appendf(&buffer, "exit\n")) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    free(helper_hex);
+    if (!ok) {
+        free(buffer.data);
+        return NULL;
+    }
+    return buffer.data;
 }
 
 static char *build_zip_hex_commands(const char *hex_text, const Options *opt, int directory_source) {
-    size_t hex_len = strlen(hex_text);
-    size_t line_count = 0;
-    size_t remote_hex_len = strlen(REMOTE_HEX);
-    size_t remote_zip_len = strlen(REMOTE_ZIP);
+    int helper = !remote_output_is_shift_free(opt->remote_output);
+    unsigned char *helper_bytes = NULL;
+    int helper_count = 0;
+    char *helper_hex = NULL;
+    size_t line_count = count_hex_lines(hex_text);
+    size_t helper_lines = 0;
     size_t cap;
-    size_t pos = 0;
-    size_t start = 0;
-    int first_line = 1;
-    char remote_target[512];
-    char *commands;
-    const char *p;
+    CommandBuffer buffer;
+    char parent[MAX_REMOTE_OUTPUT_UTF8];
+    char name[MAX_REMOTE_OUTPUT_UTF8];
+    int ok = 0;
 
-    if (!build_remote_target_path(opt, remote_target, sizeof(remote_target))) {
+    if (!remote_output_parts(opt->remote_output, parent, sizeof(parent), name, sizeof(name))) {
         return NULL;
     }
-
-    for (p = hex_text; *p != '\0'; ++p) {
-        if (*p == '\n') {
-            ++line_count;
+    if (helper) {
+        if (!build_remote_helper(opt, TRANSFER_ZIP_HEX, directory_source,
+                                 &helper_bytes, &helper_count)) {
+            return NULL;
         }
+        helper_hex = bytes_to_plain_hex(helper_bytes, helper_count, opt->hex_chunk_bytes);
+        free(helper_bytes);
+        if (helper_hex == NULL) {
+            return NULL;
+        }
+        helper_lines = count_hex_lines(helper_hex);
     }
-
-    cap = hex_len + line_count * (remote_hex_len + 64) + remote_hex_len * 2 + remote_zip_len * 8 +
-          strlen(opt->remote_path) * 3 + strlen(remote_target) * 3 + 2048;
-    commands = (char *)malloc(cap);
-    if (commands == NULL) {
+    cap = strlen(hex_text) + (helper_hex != NULL ? strlen(helper_hex) : 0) +
+          (line_count + helper_lines) * 128 + strlen(opt->remote_output) * 4 + 8192;
+    if (!command_buffer_init(&buffer, cap)) {
+        free(helper_hex);
         return NULL;
     }
-
-#define APPEND_FMT(...) do { \
-        int written = snprintf(commands + pos, cap - pos, __VA_ARGS__); \
-        if (written < 0 || (size_t)written >= cap - pos) { \
-            free(commands); \
-            return NULL; \
-        } \
-        pos += (size_t)written; \
-    } while (0)
-
-    APPEND_FMT("powershell -noprofile\n");
-
-    while (start < hex_len) {
-        size_t end = start;
-        while (end < hex_len && hex_text[end] != '\n') {
-            ++end;
+    if (!command_buffer_appendf(&buffer, "powershell -noprofile\n") ||
+        !command_buffer_append_hex(&buffer, hex_text, REMOTE_HEX) ||
+        (!helper && !command_buffer_append_parent(&buffer, opt)) ||
+        !command_buffer_appendf(&buffer, "certutil -f -decodehex '%s' '%s'\n",
+                                REMOTE_HEX, REMOTE_ZIP)) {
+        goto cleanup;
+    }
+    if (helper) {
+        if (!command_buffer_append_hex(&buffer, helper_hex, REMOTE_HELPER_HEX) ||
+            !command_buffer_appendf(&buffer, "certutil -f -decodehex '%s' '%s'\n",
+                                    REMOTE_HELPER_HEX, REMOTE_HELPER) ||
+            !command_buffer_appendf(&buffer, "cmd /d /c %s\n", REMOTE_HELPER)) {
+            goto cleanup;
         }
-        if (end > start) {
-            APPEND_FMT("%s -encoding ascii '%s' '%.*s'\n",
-                       first_line ? "set-content" : "add-content",
-                       REMOTE_HEX,
-                       (int)(end - start),
-                       hex_text + start);
-            first_line = 0;
+    } else if (directory_source) {
+        if (!command_buffer_appendf(&buffer,
+                                    "certutil -hashfile '%s' sha256\n"
+                                    "expand-archive -force '%s' '%s'\n",
+                                    REMOTE_ZIP, REMOTE_ZIP, opt->remote_output)) {
+            goto cleanup;
         }
-        start = end + 1;
+    } else if (!command_buffer_appendf(&buffer,
+                                       "expand-archive -force '%s' '%s'\n"
+                                       "certutil -hashfile '%s' sha256\n",
+                                       REMOTE_ZIP, parent, opt->remote_output)) {
+        goto cleanup;
     }
+    if (!command_buffer_append_cleanup(&buffer, REMOTE_HEX) ||
+        !command_buffer_append_cleanup(&buffer, REMOTE_ZIP) ||
+        (helper && (!command_buffer_append_cleanup(&buffer, REMOTE_HELPER_HEX) ||
+                    !command_buffer_append_cleanup(&buffer, REMOTE_HELPER))) ||
+        !command_buffer_appendf(&buffer, "exit\n")) {
+        goto cleanup;
+    }
+    ok = 1;
 
-    if (strcmp(opt->remote_path, ".") != 0) {
-        APPEND_FMT("new-item -itemtype directory -force '%s'\n", opt->remote_path);
+cleanup:
+    free(helper_hex);
+    if (!ok) {
+        free(buffer.data);
+        return NULL;
     }
-    APPEND_FMT("certutil -f -decodehex '%s' '%s'\n", REMOTE_HEX, REMOTE_ZIP);
-    if (directory_source) {
-        APPEND_FMT("certutil -hashfile '%s' sha256\nexpand-archive -force '%s' '%s'\n",
-                   REMOTE_ZIP, REMOTE_ZIP, remote_target);
-    } else {
-        APPEND_FMT("expand-archive -force '%s' '%s'\ncertutil -hashfile '%s' sha256\n",
-                   REMOTE_ZIP, opt->remote_path, remote_target);
-    }
-    APPEND_FMT("remove-item -force '%s'\nremove-item -force '%s'\nexit\n", REMOTE_HEX, REMOTE_ZIP);
-#undef APPEND_FMT
-
-    return commands;
+    return buffer.data;
 }
 
 static int generated_command_char_allowed(unsigned char ch) {
@@ -1682,10 +2025,28 @@ static int write_binary_file_w(const wchar_t *path, const unsigned char *bytes, 
 
 static int run_local_zip_command(const wchar_t *working_dir, const wchar_t *entry_name) {
     wchar_t command[4096];
+    wchar_t escaped_entry[520];
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     DWORD exit_code;
+    size_t read_pos;
+    size_t write_pos = 0;
     int written;
+
+    for (read_pos = 0; entry_name[read_pos] != L'\0'; ++read_pos) {
+        if (entry_name[read_pos] == L'\'') {
+            if (write_pos + 2 >= sizeof(escaped_entry) / sizeof(escaped_entry[0])) {
+                fprintf(stderr, "Remote output name is too long for local zip compression.\n");
+                return 0;
+            }
+            escaped_entry[write_pos++] = L'\'';
+        } else if (write_pos + 1 >= sizeof(escaped_entry) / sizeof(escaped_entry[0])) {
+            fprintf(stderr, "Remote output name is too long for local zip compression.\n");
+            return 0;
+        }
+        escaped_entry[write_pos++] = entry_name[read_pos];
+    }
+    escaped_entry[write_pos] = L'\0';
 
     written = _snwprintf(
         command,
@@ -1695,7 +2056,7 @@ static int run_local_zip_command(const wchar_t *working_dir, const wchar_t *entr
         L"$z=[System.IO.Compression.ZipFile]::Open('tt.zip','Create'); "
         L"[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z,'tt.raw','%ls'); "
         L"$z.Dispose()\"",
-        entry_name);
+        escaped_entry);
     if (written < 0 || written >= (int)(sizeof(command) / sizeof(command[0]))) {
         fprintf(stderr, "Local PowerShell zip command is too long.\n");
         return 0;
@@ -1800,15 +2161,15 @@ static int make_local_zip_payload(const unsigned char *bytes,
     wchar_t raw_path[MAX_PATH];
     wchar_t zip_path[MAX_PATH];
     wchar_t entry_name[260];
-    char normalized_output[260];
+    const char *entry_utf8;
     DWORD len;
     int raw_path_len;
     int zip_path_len;
     int ok = 0;
 
-    normalize_remote_path(remote_output, normalized_output, sizeof(normalized_output));
-    if (!ascii_to_wide(normalized_output, entry_name, sizeof(entry_name) / sizeof(entry_name[0]))) {
-        fprintf(stderr, "Remote output path could not be converted for zip entry creation.\n");
+    entry_utf8 = remote_output_name_ptr(remote_output);
+    if (!arg_to_wide_path(entry_utf8, entry_name, sizeof(entry_name) / sizeof(entry_name[0]))) {
+        fprintf(stderr, "Remote output name could not be converted for zip entry creation.\n");
         return 0;
     }
 
@@ -1948,20 +2309,12 @@ static int validate_text(const TextData *data, const TextStats *stats, const Opt
     }
 
     if (opt->transfer_mode == TRANSFER_CMD_HEX || opt->transfer_mode == TRANSFER_ZIP_HEX) {
-        char remote_target[512];
         if (opt->output_encoding == OUTPUT_PRESERVE && data->kind != DATA_FILE_BYTES &&
             data->kind != DATA_DIRECTORY) {
             fprintf(stderr, "--output-encoding preserve requires file input; clipboard text has no original bytes.\n");
             return EXIT_ARGS;
         }
-        if (!is_safe_remote_output_name(opt->remote_output)) {
-            fprintf(stderr, "--remote-output must be one cmd-safe name using only lowercase letters, digits, '.', or '-'.\n");
-            fprintf(stderr, "It cannot contain a directory or be named tt.hex or tt.zip.\n");
-            fprintf(stderr, "Example: trans.txt\n");
-            return EXIT_ARGS;
-        }
-        if (!build_remote_target_path(opt, remote_target, sizeof(remote_target))) {
-            fprintf(stderr, "The combined --remote-path and --remote-output path is longer than 240 characters.\n");
+        if (!remote_output_valid(opt->remote_output)) {
             return EXIT_ARGS;
         }
         return EXIT_OK;
@@ -2003,25 +2356,23 @@ static void print_summary(const TextData *data, const TextStats *stats, const Op
     printf("Delay: %d ms per character, %d ms per line\n", opt->delay_ms, opt->line_delay_ms);
     printf("Focus check: %s\n", opt->no_focus_check ? "off" : "on");
     if (opt->transfer_mode == TRANSFER_CMD_HEX) {
-        char remote_target[512];
-        build_remote_target_path(opt, remote_target, sizeof(remote_target));
         printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
         printf("Output encoding: %s\n", output_encoding_name(opt->output_encoding));
-        printf("Remote path: %s\n", opt->remote_path);
-        printf("Remote output: %s\n", remote_target);
+        printf("Remote output: %s\n", opt->remote_output);
+        printf("Path transport: %s\n",
+               remote_output_is_shift_free(opt->remote_output) ? "direct" : "hex helper");
         printf("Hex chunk: %d bytes per generated line\n", opt->hex_chunk_bytes);
     } else if (opt->transfer_mode == TRANSFER_ZIP_HEX) {
-        char remote_target[512];
-        build_remote_target_path(opt, remote_target, sizeof(remote_target));
         printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
-        printf("Remote path: %s\n", opt->remote_path);
         if (data->kind == DATA_DIRECTORY) {
             printf("Output encoding: directory file bytes preserved\n");
-            printf("Remote destination directory: %s\n", remote_target);
+            printf("Remote destination directory: %s\n", opt->remote_output);
         } else {
             printf("Output encoding: %s\n", output_encoding_name(opt->output_encoding));
-            printf("Remote output: %s\n", remote_target);
+            printf("Remote output: %s\n", opt->remote_output);
         }
+        printf("Path transport: %s\n",
+               remote_output_is_shift_free(opt->remote_output) ? "direct" : "hex helper");
         printf("Hex chunk: %d bytes per generated line\n", opt->hex_chunk_bytes);
     } else if (opt->legacy_keys) {
         printf("Input mode: Legacy keybd_event ASCII keys\n");
@@ -2557,7 +2908,6 @@ static int type_generated_ascii(const char *text, const char *label, const Optio
     opt.has_commands_out = 0;
     opt.enter_unicode = 0;
     opt.remote_output_set = 0;
-    strcpy(opt.remote_path, ".");
     if (!opt.ascii_keys) {
         opt.legacy_keys = 1;
         opt.ascii_keys = 0;
@@ -2582,12 +2932,7 @@ static int run_cmd_hex_transfer(const TextData *data, const Options *opt) {
     char digest_hex[65];
     int byte_count = 0;
     size_t hex_line_count = 0;
-    char remote_target[512];
     int rc;
-
-    if (!build_remote_target_path(opt, remote_target, sizeof(remote_target))) {
-        return EXIT_ARGS;
-    }
 
     if (!make_output_bytes(data, opt, &bytes, &byte_count)) {
         fprintf(stderr, "Input could not be converted to the selected output encoding.\n");
@@ -2610,7 +2955,7 @@ static int run_cmd_hex_transfer(const TextData *data, const Options *opt) {
 
     printf("cmd-hex transfer mode.\n");
     printf("Output bytes to transfer: %d\n", byte_count);
-    printf("Remote output: %s\n", remote_target);
+    printf("Remote output: %s\n", opt->remote_output);
     printf("Hex chunk: %d bytes per generated line (%u line(s))\n", opt->hex_chunk_bytes, (unsigned int)hex_line_count);
     printf("Expected SHA-256: %s\n", digest_hex);
     printf("Remote temporary %s is deleted after reconstruction.\n", REMOTE_HEX);
@@ -2676,12 +3021,7 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
     size_t hex_line_count = 0;
     double ratio;
     int directory_source = data->kind == DATA_DIRECTORY;
-    char remote_target[512];
     int rc;
-
-    if (!build_remote_target_path(opt, remote_target, sizeof(remote_target))) {
-        return EXIT_ARGS;
-    }
 
     if (directory_source) {
         byte_count = data->bytes;
@@ -2723,7 +3063,7 @@ static int run_zip_hex_transfer(const TextData *data, const Options *opt) {
     printf("zip-hex transfer mode.\n");
     printf("Output bytes before zip: %d\n", byte_count);
     printf("Zip bytes to transfer: %d (%.2f%% of output size)\n", zip_count, ratio);
-    printf("Remote output: %s\n", remote_target);
+    printf("Remote output: %s\n", opt->remote_output);
     printf("Hex chunk: %d bytes per generated line (%u line(s))\n", opt->hex_chunk_bytes, (unsigned int)hex_line_count);
     if (directory_source) {
         printf("Expected archive SHA-256: %s\n", digest_hex);

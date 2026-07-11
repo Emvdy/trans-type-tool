@@ -99,8 +99,8 @@ this shape:
 powershell -noprofile
 set-content -encoding ascii 'tt.hex' '...lowercase hex...'
 add-content -encoding ascii 'tt.hex' '...lowercase hex...'
-certutil -f -decodehex 'tt.hex' 'trans.txt'
-certutil -hashfile 'trans.txt' sha256
+certutil -f -decodehex 'tt.hex' '.\trans.txt'
+certutil -hashfile '.\trans.txt' sha256
 remove-item -force 'tt.hex'
 exit
 ```
@@ -117,7 +117,7 @@ Remote Windows runs:
 ```powershell
 certutil -f -decodehex 'tt.hex' 'tt.zip'
 expand-archive -force 'tt.zip' .
-certutil -hashfile 'trans.txt' sha256
+certutil -hashfile '.\trans.txt' sha256
 remove-item -force 'tt.hex'
 remove-item -force 'tt.zip'
 ```
@@ -132,7 +132,7 @@ directory itself:
 
 ```powershell
 certutil -hashfile 'tt.zip' sha256
-expand-archive -force 'tt.zip' 'copied-dir'
+expand-archive -force 'tt.zip' '.\copied-dir'
 ```
 
 The displayed expected hash is the ZIP archive hash. Matching it proves the hex
@@ -148,32 +148,51 @@ uppercase or Unicode; they are hex-encoded and never appear literally in the
 typed command stream. Names must still be valid on the target Windows filesystem.
 
 Neither complex mode executes the reconstructed file. The fixed intermediate
-files are `tt.hex` and, for `zip-hex`, `tt.zip`; the generated stream deletes
-them after reconstruction or extraction. If typing is aborted before those
-cleanup commands are sent, remove any partial intermediate files before retrying.
+files are `tt.hex` and, for `zip-hex`, `tt.zip`. A target path that cannot be
+typed without Shift additionally uses an internal `tt.cmd.hex`/`tt.cmd` helper;
+`cmd-hex` also stages data as `tt.out`. The helper only creates directories,
+moves/extracts the reconstructed data, and prints a hash. It never executes the
+user file. The generated stream deletes all intermediates after reconstruction
+or extraction. If typing is aborted before cleanup, remove any partial `tt.*`
+intermediates before retrying.
 
 ## Remote output and path
 
-`--remote-output` is one file or directory name, not a path. Its default depends
-on the source:
+`--remote-output TARGET` combines the former output-name and parent-path
+options. The old separate parent-path option has been removed. The default
+target depends on the source:
 
 ```text
-clipboard                 trans.txt
---source file             trans.txt
---source <local-path>     basename of the local file or directory
+clipboard                 .\trans.txt
+--source file             .\trans.txt
+--source <local-path>     .\<local-basename>
 ```
 
-The derived or explicit name must contain only lowercase letters, digits, `.`
-and `-`. It cannot be `tt.hex` or `tt.zip`. If the local basename contains
-uppercase, Unicode, spaces, or another unsupported character, supply an explicit
-safe name with `--remote-output`.
+`TARGET` may be a new name, a relative path, a current-drive rooted path, a
+drive-letter absolute path, or a UNC path. `/` and `\` are both accepted and
+normalized to Windows separators. A target ending in `/` or `\`, or exactly `.`
+or `..`, is treated as a directory and receives the local source basename:
 
-`--remote-path` selects the remote parent directory. It defaults to `./`. To
-avoid every Shift-required character in the typed stream, the only other form is
-a lowercase current-drive rooted path such as `\work\drop`. Drive-letter paths
-such as `c:\work\drop` are rejected because `:` requires Shift; UNC, relative,
-and traversal paths are also rejected. Complex modes create a missing remote
-directory before reconstruction.
+```text
+option omitted                         .\source.bin
+--remote-output renamed.bin            .\renamed.bin
+--remote-output ../                    ..\source.bin
+--remote-output ../renamed.bin         ..\renamed.bin
+--remote-output c:/work/drop/          c:\work\drop\source.bin
+--remote-output c:/work/drop/file.bin  c:\work\drop\file.bin
+```
+
+Missing parent directories are created. Invalid Windows components, reserved
+device names, trailing dots/spaces, malformed drive/UNC paths, and the fixed
+temporary names are rejected before typing. `--remote-output` applies only to
+`cmd-hex` and `zip-hex`; `simple` types text directly and creates no file.
+
+Shift-free lowercase targets use the shorter direct protocol. Targets containing
+uppercase, spaces, `_`, `:`, Unicode, or other modifier-dependent characters use
+the hex-encoded internal helper. The literal complex path therefore never
+appears in the simulated outer key stream, which remains lowercase and
+Shift-free. The helper adds typing overhead, so a lowercase relative target is
+faster when the final location/name is flexible.
 
 ## Windows use
 
@@ -206,12 +225,13 @@ Copy an arbitrary file byte for byte, or copy a directory tree:
 ```bat
 trans_type.exe --mode cmd-hex --source C:\path\to\tool.exe --output-encoding preserve
 trans_type.exe --mode zip-hex --source C:\path\to\data
-trans_type.exe --mode cmd-hex --source C:\path\to\input.txt --remote-output input.txt --remote-path \work\drop
+trans_type.exe --mode cmd-hex --source C:\path\to\input.txt --remote-output ../
+trans_type.exe --mode zip-hex --source C:\path\to\tool.exe --output-encoding preserve --remote-output C:/Drop Folder/tool.exe
 ```
 
 The local `--source` path may be a normal Windows path and is never typed into the
-RDP session. Only the separately validated remote output name and path appear in
-the generated command stream.
+RDP session. A shift-free target appears in the generated command stream;
+otherwise only its lowercase hex-encoded helper representation is typed.
 
 ## macOS use
 
@@ -229,7 +249,8 @@ macOS defaults to local clipboard input. Use `trans.txt` or another file with:
 ./trans_type_mac --mode cmd-hex --source /path/to/input.txt
 ./trans_type_mac --mode zip-hex --source /path/to/input.txt
 ./trans_type_mac --mode zip-hex --source /path/to/data
-./trans_type_mac --mode cmd-hex --source /path/to/input.txt --remote-output input.txt --remote-path '\work\drop'
+./trans_type_mac --mode cmd-hex --source /path/to/input.txt --remote-output '../'
+./trans_type_mac --mode zip-hex --source /path/to/data --remote-output 'C:/Drop Folder/'
 ```
 
 Simple mode never automatically switches to Unicode. `--input-mode unicode` is

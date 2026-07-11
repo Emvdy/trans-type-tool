@@ -95,24 +95,35 @@ retained for explicit diagnostics and does not bypass strict simple validation.
 
 ## Remote output and path
 
-Clipboard input defaults to remote `trans.txt`. A path source defaults to its
-local basename. `--remote-output` overrides that basename but accepts one safe
-lowercase name only, not a path; allowed characters are lowercase letters,
-digits, `.` and `-`. Names `tt.hex` and `tt.zip` are reserved.
+Clipboard input defaults to remote `.\trans.txt`. A path source defaults to
+`.\<local-basename>`. `--remote-output TARGET` selects both the remote name and
+location; the former separate path option has been removed.
 
-`--remote-path` defaults to `./`. It can instead be a lowercase current-drive
-rooted Windows path such as `\work\drop`:
+Both slash styles are accepted. A target ending in `/` or `\`, or exactly `.`
+or `..`, is a directory target and receives the source basename:
 
 ```sh
 ./trans_type_mac --mode cmd-hex --source /path/to/input.txt \
-  --remote-output input.txt --remote-path '\work\drop'
+  --remote-output '../'
+./trans_type_mac --mode zip-hex --source /path/to/input.bin \
+  --output-encoding preserve --remote-output 'C:/Drop Folder/output.bin'
 ```
 
-Drive-letter paths contain a Shift-required colon, so `c:\work\drop` is
-rejected. UNC, relative, and traversal paths are also rejected. The generated
-PowerShell stream creates a missing remote directory. Its fixed intermediate
-files, `tt.hex` and `tt.zip`, are deleted after reconstruction; if typing is
-aborted before cleanup is sent, remove partial files before retrying.
+The accepted forms include a name, relative path, current-drive rooted path,
+drive-letter absolute path, and UNC path. Missing parents are created. Malformed
+Windows paths, reserved device names, trailing dots/spaces, and fixed temporary
+names are rejected.
+
+A lowercase target containing only unmodified keys uses the shorter direct
+protocol. Uppercase, spaces, `_`, `:`, Unicode, and other modifier-dependent
+characters select an internal hex-encoded `tt.cmd` helper. The literal path does
+not appear in the simulated outer stream, so that stream remains lowercase and
+Shift-free. Helper transfers also use `tt.cmd.hex`; `cmd-hex` stages data in
+`tt.out`. All fixed intermediates are deleted after success. If typing is
+aborted before cleanup, remove partial `tt.*` files before retrying.
+
+`--remote-output` is valid only in `cmd-hex` and `zip-hex`. Simple mode creates
+no remote file.
 
 ## Encoding and auditing
 
@@ -189,7 +200,7 @@ The binary verifier checks:
 - `zip-hex` archive contents
 - UTF-8, UTF-8 BOM, and byte-preserving output
 - arbitrary binary files and nested directory ZIP payloads
-- source-basename defaults, remote path composition, and temporary-file cleanup
+- source-basename defaults, merged target paths, helper isolation, and temporary-file cleanup
 
 These dry-run tests do not post keyboard events.
 
