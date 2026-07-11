@@ -10,7 +10,7 @@ import sys
 import time
 import zipfile
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 EXIT_OK = 0
 EXIT_ARGS = 2
@@ -28,19 +28,22 @@ ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024
 DEFAULT_HEX_CHUNK_BYTES = 240
 MAX_HEX_CHUNK_BYTES = 2048
 MAX_DIRECTORY_ENTRIES = 10000
+REMOTE_HEX = "tt.hex"
+REMOTE_ZIP = "tt.zip"
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 
 VK_TAB = 0x09
+VK_BACK = 0x08
 VK_RETURN = 0x0D
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12
-VK_PAUSE = 0x13
 VK_CAPITAL = 0x14
 VK_ESCAPE = 0x1B
+VK_SPACE = 0x20
 VK_F24 = 0x87
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL = 25
@@ -58,8 +61,8 @@ class Options:
     file_path: Path | None
     mode: str
     remote_output: str
-    remote_hex: str
-    remote_zip: str
+    remote_output_set: bool
+    remote_path: str
     output_encoding: str
     commands_out: Path | None
     hex_chunk_bytes: int
@@ -151,17 +154,19 @@ def parse_args(argv: list[str]) -> Options:
             "    文件/files   : 直接输入，不创建远端文件 / direct typing; no remote file\n"
             "  cmd-hex:\n"
             "    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file\n"
-            "    文件/files   : 输出 trans.txt，临时 tt.hex / output trans.txt; temporary tt.hex\n"
+            "    文件/files   : 输出名默认跟随来源；中间文件自动删除 / output follows source; temp deleted\n"
             "  zip-hex (文本或文件 / text or file):\n"
             "    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file\n"
-            "    文件/files   : 输出 trans.txt，临时 tt.hex、tt.zip / output trans.txt; temporary tt.hex, tt.zip\n"
+            "    文件/files   : 输出名默认跟随来源；中间文件自动删除 / output follows source; temp deleted\n"
             "  zip-hex (目录 / directory):\n"
             "    内容/content : 一个真实目录，不允许链接 / one real directory; no links\n"
-            "    文件/files   : 解压到 --remote-output；临时 tt.hex、tt.zip / destination folder; temporary files\n"
-            "  上述文件名是默认值，可用 --remote-* 修改；目录建议显式设置 --remote-output。\n"
-            "  These are defaults and can be changed with --remote-*; set a folder destination explicitly.\n\n"
-            "本地默认 / local defaults: source=trans.txt，commands-out=unset，focus-check=on。\n\n"
-            "运行控制 / runtime controls: Esc 中止/abort，Pause/Break 暂停/pause。"
+            "    文件/files   : 解压到来源同名目录；中间文件自动删除 / source-named folder; temp deleted\n"
+            "  clipboard 默认输出 trans.txt；路径来源默认输出本地 basename。\n"
+            "  Clipboard defaults to trans.txt; path sources default to the local basename.\n\n"
+            "  中间文件/intermediates: cmd-hex=tt.hex; zip-hex=tt.hex+tt.zip; 自动删除/deleted.\n"
+            "  remote-output 仅名称/name only；remote-path 仅 ./ 或 \\lowercase\\path。\n\n"
+            "本地默认 / local defaults: source=trans.txt，remote-path=./，commands-out=unset。\n\n"
+            "运行控制 / runtime controls: Esc 中止/abort，Space 暂停或继续/pause or resume。"
         ),
     )
     parser._optionals.title = "选项 / options"
@@ -179,20 +184,19 @@ def parse_args(argv: list[str]) -> Options:
         metavar="SOURCE",
         help="来源：clipboard、file(trans.txt)或本地路径 / source selector (default: file)",
     )
-    parser.add_argument("--file", metavar="PATH", type=Path,
-                        help="--source PATH 的兼容别名 / compatibility alias (default: unset)")
     parser.add_argument("--mode", metavar="MODE", choices=("simple", "cmd-hex", "zip-hex", "complex", "cmd", "zip"), default="simple",
                         help="传输模式 / simple, cmd-hex, or zip-hex (default: simple)")
     parser.add_argument(
         "--remote-output",
-        metavar="PATH",
-        default="trans.txt",
-        help="远端文件或目录 / remote file or folder destination (default: trans.txt)",
+        metavar="NAME",
+        help="远端输出名称 / output name (default: clipboard=trans.txt, path=basename)",
     )
-    parser.add_argument("--remote-hex", metavar="PATH", default="tt.hex",
-                        help="远端临时 hex / remote temporary hex (default: tt.hex)")
-    parser.add_argument("--remote-zip", metavar="PATH", default="tt.zip",
-                        help="远端临时 zip / remote temporary zip (default: tt.zip)")
+    parser.add_argument(
+        "--remote-path",
+        metavar="PATH",
+        default=".",
+        help="远端当前驱动器绝对目录 / absolute directory (default: ./)",
+    )
     parser.add_argument(
         "--output-encoding",
         choices=("utf8", "utf8-bom", "preserve"),
@@ -241,12 +245,7 @@ def parse_args(argv: list[str]) -> Options:
         mode = "simple"
 
     source_arg = args.source
-    if args.file is not None:
-        if source_arg not in (None, "file"):
-            parser.error("--file cannot be combined with --source clipboard or --source PATH")
-        source = "file"
-        file_path = args.file
-    elif source_arg in (None, "file"):
+    if source_arg in (None, "file"):
         source = "file"
         file_path = None
     elif source_arg == "clipboard":
@@ -255,6 +254,43 @@ def parse_args(argv: list[str]) -> Options:
     else:
         source = "file"
         file_path = Path(source_arg)
+
+    if args.remote_output is not None:
+        remote_output = args.remote_output
+    elif source == "clipboard" or file_path is None:
+        remote_output = "trans.txt"
+    elif "\\" in source_arg:
+        remote_output = PureWindowsPath(source_arg).name
+    else:
+        remote_output = Path(source_arg).name
+    if not remote_output:
+        parser.error("Cannot derive --remote-output from the source path; specify --remote-output NAME")
+
+    remote_path = normalize_remote_path(args.remote_path)
+    if remote_path is None:
+        parser.error(
+            "--remote-path must be ./ or a lowercase current-drive absolute path such as \\work\\drop; "
+            "drive-letter paths contain ':' and cannot be typed without Shift"
+        )
+
+    if mode == "simple" and (args.remote_output is not None or remote_path != "."):
+        parser.error("--remote-output and --remote-path are only valid with cmd-hex or zip-hex")
+    if mode == "simple" and args.commands_out is not None:
+        parser.error("--commands-out is only valid with --mode cmd-hex or --mode zip-hex")
+    if mode in ("cmd-hex", "zip-hex"):
+        if not is_safe_remote_output_name(remote_output):
+            parser.error(
+                "--remote-output must be one cmd-safe name using only lowercase letters, "
+                "digits, '.', or '-'; it cannot be tt.hex or tt.zip"
+            )
+        if remote_path == ".":
+            remote_target = remote_output
+        elif remote_path == "\\":
+            remote_target = "\\" + remote_output
+        else:
+            remote_target = remote_path + "\\" + remote_output
+        if len(remote_target) > 240:
+            parser.error("the combined --remote-path and --remote-output path is longer than 240 characters")
 
     if args.output_encoding == "preserve" and mode == "simple":
         parser.error("--output-encoding preserve is only valid with --mode cmd-hex or --mode zip-hex")
@@ -268,9 +304,9 @@ def parse_args(argv: list[str]) -> Options:
         source=source,
         file_path=file_path,
         mode=mode,
-        remote_output=args.remote_output,
-        remote_hex=args.remote_hex,
-        remote_zip=args.remote_zip,
+        remote_output=remote_output,
+        remote_output_set=args.remote_output is not None,
+        remote_path=remote_path,
         output_encoding=args.output_encoding,
         commands_out=args.commands_out,
         hex_chunk_bytes=args.hex_chunk_bytes,
@@ -569,6 +605,37 @@ def is_safe_cmd_hex_path(path: str) -> bool:
     return True
 
 
+def normalize_remote_path(path: str) -> str | None:
+    if path in (".", "./", ".\\"):
+        return "."
+    normalized = path.replace("/", "\\")
+    if not normalized.startswith("\\") or normalized.startswith("\\\\"):
+        return None
+    if normalized != "\\":
+        normalized = normalized.rstrip("\\")
+        relative = normalized[1:]
+        if not is_safe_cmd_hex_path(relative):
+            return None
+    return normalized
+
+
+def is_safe_remote_output_name(name: str) -> bool:
+    return (
+        "/" not in name
+        and "\\" not in name
+        and is_safe_cmd_hex_path(name)
+        and name not in (REMOTE_HEX, REMOTE_ZIP)
+    )
+
+
+def remote_target_path(opt: Options) -> str:
+    if opt.remote_path == ".":
+        return opt.remote_output
+    if opt.remote_path == "\\":
+        return "\\" + opt.remote_output
+    return opt.remote_path + "\\" + opt.remote_output
+
+
 SHIFT_FREE_SIMPLE_PUNCTUATION = set(" `-=[]\\;',./")
 GENERATED_COMMAND_PUNCTUATION = set(" \r\n-./\\'")
 
@@ -591,7 +658,7 @@ def validate_generated_command_stream(text: str) -> None:
 def output_bytes(data: TextData, opt: Options) -> bytes:
     if opt.output_encoding == "preserve":
         if data.raw_bytes is None:
-            raise RuntimeError("--output-encoding preserve requires --source file or --file.")
+            raise RuntimeError("--output-encoding preserve requires a file path supplied through --source.")
         return data.raw_bytes
     encoded = data.text.encode("utf-8", errors="strict")
     if opt.output_encoding == "utf8-bom":
@@ -600,28 +667,16 @@ def output_bytes(data: TextData, opt: Options) -> bytes:
 
 
 def validate_complex_paths(opt: Options, directory_source: bool = False) -> None:
-    if not is_safe_cmd_hex_path(opt.remote_output):
+    if not is_safe_remote_output_name(opt.remote_output):
         noun = "directory" if directory_source else "file"
         raise RuntimeError(
-            f"--remote-output must be a relative cmd-safe {noun} path using only lowercase letters, "
-            "digits, '.', '-', '/', or '\\'. Example: trans.txt"
+            f"--remote-output must be one cmd-safe {noun} name using only lowercase letters, "
+            "digits, '.', or '-'. It cannot be tt.hex or tt.zip. Example: trans.txt"
         )
-    if not is_safe_cmd_hex_path(opt.remote_hex):
-        raise RuntimeError(
-            "--remote-hex must be a relative cmd-safe path using only lowercase letters, "
-            "digits, '.', '-', '/', or '\\'. Example: tt.hex"
-        )
-    if opt.mode == "zip-hex":
-        if not is_safe_cmd_hex_path(opt.remote_zip):
-            raise RuntimeError(
-                "--remote-zip must be a relative cmd-safe path using only lowercase letters, "
-                "digits, '.', '-', '/', or '\\'. Example: tt.zip"
-            )
-        paths = [opt.remote_output, opt.remote_hex, opt.remote_zip]
-        if len({path.lower().replace("\\", "/") for path in paths}) != len(paths):
-            raise RuntimeError("--remote-output, --remote-hex, and --remote-zip must be different paths.")
-    elif opt.remote_output.lower().replace("\\", "/") == opt.remote_hex.lower().replace("\\", "/"):
-        raise RuntimeError("--remote-output and --remote-hex must be different files.")
+    if normalize_remote_path(opt.remote_path) != opt.remote_path:
+        raise RuntimeError("--remote-path is not a normalized safe current-drive absolute path.")
+    if len(remote_target_path(opt)) > 240:
+        raise RuntimeError("The combined --remote-path and --remote-output path is longer than 240 characters.")
 
 
 def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
@@ -662,6 +717,8 @@ def validate_text(data: TextData, stats: TextStats, opt: Options) -> None:
         return
     if opt.commands_out is not None:
         raise RuntimeError("--commands-out is only valid with --mode cmd-hex or --mode zip-hex.")
+    if opt.remote_output_set or opt.remote_path != ".":
+        raise RuntimeError("--remote-output and --remote-path are only valid with cmd-hex or zip-hex.")
     for index, ch in enumerate(data.text):
         if ch in "\r\n\t" or is_shift_free_simple_char(ch):
             continue
@@ -692,19 +749,18 @@ def print_summary(data: TextData, stats: TextStats, opt: Options) -> None:
     if opt.mode == "cmd-hex":
         print("Mode: cmd-hex transfer through remote cmd/certutil")
         print(f"Output encoding: {opt.output_encoding}")
-        print(f"Remote output: {opt.remote_output}")
-        print(f"Remote temporary hex: {opt.remote_hex}")
+        print(f"Remote path: {opt.remote_path}")
+        print(f"Remote output: {remote_target_path(opt)}")
         print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line")
     elif opt.mode == "zip-hex":
         print("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive")
+        print(f"Remote path: {opt.remote_path}")
         if data.source_kind == "directory":
             print("Output encoding: directory file bytes preserved")
-            print(f"Remote destination directory: {opt.remote_output}")
+            print(f"Remote destination directory: {remote_target_path(opt)}")
         else:
             print(f"Output encoding: {opt.output_encoding}")
-            print(f"Remote output: {opt.remote_output}")
-        print(f"Remote temporary hex: {opt.remote_hex}")
-        print(f"Remote temporary zip: {opt.remote_zip}")
+            print(f"Remote output: {remote_target_path(opt)}")
         print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line")
     elif opt.legacy_keys:
         input_mode = "Legacy keybd_event ASCII keys"
@@ -1115,22 +1171,92 @@ def pause_and_recapture(win: WinKeyboard, opt: Options, reason: str) -> tuple[in
     return prepare_target_window(win, opt)
 
 
+def send_pause_backspace(win: WinKeyboard, opt: Options) -> None:
+    if opt.legacy_keys:
+        win.legacy_vk(VK_BACK)
+    else:
+        win.send_vk(VK_BACK, "pause Space cleanup Backspace")
+
+
+def wait_for_space_release(win: WinKeyboard, target: TargetWindow, opt: Options) -> int:
+    while win.get_async_key_state(VK_SPACE) & 0x8000:
+        if win.get_async_key_state(VK_ESCAPE) & 0x8000:
+            return EXIT_ABORTED
+        if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
+            return EXIT_ABORTED
+        time.sleep(0.01)
+    return EXIT_OK
+
+
+def pause_until_space(win: WinKeyboard, opt: Options, target: TargetWindow) -> tuple[int, TargetWindow]:
+    rc = wait_for_space_release(win, target, opt)
+    if rc != EXIT_OK:
+        return rc, target
+    if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
+        print("\nForeground window changed while handling Space; aborting.", file=sys.stderr)
+        return EXIT_ABORTED, target
+    try:
+        send_pause_backspace(win, opt)
+    except RuntimeError as exc:
+        print(f"\nCould not erase the pause Space from the target: {exc}", file=sys.stderr)
+        return EXIT_INPUT, target
+
+    print("\nPaused. Press Space again to continue; Esc aborts.")
+    while True:
+        if win.get_async_key_state(VK_ESCAPE) & 0x8000:
+            return EXIT_ABORTED, target
+        if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
+            print("\nForeground window changed while paused; aborting.", file=sys.stderr)
+            return EXIT_ABORTED, target
+        if win.get_async_key_state(VK_SPACE) & 0x8000:
+            rc = wait_for_space_release(win, target, opt)
+            if rc != EXIT_OK:
+                return rc, target
+            if not opt.no_focus_check and win.foreground_window().hwnd != target.hwnd:
+                print("\nForeground window changed while paused; aborting.", file=sys.stderr)
+                return EXIT_ABORTED, target
+            try:
+                send_pause_backspace(win, opt)
+            except RuntimeError as exc:
+                print(f"\nCould not erase the resume Space from the target: {exc}", file=sys.stderr)
+                return EXIT_INPUT, target
+            print("Resuming.")
+            return EXIT_OK, target
+        time.sleep(0.01)
+
+
 def check_runtime_controls(win: WinKeyboard, opt: Options, target: TargetWindow) -> tuple[int, TargetWindow | None]:
     if win.get_async_key_state(VK_ESCAPE) & 0x8000:
         return EXIT_ABORTED, target
-
-    if win.get_async_key_state(VK_PAUSE) & 0x0001:
-        return pause_and_recapture(win, opt, "Pause/Break was pressed.")
-
-    state_error = win.keyboard_state_error()
-    if state_error:
-        return pause_and_recapture(win, opt, state_error)
 
     if not opt.no_focus_check:
         current = win.foreground_window()
         if current.hwnd != target.hwnd:
             return pause_and_recapture(win, opt, "Foreground window changed.")
 
+    if win.get_async_key_state(VK_SPACE) & 0x8000:
+        return pause_until_space(win, opt, target)
+
+    state_error = win.keyboard_state_error()
+    if state_error:
+        return pause_and_recapture(win, opt, state_error)
+
+    return EXIT_OK, target
+
+
+def wait_typing_delay(
+    win: WinKeyboard, opt: Options, target: TargetWindow, delay_ms: int
+) -> tuple[int, TargetWindow | None]:
+    remaining_ms = delay_ms
+    while remaining_ms > 0:
+        rc, new_target = check_runtime_controls(win, opt, target)
+        if rc != EXIT_OK:
+            return rc, new_target
+        if new_target is not None:
+            target = new_target
+        slice_ms = min(10, remaining_ms)
+        time.sleep(slice_ms / 1000.0)
+        remaining_ms -= slice_ms
     return EXIT_OK, target
 
 
@@ -1263,7 +1389,7 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
     i = 0
 
     print()
-    print("Typing started. Esc aborts, Pause/Break pauses.")
+    print("Typing started. Esc aborts. Space pauses or resumes.")
     print(f"Progress: line {line}/{stats.lines}")
 
     while i < len(data.text):
@@ -1276,6 +1402,7 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
             target = new_target
 
         ch = data.text[i]
+        event_delay_ms = opt.delay_ms
         try:
             if ch == "\r":
                 if i + 1 < len(data.text) and data.text[i + 1] == "\n":
@@ -1290,7 +1417,7 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
                 col = 1
                 typed_units += 1
                 print(f"\rProgress: line {min(line, stats.lines)}/{stats.lines}", end="", flush=True)
-                sleep_ms(opt.line_delay_ms)
+                event_delay_ms = opt.line_delay_ms
             elif ch == "\n":
                 if opt.legacy_keys:
                     win.legacy_vk(VK_RETURN)
@@ -1302,7 +1429,7 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
                 col = 1
                 typed_units += 1
                 print(f"\rProgress: line {min(line, stats.lines)}/{stats.lines}", end="", flush=True)
-                sleep_ms(opt.line_delay_ms)
+                event_delay_ms = opt.line_delay_ms
             elif ch == "\t":
                 if opt.legacy_keys:
                     win.legacy_vk(VK_TAB)
@@ -1310,25 +1437,29 @@ def type_text(win: WinKeyboard, data: TextData, stats: TextStats, opt: Options, 
                     win.send_vk(VK_TAB, "Tab")
                 col += 1
                 typed_units += 1
-                sleep_ms(opt.delay_ms)
             elif opt.legacy_keys:
                 win.legacy_ascii_char(ch)
                 col += 1
                 typed_units += 1
-                sleep_ms(opt.delay_ms)
             elif opt.ascii_keys:
                 win.send_ascii_char(ch)
                 col += 1
                 typed_units += 1
-                sleep_ms(opt.delay_ms)
             else:
                 win.send_unicode_char(ch)
                 col += 1
                 typed_units += 1
-                sleep_ms(opt.delay_ms)
         except RuntimeError as exc:
             print(f"\nInput failed at line {line}, column {col}: {exc}", file=sys.stderr)
             return EXIT_INPUT
+
+        rc, new_target = wait_typing_delay(win, opt, target, event_delay_ms)
+        if rc != EXIT_OK:
+            if rc == EXIT_ABORTED:
+                print(f"\nAborted at line {line}, column {col} after {typed_units} character/event unit(s).")
+            return rc
+        if new_target is not None:
+            target = new_target
 
         i += 1
 
@@ -1401,47 +1532,63 @@ def quote_powershell_literal(value: str) -> str:
     return f"'{value}'"
 
 
-def build_hex_writer_commands(payload: str, remote_hex: str) -> list[str]:
+def build_hex_writer_commands(payload: str) -> list[str]:
     lines = [line for line in payload.splitlines() if line]
     commands = ["powershell -noprofile"]
     for index, line in enumerate(lines):
         writer = "set-content" if index == 0 else "add-content"
         commands.append(
-            f"{writer} -encoding ascii {quote_powershell_literal(remote_hex)} {quote_powershell_literal(line)}"
+            f"{writer} -encoding ascii {quote_powershell_literal(REMOTE_HEX)} {quote_powershell_literal(line)}"
         )
     return commands
 
 
+def append_remote_parent_command(commands: list[str], opt: Options) -> None:
+    if opt.remote_path != ".":
+        commands.append(
+            f"new-item -itemtype directory -force {quote_powershell_literal(opt.remote_path)}"
+        )
+
+
 def build_cmd_hex_commands(payload: str, opt: Options) -> str:
-    commands = build_hex_writer_commands(payload, opt.remote_hex)
+    commands = build_hex_writer_commands(payload)
+    append_remote_parent_command(commands, opt)
+    remote_target = remote_target_path(opt)
     if payload.strip():
         commands.append(
-            f"certutil -f -decodehex {quote_powershell_literal(opt.remote_hex)} "
-            f"{quote_powershell_literal(opt.remote_output)}"
+            f"certutil -f -decodehex {quote_powershell_literal(REMOTE_HEX)} "
+            f"{quote_powershell_literal(remote_target)}"
         )
     else:
-        commands.append(f"set-content -nonewline {quote_powershell_literal(opt.remote_hex)} ''")
-        commands.append(f"set-content -nonewline {quote_powershell_literal(opt.remote_output)} ''")
-    commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_output)} sha256")
+        commands.append(f"set-content -nonewline {quote_powershell_literal(REMOTE_HEX)} ''")
+        commands.append(f"set-content -nonewline {quote_powershell_literal(remote_target)} ''")
+    commands.append(f"certutil -hashfile {quote_powershell_literal(remote_target)} sha256")
+    commands.append(f"remove-item -force {quote_powershell_literal(REMOTE_HEX)}")
     commands.append("exit")
     return "\n".join(commands) + "\n"
 
 
 def build_zip_hex_commands(payload: str, opt: Options, directory_source: bool = False) -> str:
-    commands = build_hex_writer_commands(payload, opt.remote_hex)
+    commands = build_hex_writer_commands(payload)
+    append_remote_parent_command(commands, opt)
     commands.append(
-        f"certutil -f -decodehex {quote_powershell_literal(opt.remote_hex)} "
-        f"{quote_powershell_literal(opt.remote_zip)}"
+        f"certutil -f -decodehex {quote_powershell_literal(REMOTE_HEX)} "
+        f"{quote_powershell_literal(REMOTE_ZIP)}"
     )
     if directory_source:
-        commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_zip)} sha256")
+        commands.append(f"certutil -hashfile {quote_powershell_literal(REMOTE_ZIP)} sha256")
         commands.append(
-            f"expand-archive -force {quote_powershell_literal(opt.remote_zip)} "
-            f"{quote_powershell_literal(opt.remote_output)}"
+            f"expand-archive -force {quote_powershell_literal(REMOTE_ZIP)} "
+            f"{quote_powershell_literal(remote_target_path(opt))}"
         )
     else:
-        commands.append(f"expand-archive -force {quote_powershell_literal(opt.remote_zip)} .")
-        commands.append(f"certutil -hashfile {quote_powershell_literal(opt.remote_output)} sha256")
+        commands.append(
+            f"expand-archive -force {quote_powershell_literal(REMOTE_ZIP)} "
+            f"{quote_powershell_literal(opt.remote_path)}"
+        )
+        commands.append(f"certutil -hashfile {quote_powershell_literal(remote_target_path(opt))} sha256")
+    commands.append(f"remove-item -force {quote_powershell_literal(REMOTE_HEX)}")
+    commands.append(f"remove-item -force {quote_powershell_literal(REMOTE_ZIP)}")
     commands.append("exit")
     return "\n".join(commands) + "\n"
 
@@ -1456,6 +1603,8 @@ def keyboard_opt_for_generated_ascii(opt: Options) -> Options:
             sendinput=False,
             commands_out=None,
             enter_mode="key",
+            remote_output_set=False,
+            remote_path=".",
         )
     return replace(
         opt,
@@ -1465,6 +1614,8 @@ def keyboard_opt_for_generated_ascii(opt: Options) -> Options:
         sendinput=False,
         commands_out=None,
         enter_mode="key",
+        remote_output_set=False,
+        remote_path=".",
     )
 
 
@@ -1514,11 +1665,10 @@ def run_cmd_hex_transfer(data: TextData, opt: Options) -> int:
 
     print("cmd-hex transfer mode.")
     print(f"Output bytes to transfer: {byte_count}")
-    print(f"Remote output: {opt.remote_output}")
-    print(f"Remote temporary hex: {opt.remote_hex}")
+    print(f"Remote output: {remote_target_path(opt)}")
     print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line ({line_count} line(s))")
     print(f"Expected SHA-256: {hashlib.sha256(raw).hexdigest()}")
-    print("Remote temporary hex is retained for recovery and inspection.")
+    print(f"Remote temporary {REMOTE_HEX} is deleted after reconstruction.")
     print("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.")
 
     commands = build_cmd_hex_commands(payload, opt)
@@ -1572,9 +1722,7 @@ def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
     print("zip-hex transfer mode.")
     print(f"Output bytes before zip: {raw_byte_count}")
     print(f"Zip bytes to transfer: {zip_byte_count} ({ratio:.2%} of output size)")
-    print(f"Remote output: {opt.remote_output}")
-    print(f"Remote temporary hex: {opt.remote_hex}")
-    print(f"Remote temporary zip: {opt.remote_zip}")
+    print(f"Remote output: {remote_target_path(opt)}")
     print(f"Hex chunk: {opt.hex_chunk_bytes} bytes per generated line ({line_count} line(s))")
     if directory_source:
         print(f"Expected archive SHA-256: {hashlib.sha256(zipped).hexdigest()}")
@@ -1582,7 +1730,7 @@ def run_zip_hex_transfer(data: TextData, opt: Options) -> int:
     else:
         assert raw is not None
         print(f"Expected SHA-256: {hashlib.sha256(raw).hexdigest()}")
-    print("Remote temporary hex and zip files are retained for recovery and inspection.")
+    print(f"Remote temporary {REMOTE_HEX} and {REMOTE_ZIP} are deleted after extraction.")
     print("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.")
 
     commands = build_zip_hex_commands(payload, opt, directory_source=directory_source)

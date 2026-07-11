@@ -43,15 +43,59 @@ def verify_help(executable: Path, root: Path) -> None:
         "选项 / options:",
         "模式、内容与文件 / modes, content, and files:",
         "--source SOURCE",
+        "--remote-output NAME",
+        "--remote-path PATH",
         "--output-encoding E",
         "直接输入，不创建远端文件",
-        "输出 trans.txt，临时 tt.hex",
-        "临时 tt.hex、tt.zip",
-        "destination folder; temporary files",
+        "output follows source; temp deleted",
+        "source-named folder; temp deleted",
+        "Space",
     )
     missing = [text for text in required if text not in help_text]
     if missing:
         raise AssertionError(f"{executable.name} bilingual help is incomplete: {missing}")
+    for removed in ("--file", "--remote-hex", "--remote-zip"):
+        if removed in help_text:
+            raise AssertionError(f"{executable.name} help still advertises removed option {removed}")
+
+
+def verify_removed_options(executable: Path, root: Path) -> None:
+    for option in ("--file", "--remote-hex", "--remote-zip"):
+        result = subprocess.run(
+            [str(executable), option, "unused"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 2:
+            raise AssertionError(
+                f"{executable.name} did not reject removed option {option}; "
+                f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
+            )
+
+
+def verify_argument_validation(executable: Path, source: Path, root: Path) -> None:
+    unsafe_basename = source.parent / "Upper.TXT"
+    unsafe_basename.write_bytes(source.read_bytes())
+    cases = (
+        ("--mode", "simple", "--source", str(source), "--remote-output", "output.txt", "--dry-run"),
+        ("--mode", "simple", "--source", str(source), "--commands-out", str(root / "bad.commands"), "--dry-run"),
+        ("--mode", "cmd-hex", "--source", str(source), "--remote-output", "dir\\out.txt", "--dry-run"),
+        ("--mode", "cmd-hex", "--source", str(source), "--remote-path", "c:\\work", "--dry-run"),
+        ("--mode", "cmd-hex", "--source", str(unsafe_basename), "--dry-run"),
+    )
+    for arguments in cases:
+        result = subprocess.run(
+            [str(executable), *arguments],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 2:
+            raise AssertionError(
+                f"{executable.name} returned {result.returncode} for invalid arguments {arguments}\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}"
+            )
 
 
 def verify(
@@ -62,44 +106,42 @@ def verify(
     source: Path,
     root: Path,
     expected: bytes,
+    remote_output: str | None = None,
 ) -> None:
     suffix = f"{label}-{mode}-{encoding}"
-    output = f"out-{suffix}.txt"
-    remote_hex = f"temp-{suffix}.hex"
-    remote_zip = f"temp-{suffix}.zip"
+    output = remote_output or source.name
     command_file = root / f"commands-{suffix}.txt"
-    subprocess.run(
-        [
-            str(executable),
-            "--mode",
-            mode,
-            "--source",
-            str(source),
-            "--remote-output",
-            output,
-            "--remote-hex",
-            remote_hex,
-            "--remote-zip",
-            remote_zip,
-            "--output-encoding",
-            encoding,
-            "--dry-run",
-            "--commands-out",
-            str(command_file),
-        ],
-        check=True,
-        cwd=root,
-    )
+    arguments = [
+        str(executable),
+        "--mode",
+        mode,
+        "--source",
+        str(source),
+        "--output-encoding",
+        encoding,
+        "--dry-run",
+        "--commands-out",
+        str(command_file),
+    ]
+    if remote_output is not None:
+        arguments.extend(("--remote-output", remote_output))
+    for temporary in (root / "tt.hex", root / "tt.zip"):
+        temporary.unlink(missing_ok=True)
+    subprocess.run(arguments, check=True, cwd=root)
     commands = command_file.read_text(encoding="ascii")
     if not set(commands) <= ALLOWED_COMMAND_CHARS or any("A" <= ch <= "Z" for ch in commands):
         raise AssertionError(f"{executable.name} generated a forbidden command character")
+    if "remove-item -force 'tt.hex'" not in commands:
+        raise AssertionError(f"{executable.name} does not clean up tt.hex")
+    if mode == "zip-hex" and "remove-item -force 'tt.zip'" not in commands:
+        raise AssertionError(f"{executable.name} does not clean up tt.zip")
     execute_command_stream(commands, root)
     if (root / output).read_bytes() != expected:
         raise AssertionError(f"{executable.name} {mode} output differs from the source")
-    if not (root / remote_hex).exists():
-        raise AssertionError(f"{executable.name} did not retain the remote hex file")
-    if mode == "zip-hex" and not (root / remote_zip).exists():
-        raise AssertionError(f"{executable.name} did not retain the remote zip file")
+    if (root / "tt.hex").exists():
+        raise AssertionError(f"{executable.name} left tt.hex behind")
+    if mode == "zip-hex" and (root / "tt.zip").exists():
+        raise AssertionError(f"{executable.name} left tt.zip behind")
 
 
 def verify_simple_rejections(executable: Path, root: Path) -> None:
@@ -107,7 +149,7 @@ def verify_simple_rejections(executable: Path, root: Path) -> None:
         source = root / f"invalid-simple-{index}.txt"
         source.write_bytes(raw)
         result = subprocess.run(
-            [str(executable), "--mode", "simple", "--file", str(source), "--dry-run"],
+            [str(executable), "--mode", "simple", "--source", str(source), "--dry-run"],
             cwd=root,
             capture_output=True,
             text=True,
@@ -117,6 +159,33 @@ def verify_simple_rejections(executable: Path, root: Path) -> None:
                 f"{executable.name} accepted invalid simple input {raw!r}; "
                 f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
             )
+
+
+def verify_remote_path_commands(executable: Path, label: str, source: Path, root: Path) -> None:
+    command_file = root / f"remote-path-{label}.commands"
+    subprocess.run(
+        [
+            str(executable),
+            "--mode",
+            "cmd-hex",
+            "--source",
+            str(source),
+            "--remote-path",
+            "\\work\\drop",
+            "--dry-run",
+            "--commands-out",
+            str(command_file),
+        ],
+        check=True,
+        cwd=root,
+    )
+    commands = command_file.read_text(encoding="ascii")
+    if not set(commands) <= ALLOWED_COMMAND_CHARS or any("A" <= ch <= "Z" for ch in commands):
+        raise AssertionError(f"{executable.name} generated a forbidden remote-path command character")
+    if "new-item -itemtype directory -force '\\work\\drop'" not in commands:
+        raise AssertionError(f"{executable.name} did not create the requested remote directory")
+    if f"'\\work\\drop\\{source.name}'" not in commands:
+        raise AssertionError(f"{executable.name} did not combine remote path with source basename")
 
 
 def verify_zip_compression(executable: Path, label: str, root: Path) -> None:
@@ -149,15 +218,13 @@ def verify_zip_compression(executable: Path, label: str, root: Path) -> None:
 
 
 def verify_directory_transfer(executable: Path, label: str, root: Path) -> None:
-    source = root / f"folder-source-{label}"
+    source = root / "folder-inputs" / f"folder-source-{label}"
     (source / "Nested").mkdir(parents=True)
     (source / "empty").mkdir()
     (source / "root.bin").write_bytes(b"\x00\xffroot")
     (source / "Nested" / "unicode-\u4e2d.txt").write_bytes(b"nested")
-    destination = f"copied-dir-{label}"
+    destination = source.name
     command_file = root / f"folder-{label}.commands"
-    remote_hex = f"folder-{label}.hex"
-    remote_zip = f"folder-{label}.zip"
     subprocess.run(
         [
             str(executable),
@@ -165,12 +232,6 @@ def verify_directory_transfer(executable: Path, label: str, root: Path) -> None:
             "zip-hex",
             "--source",
             str(source),
-            "--remote-output",
-            destination,
-            "--remote-hex",
-            remote_hex,
-            "--remote-zip",
-            remote_zip,
             "--dry-run",
             "--commands-out",
             str(command_file),
@@ -181,9 +242,11 @@ def verify_directory_transfer(executable: Path, label: str, root: Path) -> None:
     commands = command_file.read_text(encoding="ascii")
     if not set(commands) <= ALLOWED_COMMAND_CHARS or any("A" <= ch <= "Z" for ch in commands):
         raise AssertionError(f"{executable.name} generated a forbidden folder command character")
-    expected_expand = f"expand-archive -force '{remote_zip}' '{destination}'"
-    if expected_expand not in commands or f"certutil -hashfile '{remote_zip}' sha256" not in commands:
+    expected_expand = f"expand-archive -force 'tt.zip' '{destination}'"
+    if expected_expand not in commands or "certutil -hashfile 'tt.zip' sha256" not in commands:
         raise AssertionError(f"{executable.name} generated an invalid folder reconstruction protocol")
+    for temporary in (root / "tt.hex", root / "tt.zip"):
+        temporary.unlink(missing_ok=True)
     execute_command_stream(commands, root)
     copied = root / destination
     if (copied / "root.bin").read_bytes() != b"\x00\xffroot":
@@ -194,6 +257,8 @@ def verify_directory_transfer(executable: Path, label: str, root: Path) -> None:
         raise AssertionError(f"{executable.name} folder transfer lost an empty directory")
     if (copied / source.name).exists():
         raise AssertionError(f"{executable.name} unexpectedly nested the local source root")
+    if (root / "tt.hex").exists() or (root / "tt.zip").exists():
+        raise AssertionError(f"{executable.name} left folder-transfer temporary files behind")
 
 
 def main() -> int:
@@ -206,17 +271,22 @@ def main() -> int:
     binary_source = bytes(range(256)) * 4
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        source_utf8 = root / "input-utf8.txt"
-        source_preserve = root / "input-preserve.txt"
-        source_binary = root / "input-arbitrary.bin"
+        inputs = root / "inputs"
+        inputs.mkdir()
+        source_utf8 = inputs / "input-utf8.txt"
+        source_preserve = inputs / "input-preserve.txt"
+        source_binary = inputs / "input-arbitrary.bin"
         source_utf8.write_bytes(utf8_source)
         source_preserve.write_bytes(preserve_source)
         source_binary.write_bytes(binary_source)
         for index, executable in enumerate(executables):
             verify_pe_x64(executable)
             verify_help(executable, root)
+            verify_removed_options(executable, root)
+            verify_argument_validation(executable, source_utf8, root)
             verify_simple_rejections(executable, root)
             label = f"e{index}"
+            verify_remote_path_commands(executable, label, source_utf8, root)
             verify_zip_compression(executable, label, root)
             verify_directory_transfer(executable, label, root)
             for mode in ("cmd-hex", "zip-hex"):
@@ -229,6 +299,7 @@ def main() -> int:
                     source_utf8,
                     root,
                     b"\xef\xbb\xbf" + utf8_source,
+                    f"out-{label}-{mode}-bom.txt",
                 )
                 verify(executable, label, mode, "preserve", source_preserve, root, preserve_source)
                 verify(executable, f"{label}-binary", mode, "preserve", source_binary, root, binary_source)

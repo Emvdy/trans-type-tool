@@ -68,15 +68,15 @@ Use file input:
 ```
 
 `--source` accepts `clipboard`, `file` (the adjacent `trans.txt`), or a local
-path. The older `--file PATH` spelling remains a compatibility alias.
+path. `--file` has been removed.
 
 Use a complex mode for scripts, symbols, or Unicode. Focus a remote `cmd.exe` or
 PowerShell prompt during the countdown:
 
 ```sh
-./trans_type_mac --mode cmd-hex --source /path/to/input.txt --remote-output trans.txt
-./trans_type_mac --mode zip-hex --source /path/to/input.txt --remote-output trans.txt
-./trans_type_mac --mode zip-hex --source /path/to/folder --remote-output copied-dir
+./trans_type_mac --mode cmd-hex --source /path/to/input.txt
+./trans_type_mac --mode zip-hex --source /path/to/input.txt
+./trans_type_mac --mode zip-hex --source /path/to/folder
 ```
 
 Both modes type a validated stream containing no uppercase and no Shift-required
@@ -86,12 +86,33 @@ typing.
 
 Copy arbitrary regular-file bytes with `--output-encoding preserve`. Directory
 sources are accepted only by `zip-hex`; their contents are extracted into the
-remote directory named by `--remote-output`. Existing destination files are
+remote directory named by the source basename by default. Existing destination files are
 overwritten/merged, but unrelated files are not deleted. Symbolic links and
 special files are rejected.
 
 Simple mode does not automatically switch to Unicode. `--input-mode unicode` is
 retained for explicit diagnostics and does not bypass strict simple validation.
+
+## Remote output and path
+
+Clipboard input defaults to remote `trans.txt`. A path source defaults to its
+local basename. `--remote-output` overrides that basename but accepts one safe
+lowercase name only, not a path; allowed characters are lowercase letters,
+digits, `.` and `-`. Names `tt.hex` and `tt.zip` are reserved.
+
+`--remote-path` defaults to `./`. It can instead be a lowercase current-drive
+rooted Windows path such as `\work\drop`:
+
+```sh
+./trans_type_mac --mode cmd-hex --source /path/to/input.txt \
+  --remote-output input.txt --remote-path '\work\drop'
+```
+
+Drive-letter paths contain a Shift-required colon, so `c:\work\drop` is
+rejected. UNC, relative, and traversal paths are also rejected. The generated
+PowerShell stream creates a missing remote directory. Its fixed intermediate
+files, `tt.hex` and `tt.zip`, are deleted after reconstruction; if typing is
+aborted before cleanup is sent, remove partial files before retrying.
 
 ## Encoding and auditing
 
@@ -145,6 +166,10 @@ either changes while typing. Before starting, turn Caps Lock off, release Shift,
 Control, Option, and Command, select an English input method, and align the local
 and remote keyboard layouts.
 
+Press Esc to abort. Tap physical Space to pause and tap it again to resume. The
+Space reaches the target first, then the tool sends one Delete/Backspace after
+key release to remove it. Do not hold Space long enough to trigger key repeat.
+
 ## Local verification
 
 Run the protocol unit tests, compile, and validate all native payload variants:
@@ -164,6 +189,7 @@ The binary verifier checks:
 - `zip-hex` archive contents
 - UTF-8, UTF-8 BOM, and byte-preserving output
 - arbitrary binary files and nested directory ZIP payloads
+- source-basename defaults, remote path composition, and temporary-file cleanup
 
 These dry-run tests do not post keyboard events.
 

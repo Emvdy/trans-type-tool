@@ -36,6 +36,8 @@ static constexpr int ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024;
 static constexpr int DEFAULT_HEX_CHUNK_BYTES = 240;
 static constexpr int MAX_HEX_CHUNK_BYTES = 2048;
 static constexpr size_t MAX_DIRECTORY_ENTRIES = 10000;
+static constexpr const char *REMOTE_HEX = "tt.hex";
+static constexpr const char *REMOTE_ZIP = "tt.zip";
 
 enum class SourceKind {
     Clipboard,
@@ -91,8 +93,8 @@ struct Options {
     std::filesystem::path file_path;
     std::filesystem::path commands_out;
     std::string remote_output = "trans.txt";
-    std::string remote_hex = "tt.hex";
-    std::string remote_zip = "tt.zip";
+    std::string remote_path = ".";
+    bool remote_output_set = false;
     int hex_chunk_bytes = DEFAULT_HEX_CHUNK_BYTES;
 };
 
@@ -127,6 +129,7 @@ struct FrontApp {
 };
 
 static bool simple_ascii_key_supported(char16_t ch);
+static bool normalize_remote_directory(std::string *path);
 
 static void print_help_option(const char *option, const char *description) {
     printf("  %-25s%s\n", option, description);
@@ -141,11 +144,9 @@ static void print_usage() {
     puts("");
     puts("选项 / options:");
     print_help_option("--source SOURCE", "来源：clipboard、file(trans.txt)或本地路径 / source (default: clipboard)");
-    print_help_option("--file PATH", "--source PATH 的兼容别名 / compatibility alias (default: unset)");
     print_help_option("--mode MODE", "传输模式 / simple, cmd-hex, or zip-hex (default: simple)");
-    print_help_option("--remote-output PATH", "远端文件或目录 / remote file or folder (default: trans.txt)");
-    print_help_option("--remote-hex PATH", "远端临时 hex / remote temporary hex (default: tt.hex)");
-    print_help_option("--remote-zip PATH", "远端临时 zip / remote temporary zip (default: tt.zip)");
+    print_help_option("--remote-output NAME", "远端输出名称 / output name (default: clipboard=trans.txt, path=basename)");
+    print_help_option("--remote-path PATH", "远端当前驱动器绝对目录 / absolute directory (default: ./)");
     print_help_option("--output-encoding E", "输出编码 / utf8, utf8-bom, or preserve (default: utf8)");
     print_help_option("--commands-out PATH", "导出复杂模式命令 / export command stream (default: unset)");
     print_help_option("--hex-chunk-bytes N", "每行 hex 原始字节数 / bytes per hex line (default: 240)");
@@ -171,20 +172,23 @@ static void print_usage() {
     puts("    文件/files   : 直接输入，不创建远端文件 / direct typing; no remote file");
     puts("  cmd-hex:");
     puts("    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file");
-    puts("    文件/files   : 输出 trans.txt，临时 tt.hex / output trans.txt; temporary tt.hex");
+    puts("    文件/files   : 输出名默认跟随来源；中间文件自动删除 / output follows source; temp deleted");
     puts("  zip-hex (文本或文件 / text or file):");
     puts("    内容/content : 文本；preserve 可传任意单文件 / text; preserve allows one arbitrary file");
-    puts("    文件/files   : 输出 trans.txt，临时 tt.hex、tt.zip / output trans.txt; temporary tt.hex, tt.zip");
+    puts("    文件/files   : 输出名默认跟随来源；中间文件自动删除 / output follows source; temp deleted");
     puts("  zip-hex (目录 / directory):");
     puts("    内容/content : 一个真实目录，不允许链接 / one real directory; no links");
-    puts("    文件/files   : 解压到 --remote-output；临时 tt.hex、tt.zip / destination folder; temporary files");
-    puts("  上述文件名是默认值，可用 --remote-* 修改；目录建议显式设置 --remote-output。");
-    puts("  These are defaults and can be changed with --remote-*; set a folder destination explicitly.");
-    puts("  本地默认 / local defaults: source=clipboard, commands-out=unset, focus-check=on.");
+    puts("    文件/files   : 解压到来源同名目录；中间文件自动删除 / source-named folder; temp deleted");
+    puts("  clipboard 默认输出 trans.txt；路径来源默认输出本地 basename。");
+    puts("  Clipboard defaults to trans.txt; path sources default to the local basename.");
+    puts("  中间文件/intermediates: cmd-hex=tt.hex; zip-hex=tt.hex+tt.zip; 自动删除/deleted.");
+    puts("  remote-output 仅名称/name only；remote-path 仅 ./ 或 \\lowercase\\path。");
+    puts("  本地默认 / local defaults: source=clipboard, remote-path=./, commands-out=unset.");
     puts("");
     puts("运行控制 / runtime controls:");
     puts("  Ctrl-C                 立即中止 / abort immediately");
-    puts("  Esc                    下一个字符前中止 / abort before the next character");
+    puts("  Esc                    中止 / abort");
+    puts("  Space                  暂停或继续 / pause or resume");
 }
 
 static bool parse_int_range(const char *value, int min_value, int max_value, int *out) {
@@ -220,7 +224,6 @@ static int get_option_value(int *i, int argc, char **argv, const char *name, con
 
 static bool parse_args(int argc, char **argv, Options *opt) {
     int source_option_kind = 0;
-    bool file_option_seen = false;
     for (int i = 1; i < argc; ++i) {
         const char *value = nullptr;
         int matched = get_option_value(&i, argc, argv, "--delay-ms", &value);
@@ -290,39 +293,16 @@ static bool parse_args(int argc, char **argv, Options *opt) {
                 return false;
             }
             if (strcmp(value, "clipboard") == 0) {
-                if (file_option_seen) {
-                    fprintf(stderr, "--file cannot be combined with --source clipboard.\n");
-                    return false;
-                }
                 opt->source = SourceKind::Clipboard;
                 source_option_kind = 2;
             } else if (strcmp(value, "file") == 0) {
                 opt->source = SourceKind::File;
                 source_option_kind = 1;
             } else {
-                if (file_option_seen) {
-                    fprintf(stderr, "--file cannot be combined with --source PATH.\n");
-                    return false;
-                }
                 opt->source = SourceKind::File;
                 opt->file_path = std::filesystem::u8path(value);
                 source_option_kind = 3;
             }
-            continue;
-        }
-        if (matched == 0) {
-            return false;
-        }
-
-        matched = get_option_value(&i, argc, argv, "--file", &value);
-        if (matched == 1) {
-            if (file_option_seen || source_option_kind == 2 || source_option_kind == 3) {
-                fprintf(stderr, "--file conflicts with another explicit source path.\n");
-                return false;
-            }
-            opt->source = SourceKind::File;
-            opt->file_path = std::filesystem::u8path(value);
-            file_option_seen = true;
             continue;
         }
         if (matched == 0) {
@@ -365,34 +345,17 @@ static bool parse_args(int argc, char **argv, Options *opt) {
 
         matched = get_option_value(&i, argc, argv, "--remote-output", &value);
         if (matched == 1) {
-            if (opt->transfer_mode == TransferMode::Simple) {
-                opt->transfer_mode = TransferMode::CmdHex;
-            }
             opt->remote_output = value;
+            opt->remote_output_set = true;
             continue;
         }
         if (matched == 0) {
             return false;
         }
 
-        matched = get_option_value(&i, argc, argv, "--remote-hex", &value);
+        matched = get_option_value(&i, argc, argv, "--remote-path", &value);
         if (matched == 1) {
-            if (opt->transfer_mode == TransferMode::Simple) {
-                opt->transfer_mode = TransferMode::CmdHex;
-            }
-            opt->remote_hex = value;
-            continue;
-        }
-        if (matched == 0) {
-            return false;
-        }
-
-        matched = get_option_value(&i, argc, argv, "--remote-zip", &value);
-        if (matched == 1) {
-            if (opt->transfer_mode == TransferMode::Simple) {
-                opt->transfer_mode = TransferMode::ZipHex;
-            }
-            opt->remote_zip = value;
+            opt->remote_path = value;
             continue;
         }
         if (matched == 0) {
@@ -472,6 +435,20 @@ static bool parse_args(int argc, char **argv, Options *opt) {
     }
     if (opt->output_encoding == OutputEncoding::Preserve && opt->source == SourceKind::Clipboard) {
         fprintf(stderr, "--output-encoding preserve requires a file source, not clipboard text.\n");
+        return false;
+    }
+    if (!normalize_remote_directory(&opt->remote_path)) {
+        fprintf(stderr, "--remote-path must be ./ or a lowercase current-drive absolute path such as \\work\\drop.\n");
+        fprintf(stderr, "Drive-letter paths contain ':' and cannot be typed without Shift.\n");
+        return false;
+    }
+    if (opt->transfer_mode == TransferMode::Simple &&
+        (opt->remote_output_set || opt->remote_path != ".")) {
+        fprintf(stderr, "--remote-output and --remote-path are only valid with cmd-hex or zip-hex.\n");
+        return false;
+    }
+    if (opt->transfer_mode == TransferMode::Simple && !opt->commands_out.empty()) {
+        fprintf(stderr, "--commands-out is only valid with --mode cmd-hex or --mode zip-hex.\n");
         return false;
     }
     return true;
@@ -724,6 +701,22 @@ static bool read_text_source(const Options &opt, TextData *out, std::string *err
     return read_file_source(opt, out, error);
 }
 
+static bool apply_default_remote_output(Options *opt, const TextData &data, std::string *error) {
+    if (opt->remote_output_set) {
+        return true;
+    }
+    if (opt->source == SourceKind::Clipboard) {
+        opt->remote_output = "trans.txt";
+        return true;
+    }
+    opt->remote_output = data.source_path.filename().u8string();
+    if (opt->remote_output.empty()) {
+        *error = "Cannot derive --remote-output from the source path; specify --remote-output NAME.";
+        return false;
+    }
+    return true;
+}
+
 static bool is_safe_cmd_hex_path(const std::string &path) {
     if (path.empty() || path.size() > 240 || path.front() == '/' || path.front() == '\\' ||
         path.back() == '/' || path.back() == '\\') {
@@ -759,6 +752,41 @@ static bool is_safe_cmd_hex_path(const std::string &path) {
         return false;
     }
     return true;
+}
+
+static bool normalize_remote_directory(std::string *path) {
+    if (*path == "." || *path == "./" || *path == ".\\") {
+        *path = ".";
+        return true;
+    }
+    for (char &ch : *path) {
+        if (ch == '/') {
+            ch = '\\';
+        }
+    }
+    if (path->empty() || path->front() != '\\' ||
+        (path->size() > 1 && (*path)[1] == '\\')) {
+        return false;
+    }
+    while (path->size() > 1 && path->back() == '\\') {
+        path->pop_back();
+    }
+    return path->size() == 1 || is_safe_cmd_hex_path(path->substr(1));
+}
+
+static bool is_safe_remote_output_name(const std::string &name) {
+    return name.find_first_of("/\\") == std::string::npos &&
+           name != REMOTE_HEX && name != REMOTE_ZIP && is_safe_cmd_hex_path(name);
+}
+
+static std::string remote_target_path(const Options &opt) {
+    if (opt.remote_path == ".") {
+        return opt.remote_output;
+    }
+    if (opt.remote_path == "\\") {
+        return "\\" + opt.remote_output;
+    }
+    return opt.remote_path + "\\" + opt.remote_output;
 }
 
 static std::vector<unsigned char> text_to_utf8_bytes(const std::u16string &text) {
@@ -1118,7 +1146,7 @@ static std::string quote_powershell_literal(const std::string &value) {
     return "'" + value + "'";
 }
 
-static std::string build_hex_writer_commands(const std::string &hex_text, const std::string &remote_hex) {
+static std::string build_hex_writer_commands(const std::string &hex_text) {
     std::string commands = "powershell -noprofile\n";
 
     size_t start = 0;
@@ -1131,7 +1159,7 @@ static std::string build_hex_writer_commands(const std::string &hex_text, const 
         if (end > start) {
             commands += first_line ? "set-content" : "add-content";
             commands += " -encoding ascii ";
-            commands += quote_powershell_literal(remote_hex);
+            commands += quote_powershell_literal(REMOTE_HEX);
             commands += " ";
             commands += "'";
             commands.append(hex_text, start, end - start);
@@ -1146,32 +1174,43 @@ static std::string build_hex_writer_commands(const std::string &hex_text, const 
 }
 
 static std::string build_cmd_hex_commands(const std::string &hex_text, const Options &opt) {
-    std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
-    if (count_hex_lines(hex_text) > 0) {
-        commands += "certutil -f -decodehex " + quote_powershell_literal(opt.remote_hex) + " " +
-                    quote_powershell_literal(opt.remote_output) + "\n";
-    } else {
-        commands += "set-content -nonewline " + quote_powershell_literal(opt.remote_hex) + " ''\n";
-        commands += "set-content -nonewline " + quote_powershell_literal(opt.remote_output) + " ''\n";
+    std::string commands = build_hex_writer_commands(hex_text);
+    if (opt.remote_path != ".") {
+        commands += "new-item -itemtype directory -force " + quote_powershell_literal(opt.remote_path) + "\n";
     }
-    commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
+    std::string remote_target = remote_target_path(opt);
+    if (count_hex_lines(hex_text) > 0) {
+        commands += "certutil -f -decodehex " + quote_powershell_literal(REMOTE_HEX) + " " +
+                    quote_powershell_literal(remote_target) + "\n";
+    } else {
+        commands += "set-content -nonewline " + quote_powershell_literal(REMOTE_HEX) + " ''\n";
+        commands += "set-content -nonewline " + quote_powershell_literal(remote_target) + " ''\n";
+    }
+    commands += "certutil -hashfile " + quote_powershell_literal(remote_target) + " sha256\n";
+    commands += "remove-item -force " + quote_powershell_literal(REMOTE_HEX) + "\n";
     commands += "exit\n";
     return commands;
 }
 
 static std::string build_zip_hex_commands(const std::string &hex_text, const Options &opt,
                                           bool directory_source = false) {
-    std::string commands = build_hex_writer_commands(hex_text, opt.remote_hex);
-    commands += "certutil -f -decodehex " + quote_powershell_literal(opt.remote_hex) + " " +
-                quote_powershell_literal(opt.remote_zip) + "\n";
-    if (directory_source) {
-        commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_zip) + " sha256\n";
-        commands += "expand-archive -force " + quote_powershell_literal(opt.remote_zip) + " " +
-                    quote_powershell_literal(opt.remote_output) + "\n";
-    } else {
-        commands += "expand-archive -force " + quote_powershell_literal(opt.remote_zip) + " .\n";
-        commands += "certutil -hashfile " + quote_powershell_literal(opt.remote_output) + " sha256\n";
+    std::string commands = build_hex_writer_commands(hex_text);
+    if (opt.remote_path != ".") {
+        commands += "new-item -itemtype directory -force " + quote_powershell_literal(opt.remote_path) + "\n";
     }
+    commands += "certutil -f -decodehex " + quote_powershell_literal(REMOTE_HEX) + " " +
+                quote_powershell_literal(REMOTE_ZIP) + "\n";
+    if (directory_source) {
+        commands += "certutil -hashfile " + quote_powershell_literal(REMOTE_ZIP) + " sha256\n";
+        commands += "expand-archive -force " + quote_powershell_literal(REMOTE_ZIP) + " " +
+                    quote_powershell_literal(remote_target_path(opt)) + "\n";
+    } else {
+        commands += "expand-archive -force " + quote_powershell_literal(REMOTE_ZIP) + " " +
+                    quote_powershell_literal(opt.remote_path) + "\n";
+        commands += "certutil -hashfile " + quote_powershell_literal(remote_target_path(opt)) + " sha256\n";
+    }
+    commands += "remove-item -force " + quote_powershell_literal(REMOTE_HEX) + "\n";
+    commands += "remove-item -force " + quote_powershell_literal(REMOTE_ZIP) + "\n";
     commands += "exit\n";
     return commands;
 }
@@ -1365,37 +1404,24 @@ static int validate_text(const TextData &data, const TextStats &stats, const Opt
             fprintf(stderr, "--output-encoding preserve requires file input; clipboard text has no original bytes.\n");
             return EXIT_ARGS;
         }
-        if (!is_safe_cmd_hex_path(opt.remote_output)) {
-            fprintf(stderr, "--remote-output must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
+        if (!is_safe_remote_output_name(opt.remote_output)) {
+            fprintf(stderr, "--remote-output must be one cmd-safe name using only lowercase letters, digits, '.', or '-'.\n");
+            fprintf(stderr, "It cannot contain a directory or be named tt.hex or tt.zip.\n");
             fprintf(stderr, "Example: trans.txt\n");
             return EXIT_ARGS;
         }
-        if (!is_safe_cmd_hex_path(opt.remote_hex)) {
-            fprintf(stderr, "--remote-hex must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
-            fprintf(stderr, "Example: tt.hex\n");
-            return EXIT_ARGS;
-        }
-        std::string output_path = normalized_zip_entry_name(opt.remote_output);
-        std::string hex_path = normalized_zip_entry_name(opt.remote_hex);
-        if (opt.transfer_mode == TransferMode::ZipHex) {
-            if (!is_safe_cmd_hex_path(opt.remote_zip)) {
-                fprintf(stderr, "--remote-zip must be a relative cmd-safe path using only lowercase letters, digits, '.', '-', '/', or '\\'.\n");
-                fprintf(stderr, "Example: tt.zip\n");
-                return EXIT_ARGS;
-            }
-            std::string zip_path = normalized_zip_entry_name(opt.remote_zip);
-            if (output_path == hex_path || output_path == zip_path || hex_path == zip_path) {
-                fprintf(stderr, "--remote-output, --remote-hex, and --remote-zip must be different files.\n");
-                return EXIT_ARGS;
-            }
-        } else if (output_path == hex_path) {
-            fprintf(stderr, "--remote-output and --remote-hex must be different files.\n");
+        if (remote_target_path(opt).size() > 240) {
+            fprintf(stderr, "The combined --remote-path and --remote-output path is longer than 240 characters.\n");
             return EXIT_ARGS;
         }
         return EXIT_OK;
     }
     if (!opt.commands_out.empty()) {
         fprintf(stderr, "--commands-out is only valid with --mode cmd-hex or --mode zip-hex.\n");
+        return EXIT_ARGS;
+    }
+    if (opt.remote_output_set || opt.remote_path != ".") {
+        fprintf(stderr, "--remote-output and --remote-path are only valid with cmd-hex or zip-hex.\n");
         return EXIT_ARGS;
     }
     if (opt.debug_input && opt.input_mode == InputMode::Unicode) {
@@ -1507,20 +1533,19 @@ static void print_summary(const TextData &data, const TextStats &stats, const Op
     if (opt.transfer_mode == TransferMode::CmdHex) {
         printf("Mode: cmd-hex transfer through remote cmd/certutil\n");
         printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
-        printf("Remote output: %s\n", opt.remote_output.c_str());
-        printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+        printf("Remote path: %s\n", opt.remote_path.c_str());
+        printf("Remote output: %s\n", remote_target_path(opt).c_str());
         printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
     } else if (opt.transfer_mode == TransferMode::ZipHex) {
         printf("Mode: zip-hex transfer through remote PowerShell/certutil/Expand-Archive\n");
+        printf("Remote path: %s\n", opt.remote_path.c_str());
         if (data.kind == DataKind::Directory) {
             printf("Output encoding: directory file bytes preserved\n");
-            printf("Remote destination directory: %s\n", opt.remote_output.c_str());
+            printf("Remote destination directory: %s\n", remote_target_path(opt).c_str());
         } else {
             printf("Output encoding: %s\n", output_encoding_name(opt.output_encoding));
-            printf("Remote output: %s\n", opt.remote_output.c_str());
+            printf("Remote output: %s\n", remote_target_path(opt).c_str());
         }
-        printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
-        printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
         printf("Hex chunk: %d bytes per generated line\n", opt.hex_chunk_bytes);
     } else if (opt.input_mode == InputMode::Auto) {
         printf("Input mode: Auto -> %s\n", input_mode_name(mode));
@@ -1615,6 +1640,10 @@ static bool escape_pressed() {
     return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, kVK_Escape);
 }
 
+static bool space_pressed() {
+    return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, kVK_Space);
+}
+
 static std::string keyboard_state_error() {
     CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
     if ((flags & kCGEventFlagMaskAlphaShift) != 0) {
@@ -1704,6 +1733,121 @@ private:
     CGEventSourceRef source_ = nullptr;
 };
 
+static bool target_changed(const FrontApp &target, FrontApp *current_out = nullptr) {
+    FrontApp current = frontmost_app();
+    if (current_out != nullptr) {
+        *current_out = current;
+    }
+    bool app_changed = target.pid != 0 && current.pid != target.pid;
+    bool window_changed = target.window_id != 0 && current.window_id != target.window_id;
+    return app_changed || window_changed;
+}
+
+static bool target_app_changed(const FrontApp &target) {
+    @autoreleasepool {
+        NSRunningApplication *running = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        return target.pid != 0 && (running == nil || [running processIdentifier] != target.pid);
+    }
+}
+
+static int wait_for_space_release(const Options &opt, const FrontApp &target) {
+    while (space_pressed()) {
+        if (escape_pressed()) {
+            return EXIT_ABORTED;
+        }
+        if (!opt.no_focus_check && target_app_changed(target)) {
+            fprintf(stderr, "\nForeground app changed while handling Space; aborting.\n");
+            return EXIT_ABORTED;
+        }
+        sleep_ms(10);
+    }
+    return EXIT_OK;
+}
+
+static int pause_until_space(MacKeyboard &keyboard, const Options &opt, const FrontApp &target) {
+    int rc = wait_for_space_release(opt, target);
+    if (rc != EXIT_OK) {
+        return rc;
+    }
+    if (!opt.no_focus_check && target_changed(target)) {
+        fprintf(stderr, "\nForeground target changed while handling Space; aborting.\n");
+        return EXIT_ABORTED;
+    }
+    if (!keyboard.send_key(kVK_Delete)) {
+        fprintf(stderr, "\nCould not erase the pause Space from the target.\n");
+        return EXIT_INPUT;
+    }
+
+    puts("\nPaused. Press Space again to continue; Esc aborts.");
+    for (;;) {
+        if (escape_pressed()) {
+            return EXIT_ABORTED;
+        }
+        if (!opt.no_focus_check && target_app_changed(target)) {
+            fprintf(stderr, "\nForeground app changed while paused; aborting.\n");
+            return EXIT_ABORTED;
+        }
+        if (space_pressed()) {
+            rc = wait_for_space_release(opt, target);
+            if (rc != EXIT_OK) {
+                return rc;
+            }
+            if (!opt.no_focus_check && target_changed(target)) {
+                fprintf(stderr, "\nForeground target changed while paused; aborting.\n");
+                return EXIT_ABORTED;
+            }
+            if (!keyboard.send_key(kVK_Delete)) {
+                fprintf(stderr, "\nCould not erase the resume Space from the target.\n");
+                return EXIT_INPUT;
+            }
+            puts("Resuming.");
+            return EXIT_OK;
+        }
+        sleep_ms(10);
+    }
+}
+
+static int check_runtime_controls(MacKeyboard &keyboard, const Options &opt,
+                                  const FrontApp &target, bool check_focus) {
+    if (escape_pressed()) {
+        return EXIT_ABORTED;
+    }
+    if (check_focus && !opt.no_focus_check) {
+        FrontApp current;
+        if (target_changed(target, &current)) {
+            fprintf(stderr, "\nForeground target changed from app \"%s\" window %u to app \"%s\" window %u. "
+                    "Aborting to avoid typing into the wrong target.\n",
+                    target.name.c_str(), static_cast<unsigned int>(target.window_id),
+                    current.name.c_str(), static_cast<unsigned int>(current.window_id));
+            return EXIT_ABORTED;
+        }
+    }
+    if (space_pressed()) {
+        return pause_until_space(keyboard, opt, target);
+    }
+    std::string state_error = keyboard_state_error();
+    if (!state_error.empty()) {
+        fprintf(stderr, "\n%s\n", state_error.c_str());
+        return EXIT_ABORTED;
+    }
+    return EXIT_OK;
+}
+
+static int wait_typing_delay(MacKeyboard &keyboard, const Options &opt,
+                             const FrontApp &target, int delay_ms) {
+    int remaining = delay_ms;
+    while (remaining > 0) {
+        int slice = remaining > 10 ? 10 : remaining;
+        int rc = check_runtime_controls(keyboard, opt, target, false);
+        if (rc != EXIT_OK) {
+            return rc;
+        }
+        sleep_ms(slice);
+        remaining -= slice;
+    }
+    return EXIT_OK;
+}
+
 static int run_countdown(int seconds) {
     for (int remaining = seconds; remaining > 0; --remaining) {
         printf("\rStarting in %d second(s)...", remaining);
@@ -1733,7 +1877,7 @@ static int prepare_target(const Options &opt, FrontApp *target) {
     }
 
     puts("Focus the target window now.");
-    puts("Ctrl-C aborts. Esc aborts if macOS reports it as pressed.");
+    puts("Ctrl-C or Esc aborts. Space pauses or resumes.");
     int rc = run_countdown(opt.start_delay_sec);
     if (rc != EXIT_OK) {
         return rc;
@@ -1756,30 +1900,16 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
     InputMode mode = effective_input_mode(opt);
 
     puts("");
-    puts("Typing started. Ctrl-C aborts. Esc aborts before the next character.");
+    puts("Typing started. Ctrl-C or Esc aborts. Space pauses or resumes.");
     printf("Progress: line %zu/%zu\n", line, stats.lines);
 
     for (size_t i = 0; i < data.text.size();) {
-        if (escape_pressed()) {
-            printf("\nAborted at line %zu, column %zu after %zu character/event unit(s).\n", line, col, typed);
-            return EXIT_ABORTED;
-        }
-        std::string state_error = keyboard_state_error();
-        if (!state_error.empty()) {
-            fprintf(stderr, "\n%s\n", state_error.c_str());
-            return EXIT_ABORTED;
-        }
-        if (!opt.no_focus_check) {
-            FrontApp current = frontmost_app();
-            bool app_changed = target.pid != 0 && current.pid != target.pid;
-            bool window_changed = target.window_id != 0 && current.window_id != target.window_id;
-            if (app_changed || window_changed) {
-                fprintf(stderr, "\nForeground target changed from app \"%s\" window %u to app \"%s\" window %u. "
-                        "Aborting to avoid typing into the wrong target.\n",
-                        target.name.c_str(), static_cast<unsigned int>(target.window_id),
-                        current.name.c_str(), static_cast<unsigned int>(current.window_id));
-                return EXIT_ABORTED;
+        int rc = check_runtime_controls(keyboard, opt, target, true);
+        if (rc != EXIT_OK) {
+            if (rc == EXIT_ABORTED) {
+                printf("\nAborted at line %zu, column %zu after %zu character/event unit(s).\n", line, col, typed);
             }
+            return rc;
         }
 
         uint32_t scalar = 0;
@@ -1787,6 +1917,7 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
         bool invalid = false;
         next_scalar(data.text, i, &scalar, &units, &invalid);
         bool ok = false;
+        int event_delay_ms = opt.delay_ms;
 
         if (scalar == '\r') {
             if (i + 1 < data.text.size() && data.text[i + 1] == '\n') {
@@ -1802,7 +1933,7 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
             col = 1;
             printf("\rProgress: line %zu/%zu", line <= stats.lines ? line : stats.lines, stats.lines);
             fflush(stdout);
-            sleep_ms(opt.line_delay_ms);
+            event_delay_ms = opt.line_delay_ms;
         } else if (scalar == '\n') {
             if (opt.enter_mode == EnterMode::Unicode) {
                 char16_t cr = '\r';
@@ -1814,11 +1945,10 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
             col = 1;
             printf("\rProgress: line %zu/%zu", line <= stats.lines ? line : stats.lines, stats.lines);
             fflush(stdout);
-            sleep_ms(opt.line_delay_ms);
+            event_delay_ms = opt.line_delay_ms;
         } else if (scalar == '\t') {
             ok = keyboard.send_key(kVK_Tab);
             ++col;
-            sleep_ms(opt.delay_ms);
         } else {
             if (mode == InputMode::Keys) {
                 ok = keyboard.send_ascii_char(data.text[i]);
@@ -1826,12 +1956,18 @@ static int type_text(MacKeyboard &keyboard, const TextData &data, const TextStat
                 ok = keyboard.send_unicode_units(&data.text[i], units);
             }
             ++col;
-            sleep_ms(opt.delay_ms);
         }
 
         if (!ok) {
             fprintf(stderr, "\nInput failed at line %zu, column %zu.\n", line, col);
             return EXIT_INPUT;
+        }
+        rc = wait_typing_delay(keyboard, opt, target, event_delay_ms);
+        if (rc != EXIT_OK) {
+            if (rc == EXIT_ABORTED) {
+                printf("\nAborted at line %zu, column %zu after %zu character/event unit(s).\n", line, col, typed + 1);
+            }
+            return rc;
         }
         ++typed;
         i += units;
@@ -1922,6 +2058,8 @@ static int type_generated_ascii(MacKeyboard &keyboard, const std::string &text, 
     opt.input_mode = InputMode::Keys;
     opt.enter_mode = EnterMode::Key;
     opt.commands_out.clear();
+    opt.remote_output_set = false;
+    opt.remote_path = ".";
     int rc = validate_text(data, stats, opt);
     if (rc != EXIT_OK) {
         return rc;
@@ -1941,11 +2079,10 @@ static int run_cmd_hex_transfer(const TextData &data, const Options &opt) {
     size_t hex_line_count = count_hex_lines(hex_text);
     printf("cmd-hex transfer mode.\n");
     printf("Output bytes to transfer: %zu\n", bytes.size());
-    printf("Remote output: %s\n", opt.remote_output.c_str());
-    printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
+    printf("Remote output: %s\n", remote_target_path(opt).c_str());
     printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
     printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
-    printf("Remote temporary hex is retained for recovery and inspection.\n");
+    printf("Remote temporary %s is deleted after reconstruction.\n", REMOTE_HEX);
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode uses PowerShell Set-Content/Add-Content, not redirection or Ctrl+Z/F6.\n");
     fflush(stdout);
 
@@ -2011,9 +2148,7 @@ static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
     printf("zip-hex transfer mode.\n");
     printf("Output bytes before zip: %zu\n", source_bytes);
     printf("Zip bytes to transfer: %zu (%.2f%% of output size)\n", zip_bytes.size(), ratio);
-    printf("Remote output: %s\n", opt.remote_output.c_str());
-    printf("Remote temporary hex: %s\n", opt.remote_hex.c_str());
-    printf("Remote temporary zip: %s\n", opt.remote_zip.c_str());
+    printf("Remote output: %s\n", remote_target_path(opt).c_str());
     printf("Hex chunk: %d bytes per generated line (%zu line(s))\n", opt.hex_chunk_bytes, hex_line_count);
     if (directory_source) {
         printf("Expected archive SHA-256: %s\n", sha256_hex(zip_bytes).c_str());
@@ -2021,7 +2156,7 @@ static int run_zip_hex_transfer(const TextData &data, const Options &opt) {
     } else {
         printf("Expected SHA-256: %s\n", sha256_hex(bytes).c_str());
     }
-    printf("Remote temporary hex and zip files are retained for recovery and inspection.\n");
+    printf("Remote temporary %s and %s are deleted after extraction.\n", REMOTE_HEX, REMOTE_ZIP);
     printf("Focus a remote cmd.exe or PowerShell prompt. This mode decodes a zip, then runs Expand-Archive.\n");
     fflush(stdout);
 
@@ -2065,8 +2200,13 @@ static int run_diagnose(const Options &opt) {
     TextData data;
     std::string error;
     if (read_text_source(opt, &data, &error)) {
+        Options resolved = opt;
+        if (!apply_default_remote_output(&resolved, data, &error)) {
+            fprintf(stderr, "Source read failed: %s\n", error.c_str());
+            return EXIT_ARGS;
+        }
         TextStats stats = analyze_text(data.text);
-        print_summary(data, stats, opt);
+        print_summary(data, stats, resolved);
     } else {
         fprintf(stderr, "Source read failed: %s\n", error.c_str());
         return opt.source == SourceKind::Clipboard ? EXIT_CONTENT : EXIT_FILE;
@@ -2100,6 +2240,10 @@ int main(int argc, char **argv) {
         if (!read_text_source(opt, &data, &error)) {
             fprintf(stderr, "%s\n", error.c_str());
             return opt.source == SourceKind::Clipboard ? EXIT_CONTENT : EXIT_FILE;
+        }
+        if (!apply_default_remote_output(&opt, data, &error)) {
+            fprintf(stderr, "%s\n", error.c_str());
+            return EXIT_ARGS;
         }
 
         TextStats stats = analyze_text(data.text);

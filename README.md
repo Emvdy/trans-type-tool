@@ -43,8 +43,8 @@ an interactive target window.
 --source <local-path>       a local regular file, or a directory in zip-hex
 ```
 
-The older `--file <local-path>` spelling remains as a compatibility alias for
-`--source <local-path>`. Do not specify both with different values.
+`--file` has been removed. Use `--source <local-path>` for both text and binary
+file sources.
 
 The supported matrix is:
 
@@ -101,6 +101,7 @@ set-content -encoding ascii 'tt.hex' '...lowercase hex...'
 add-content -encoding ascii 'tt.hex' '...lowercase hex...'
 certutil -f -decodehex 'tt.hex' 'trans.txt'
 certutil -hashfile 'trans.txt' sha256
+remove-item -force 'tt.hex'
 exit
 ```
 
@@ -117,13 +118,15 @@ Remote Windows runs:
 certutil -f -decodehex 'tt.hex' 'tt.zip'
 expand-archive -force 'tt.zip' .
 certutil -hashfile 'trans.txt' sha256
+remove-item -force 'tt.hex'
+remove-item -force 'tt.zip'
 ```
 
 Compression is useful for longer or repetitive content. It is normally slower
 than `cmd-hex` for very small or already-compressed input. Run `--dry-run` and
 compare the reported source and zip sizes before choosing it.
 
-For a directory source, `--remote-output` is the destination directory, and the
+For a directory source, the output name is the destination directory, and the
 archive contains the source directory's contents rather than the local root
 directory itself:
 
@@ -144,9 +147,33 @@ with `--max-bytes`. Directory entry names are ZIP metadata and may contain
 uppercase or Unicode; they are hex-encoded and never appear literally in the
 typed command stream. Names must still be valid on the target Windows filesystem.
 
-Neither complex mode executes the reconstructed file. The temporary `.hex` and
-`.zip` files are retained for inspection and recovery. Delete them manually only
-after verifying the output.
+Neither complex mode executes the reconstructed file. The fixed intermediate
+files are `tt.hex` and, for `zip-hex`, `tt.zip`; the generated stream deletes
+them after reconstruction or extraction. If typing is aborted before those
+cleanup commands are sent, remove any partial intermediate files before retrying.
+
+## Remote output and path
+
+`--remote-output` is one file or directory name, not a path. Its default depends
+on the source:
+
+```text
+clipboard                 trans.txt
+--source file             trans.txt
+--source <local-path>     basename of the local file or directory
+```
+
+The derived or explicit name must contain only lowercase letters, digits, `.`
+and `-`. It cannot be `tt.hex` or `tt.zip`. If the local basename contains
+uppercase, Unicode, spaces, or another unsupported character, supply an explicit
+safe name with `--remote-output`.
+
+`--remote-path` selects the remote parent directory. It defaults to `./`. To
+avoid every Shift-required character in the typed stream, the only other form is
+a lowercase current-drive rooted path such as `\work\drop`. Drive-letter paths
+such as `c:\work\drop` are rejected because `:` requires Shift; UNC, relative,
+and traversal paths are also rejected. Complex modes create a missing remote
+directory before reconstruction.
 
 ## Windows use
 
@@ -170,24 +197,21 @@ trans_type.exe --mode simple --source clipboard
 Use a complex mode for unrestricted text:
 
 ```bat
-trans_type.exe --mode cmd-hex --source C:\path\to\input.txt --remote-output trans.txt
-trans_type.exe --mode zip-hex --source clipboard --remote-output trans.txt
+trans_type.exe --mode cmd-hex --source C:\path\to\input.txt
+trans_type.exe --mode zip-hex --source clipboard
 ```
 
 Copy an arbitrary file byte for byte, or copy a directory tree:
 
 ```bat
-trans_type.exe --mode cmd-hex --source C:\path\to\tool.exe --output-encoding preserve --remote-output tool.exe
-trans_type.exe --mode zip-hex --source C:\path\to\data --remote-output copied-dir
+trans_type.exe --mode cmd-hex --source C:\path\to\tool.exe --output-encoding preserve
+trans_type.exe --mode zip-hex --source C:\path\to\data
+trans_type.exe --mode cmd-hex --source C:\path\to\input.txt --remote-output input.txt --remote-path \work\drop
 ```
 
-The local `--source` path may be a normal Windows path. Remote paths are more
-restricted because they become part of the typed command stream: use only
-lowercase letters, digits, `.`, `-`, `/`, and `\` in a relative path. Reserved
-Windows device names, traversal, leading `-`, and paths longer than 240 characters
-are rejected. Parent directories used by temporary or `cmd-hex` output paths must
-already exist; a simple filename in the current remote directory is the safest
-choice.
+The local `--source` path may be a normal Windows path and is never typed into the
+RDP session. Only the separately validated remote output name and path appear in
+the generated command stream.
 
 ## macOS use
 
@@ -202,9 +226,10 @@ macOS defaults to local clipboard input. Use `trans.txt` or another file with:
 
 ```sh
 ./trans_type_mac --mode simple --source file
-./trans_type_mac --mode cmd-hex --source /path/to/input.txt --remote-output trans.txt
-./trans_type_mac --mode zip-hex --source /path/to/input.txt --remote-output trans.txt
-./trans_type_mac --mode zip-hex --source /path/to/data --remote-output copied-dir
+./trans_type_mac --mode cmd-hex --source /path/to/input.txt
+./trans_type_mac --mode zip-hex --source /path/to/input.txt
+./trans_type_mac --mode zip-hex --source /path/to/data
+./trans_type_mac --mode cmd-hex --source /path/to/input.txt --remote-output input.txt --remote-path '\work\drop'
 ```
 
 Simple mode never automatically switches to Unicode. `--input-mode unicode` is
@@ -330,7 +355,10 @@ trans_type_py.exe --debug-input
 - Windows `--diagnose` reports foreground-window and integrity information.
 - Windows `--debug-input` visibly compares legacy keys, SendInput virtual keys,
   and Unicode SendInput. Run it only in a disposable text field.
-- `Esc` aborts. Windows `Pause/Break` pauses and requires a new countdown.
+- `Esc` aborts. Physical Space pauses; press Space again to resume.
+- The physical pause/resume Space reaches the target first. The tool waits for
+  key release and sends one Backspace to remove it. Tap Space briefly to avoid
+  keyboard auto-repeat; verify the current line after resuming.
 - Windows pauses when focus changes; macOS aborts when the foreground app/window
   changes. `--no-focus-check` disables this protection and should be used only
   for a target whose window identity cannot remain stable.

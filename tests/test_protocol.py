@@ -47,6 +47,32 @@ def execute_command_stream(commands: str, cwd: Path) -> subprocess.CompletedProc
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_space_pause_erases_control_keys_and_resumes(self) -> None:
+        class FakeKeyboard:
+            def __init__(self) -> None:
+                self.space_states = iter((0, 0x8000, 0))
+                self.backspaces = 0
+
+            def get_async_key_state(self, key: int) -> int:
+                if key == tool.VK_SPACE:
+                    return next(self.space_states, 0)
+                return 0
+
+            def foreground_window(self) -> tool.TargetWindow:
+                return tool.TargetWindow(1, 2, "target")
+
+            def legacy_vk(self, key: int) -> None:
+                if key == tool.VK_BACK:
+                    self.backspaces += 1
+
+        keyboard = FakeKeyboard()
+        rc, target = tool.pause_until_space(
+            keyboard, options("--mode", "simple"), tool.TargetWindow(1, 2, "target")
+        )
+        self.assertEqual(rc, tool.EXIT_OK)
+        self.assertEqual(target.hwnd, 1)
+        self.assertEqual(keyboard.backspaces, 2)
+
     def test_numeric_hex_payload_is_single_quoted(self) -> None:
         opt = options("--mode", "cmd-hex")
         payload, _, _ = tool.hex_payload("\t123", opt.hex_chunk_bytes)
@@ -69,8 +95,10 @@ class ProtocolTests(unittest.TestCase):
                     else tool.build_cmd_hex_commands(payload, opt)
                 )
                 assert_safe_stream(self, commands)
-                self.assertNotIn("del ", commands)
                 self.assertIn("certutil -hashfile 'trans.txt' sha256", commands)
+                self.assertIn("remove-item -force 'tt.hex'", commands)
+                if mode == "zip-hex":
+                    self.assertIn("remove-item -force 'tt.zip'", commands)
 
     def test_output_encoding_modes(self) -> None:
         data = text_data("中文", b"original-bytes")
@@ -92,14 +120,24 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(archive.namelist(), ["trans.txt"])
             self.assertEqual(archive.read("trans.txt"), raw)
 
-    def test_source_path_replaces_file_option_without_breaking_alias(self) -> None:
+    def test_source_path_sets_output_basename_and_file_option_is_removed(self) -> None:
         direct = options("--mode", "cmd-hex", "--source", "some/path.bin", "--output-encoding", "preserve")
-        alias = options("--mode", "cmd-hex", "--file", "some/path.bin", "--output-encoding", "preserve")
         self.assertEqual(direct.source, "file")
         self.assertEqual(direct.file_path, Path("some/path.bin"))
-        self.assertEqual(alias.file_path, direct.file_path)
-        with self.assertRaises(SystemExit):
-            options("--source", "clipboard", "--file", "some/path.bin")
+        self.assertEqual(direct.remote_output, "path.bin")
+        self.assertEqual(options("--mode", "cmd-hex", "--source", "clipboard").remote_output, "trans.txt")
+        for removed in ("--file", "--remote-hex", "--remote-zip"):
+            with self.assertRaises(SystemExit, msg=removed):
+                options(removed, "unused")
+
+    def test_simple_mode_rejects_remote_output_options(self) -> None:
+        for arguments in (
+            ("--remote-output", "trans.txt"),
+            ("--remote-path", "\\work\\drop"),
+            ("--commands-out", "commands.txt"),
+        ):
+            with self.assertRaises(SystemExit, msg=arguments):
+                options("--mode", "simple", *arguments)
 
     def test_preserve_is_restricted_to_file_complex_modes(self) -> None:
         with self.assertRaises(SystemExit):
@@ -148,9 +186,8 @@ class ProtocolTests(unittest.TestCase):
                 "zip-hex",
                 "--source",
                 str(source),
-                "--remote-output",
-                "copied-dir",
             )
+            self.assertEqual(opt.remote_output, "source")
             data = tool.read_text_source(opt)
             self.assertEqual(data.source_kind, "directory")
             tool.validate_text(data, tool.analyze_text(data.text), opt)
@@ -164,7 +201,9 @@ class ProtocolTests(unittest.TestCase):
             commands = tool.build_zip_hex_commands(payload, opt, directory_source=True)
             assert_safe_stream(self, commands)
             self.assertIn("certutil -hashfile 'tt.zip' sha256", commands)
-            self.assertIn("expand-archive -force 'tt.zip' 'copied-dir'", commands)
+            self.assertIn("expand-archive -force 'tt.zip' 'source'", commands)
+            self.assertIn("remove-item -force 'tt.hex'", commands)
+            self.assertIn("remove-item -force 'tt.zip'", commands)
 
     def test_directory_source_is_zip_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -182,6 +221,32 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("set-content -nonewline 'empty.bin' ''", commands)
         self.assertNotIn("decodehex", commands)
 
+    def test_remote_path_is_separate_from_output_name(self) -> None:
+        opt = options(
+            "--mode",
+            "cmd-hex",
+            "--source",
+            "input.bin",
+            "--output-encoding",
+            "preserve",
+            "--remote-path",
+            "\\work\\drop",
+        )
+        self.assertEqual(tool.remote_target_path(opt), "\\work\\drop\\input.bin")
+        payload, _, _ = tool.hex_payload_from_bytes(b"data", opt.hex_chunk_bytes)
+        commands = tool.build_cmd_hex_commands(payload, opt)
+        assert_safe_stream(self, commands)
+        self.assertIn("new-item -itemtype directory -force '\\work\\drop'", commands)
+        self.assertIn("'\\work\\drop\\input.bin'", commands)
+        for invalid in ("relative", "c:\\work", "\\\\server\\share", "\\Work"):
+            with self.assertRaises(SystemExit, msg=invalid):
+                options("--mode", "cmd-hex", "--remote-path", invalid)
+
+    def test_remote_output_is_a_name_not_a_path(self) -> None:
+        for invalid in ("dir/out.txt", "dir\\out.txt", "Upper.txt", "tt.hex", "tt.zip"):
+            with self.assertRaises(SystemExit, msg=invalid):
+                options("--mode", "cmd-hex", "--remote-output", invalid)
+
     def test_simple_mode_is_strictly_shift_free(self) -> None:
         opt = options("--mode", "simple")
         safe = text_data("abc 123-=[]\\;',./\n")
@@ -193,9 +258,21 @@ class ProtocolTests(unittest.TestCase):
 
     def test_complex_mode_forces_physical_enter(self) -> None:
         for extra in ((), ("--ascii-keys",)):
-            opt = options("--mode", "cmd-hex", "--enter-mode", "unicode", *extra)
+            opt = options(
+                "--mode",
+                "cmd-hex",
+                "--enter-mode",
+                "unicode",
+                "--remote-output",
+                "output.txt",
+                "--remote-path",
+                "\\work\\drop",
+                *extra,
+            )
             key_opt = tool.keyboard_opt_for_generated_ascii(opt)
             self.assertEqual(key_opt.enter_mode, "key")
+            self.assertFalse(key_opt.remote_output_set)
+            self.assertEqual(key_opt.remote_path, ".")
 
     def test_windows_special_paths_are_rejected(self) -> None:
         for path in ("-foo", "dir/-foo", "con", "nul.txt", "com1.log", "a.", "../a", "/abs"):
@@ -214,10 +291,6 @@ class ProtocolTests(unittest.TestCase):
                     mode,
                     "--remote-output",
                     f"out-{mode}.txt",
-                    "--remote-hex",
-                    f"temp-{mode}.hex",
-                    "--remote-zip",
-                    f"temp-{mode}.zip",
                 )
                 transfer = tool.zip_payload(raw, opt) if mode == "zip-hex" else raw
                 payload, _, _ = tool.hex_payload_from_bytes(transfer, opt.hex_chunk_bytes)
@@ -228,9 +301,8 @@ class ProtocolTests(unittest.TestCase):
                 )
                 execute_command_stream(commands, root)
                 self.assertEqual((root / opt.remote_output).read_bytes(), raw)
-                self.assertTrue((root / opt.remote_hex).exists())
-                if mode == "zip-hex":
-                    self.assertTrue((root / opt.remote_zip).exists())
+                self.assertFalse((root / tool.REMOTE_HEX).exists())
+                self.assertFalse((root / tool.REMOTE_ZIP).exists())
 
 
 if __name__ == "__main__":

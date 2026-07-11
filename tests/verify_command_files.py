@@ -13,10 +13,12 @@ def main() -> int:
         path = Path(name)
         commands = path.read_text(encoding="ascii")
         tool.validate_generated_command_stream(commands)
-        if "del " in commands:
-            raise AssertionError(f"{path} deletes recovery files")
         if "certutil -hashfile" not in commands:
             raise AssertionError(f"{path} does not verify the remote output hash")
+        if "remove-item -force 'tt.hex'" not in commands:
+            raise AssertionError(f"{path} does not clean up tt.hex")
+        if "decodehex 'tt.hex' 'tt.zip'" in commands and "remove-item -force 'tt.zip'" not in commands:
+            raise AssertionError(f"{path} does not clean up tt.zip")
     print(f"Verified {len(sys.argv) - 1} generated command stream(s).")
     return 0
 

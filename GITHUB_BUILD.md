@@ -116,7 +116,7 @@ workflow 文件：
 8. 检查命令流只有小写、数字和无需 Shift 的白名单字符。
 9. 在 Windows PowerShell 5.1 中真实执行命令流，并使用 `certutil` 解码。
 10. 对 UTF-8、UTF-8 BOM、preserve 三种输出逐字节比对。
-11. 确认恢复用 `.hex`/`.zip` 临时文件仍然存在。
+11. 确认固定的 `tt.hex`/`tt.zip` 中间文件在恢复后自动删除。
 
 因此，Actions 不只是检查“程序能启动”，还会验证复杂协议确实恢复出相同字节。
 
@@ -190,9 +190,11 @@ trans_type_py.exe --debug-input
 5. 用短文本测试 `cmd-hex`，比较程序显示的 SHA-256 与远端 `certutil` 输出。
 6. 用含 NUL/非文本字节的文件测试 `--output-encoding preserve`。
 7. 用可压缩的长文本测试 `zip-hex`，再次比较 SHA-256。
-8. 用临时目录测试 `zip-hex --source <目录> --remote-output copied-dir`，核对
+8. 用临时目录测试 `zip-hex --source <目录>`，核对默认 basename 目标目录、
    `tt.zip` 的 SHA-256、嵌套文件、Unicode 文件名和空目录。
-9. 确认输出无误后，再人工删除远端 `tt.hex` 和 `tt.zip`。
+9. 测试 `--remote-path \work\drop`，确认目录被创建且输出名与路径正确组合。
+10. 确认完成后远端 `tt.hex` 和 `tt.zip` 已自动删除；中止时则在重试前清理残留。
+11. 短按 Space 测试暂停/继续，并确认自动 Backspace 没有留下控制空格。
 
 正常 medium integrity 的 RDP 不要求管理员权限。如果目标窗口本身以管理员身份
 运行，Windows 可能阻止低完整性进程发送输入。应把目标窗口重新以普通权限打开，
