@@ -20,11 +20,12 @@ gh run watch --exit-status
 
 ```sh
 gh run list --workflow build-windows.yml --limit 5
-gh run download run-id -n trans_type-windows -D artifacts/windows
+gh run download run-id -n qr-transfer-windows-x86 -D artifacts/windows-x86
+gh run download run-id -n qr-transfer-windows-x64 -D artifacts/windows-x64
 ```
 
 把 `run-id` 替换为第一条命令显示的数字。网页也可以在对应 run 页面底部下载
-`trans_type-windows`。
+`qr-transfer-windows-x86` 或 `qr-transfer-windows-x64`。
 
 ## 为什么必须使用 self-hosted runner
 
@@ -87,7 +88,7 @@ runner 显示 `Listening for Jobs` 后保持窗口运行。
 网页：
 
 1. 打开 **Actions**。
-2. 选择 **Build Windows exes and validate Windows 10**。
+2. 选择 **Build Windows executables and validate Windows 10**。
 3. 点击 **Run workflow**。
 4. 保持 `Run compatibility tests on a self-hosted Windows 10 x64 runner` 为选中。
 5. 选择 `main` 并运行。
@@ -102,12 +103,13 @@ gh workflow run build-windows.yml --ref main -f validate_windows_10=true
 gh run watch --exit-status
 ```
 
-workflow 应包含两个 job：
+workflow 应包含三个 job：
 
-- `Build Windows x64 artifacts`
+- `Build Windows x86 executable`
+- `Build Windows x64 executable`
 - `Validate on real Windows 10 x64`
 
-如果第二个 job 一直显示 queued，说明 runner 没有在线，或者缺少
+如果 Windows 10 验证 job 一直显示 queued，说明 runner 没有在线，或者缺少
 `windows-10` 自定义标签。
 
 只需要重新编译、不运行 Windows 10 job 时：
@@ -127,10 +129,10 @@ job 不相信 runner 名称，而是读取操作系统本身并检查：
 - shell 是 Windows PowerShell 5.1 Desktop。
 - `certutil.exe` 和 `Expand-Archive` 存在。
 
-随后它会下载本次构建的三个 exe，并再次执行：
+随后它会下载本次构建的 `qr-transfer-windows-x64`，并再次执行：
 
 - Python 协议单元测试。
-- 三个 exe 的 strict simple dry-run。
+- x64 `trans_type.exe` 的 strict simple dry-run。
 - PE x64 检查。
 - simple 对大写、`@` 和 Unicode 的拒绝检查。
 - `cmd-hex` 和 `zip-hex` 的 PowerShell 5.1/certutil 真实回读。
@@ -140,11 +142,10 @@ job 不相信 runner 名称，而是读取操作系统本身并检查：
 
 ## 下载后如何使用 exe
 
-artifact 中有三个 Windows x64 程序：
+Windows artifact 分为两个架构，每个压缩包里只有一个程序：
 
-- `trans_type.exe`：原生 C 版本，约 233 KB，日常使用优先选择。
-- `trans_type_cpp.exe`：与 C 版本行为相同。
-- `trans_type_py.exe`：Python/PyInstaller 版本，体积较大，便于继续调试。
+- `qr-transfer-windows-x86`：x86 `trans_type.exe`，适用于 32 位和 64 位 Windows 10。
+- `qr-transfer-windows-x64`：x64 `trans_type.exe`，适用于 64 位 Windows 10。
 
 默认读取 exe 同目录下的 `trans.txt`。先在本地 PowerShell 中进入解压目录并做
 dry-run：

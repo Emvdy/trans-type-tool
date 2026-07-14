@@ -1,4 +1,4 @@
-name: Build Windows exes and validate Windows 10
+name: Build Windows executables and validate Windows 10
 
 on:
   push:
@@ -18,9 +18,21 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows x64 artifacts
+    name: Build Windows ${{ matrix.architecture }} executable
     runs-on: windows-2022
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86
+            msvc_arch: x86
+            pe_machine: "014c"
+            artifact_name: qr-transfer-windows-x86
+          - architecture: x64
+            msvc_arch: x64
+            pe_machine: "8664"
+            artifact_name: qr-transfer-windows-x64
 
     steps:
       - name: Checkout
@@ -29,7 +41,7 @@ jobs:
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,54 +66,52 @@ jobs:
         shell: cmd
         run: build.bat
 
-      - name: Build C++ wrapper exe
-        shell: cmd
-        run: build_cpp.bat
-
-      - name: Build Python exe
-        shell: cmd
-        run: build_python.bat
-
-      - name: Verify generated exes
+      - name: Verify generated exe
         shell: cmd
         run: |
           trans_type.exe --dry-run --ascii-only
           trans_type.exe --mode cmd-hex --dry-run --hex-chunk-bytes 240
           trans_type.exe --mode zip-hex --dry-run --hex-chunk-bytes 240
-          trans_type_cpp.exe --dry-run --ascii-only
-          trans_type_cpp.exe --mode cmd-hex --dry-run --hex-chunk-bytes 240
-          trans_type_cpp.exe --mode zip-hex --dry-run --hex-chunk-bytes 240
-          trans_type_py.exe --dry-run --ascii-only
-          trans_type_py.exe --mode cmd-hex --dry-run --hex-chunk-bytes 240
-          trans_type_py.exe --mode zip-hex --dry-run --hex-chunk-bytes 240
+
+      - name: Verify PE architecture
+        shell: powershell
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+          EXPECTED_PE_MACHINE: ${{ matrix.pe_machine }}
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path 'trans_type.exe'))
+          if ($bytes.Length -lt 64) {
+            throw 'trans_type.exe is too short to contain a valid PE header.'
+          }
+
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+            throw 'trans_type.exe has an invalid PE header offset.'
+          }
+          if ($bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or
+              $bytes[$peOffset + 2] -ne 0 -or $bytes[$peOffset + 3] -ne 0) {
+            throw 'trans_type.exe has an invalid PE signature.'
+          }
+
+          $actual = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $expected = [Convert]::ToUInt16($env:EXPECTED_PE_MACHINE, 16)
+          if ($actual -ne $expected) {
+            throw ('Expected {0} PE machine 0x{1:x4}, got 0x{2:x4}.' -f
+              $env:EXPECTED_ARCHITECTURE, $expected, $actual)
+          }
+          Write-Host ('Verified {0} PE machine 0x{1:x4}.' -f $env:EXPECTED_ARCHITECTURE, $actual)
 
       - name: Execute emitted protocols with Windows PowerShell 5.1
         shell: cmd
-        run: python tests\verify_windows_exes.py trans_type.exe trans_type_cpp.exe trans_type_py.exe
+        run: python tests\verify_windows_exes.py --expected-arch ${{ matrix.architecture }} trans_type.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: trans_type-windows
+          name: ${{ matrix.artifact_name }}
           retention-days: 14
-          path: |
-            trans_type.exe
-            trans_type_cpp.exe
-            trans_type_py.exe
-            README.md
-            trans.txt
-            trans_type.c
-            trans_type.cpp
-            trans_type.py
-            build.bat
-            build_cpp.bat
-            build_python.bat
-            build_all.bat
-            requirements-build.txt
-            MAC_BUILD.md
-            GITHUB_BUILD.md
-            WINDOWS10_ACTIONS.md
-            tests/*.py
+          if-no-files-found: error
+          path: trans_type.exe
 
   validate-windows-10:
     name: Validate on real Windows 10 x64
@@ -111,6 +121,9 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Assert Windows 10 x64 runner and built-ins
         shell: powershell
         run: |
@@ -144,15 +157,20 @@ jobs:
       - name: Download Windows artifacts from this run
         uses: actions/download-artifact@v4
         with:
-          name: trans_type-windows
+          name: qr-transfer-windows-x64
           path: windows-artifact
+
+      - name: Assert artifact contains one executable
+        shell: powershell
+        run: |
+          $files = @(Get-ChildItem 'windows-artifact' -File -Recurse)
+          if ($files.Count -ne 1 -or $files[0].Name -ne 'trans_type.exe') {
+            throw 'qr-transfer-windows-x64 must contain only trans_type.exe.'
+          }
 
       - name: Execute compatibility and protocol tests on Windows 10
         shell: cmd
-        working-directory: windows-artifact
         run: |
           python -m unittest discover -s tests -v
-          trans_type.exe --mode simple --dry-run
-          trans_type_cpp.exe --mode simple --dry-run
-          trans_type_py.exe --mode simple --dry-run
-          python tests\verify_windows_exes.py trans_type.exe trans_type_cpp.exe trans_type_py.exe
+          windows-artifact\trans_type.exe --mode simple --dry-run
+          python tests\verify_windows_exes.py --expected-arch x64 windows-artifact\trans_type.exe
