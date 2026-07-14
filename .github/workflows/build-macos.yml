@@ -43,9 +43,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: trans-type-macos-universal
+          name: qr-transfer-macos
           retention-days: 14
-          path: |
-            trans_type_mac
-            README.md
-            MAC_BUILD.md
+          if-no-files-found: error
+          path: trans_type_mac

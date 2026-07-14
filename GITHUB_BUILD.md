@@ -1,7 +1,7 @@
-# 使用 GitHub Actions 编译 Windows 10 x64 程序
+# 使用 GitHub Actions 编译 Windows x86/x64 程序
 
-这套流程适合在 macOS 上维护源码，通过 GitHub 的 Windows 运行器生成三个
-Windows `.exe`。
+这套流程适合在 macOS 上维护源码，通过 GitHub 的 Windows 运行器分别生成 x86
+和 x64 原生 Windows `.exe`。
 
 从注册 Windows 10 runner 到下载并实际使用 exe 的完整中文步骤见
 `WINDOWS10_ACTIONS.md`。
@@ -12,25 +12,22 @@ Windows `.exe`。
 - Windows exe 必须在 Windows 环境中打包。
 - GitHub 没有 `windows-10` 官方托管标签，不能靠修改 `runs-on` 获得真实
   Windows 10。
-- 本仓库先使用 `windows-2022` x64、MSVC、Python 3.12 和 PyInstaller 构建。
+- 本仓库使用 `windows-2022`、MSVC x86/x64 交叉编译环境和 Python 3.12 测试。
 - 手动运行 workflow 时，默认继续在带 `windows-10` 标签的真实 self-hosted
   Windows 10 x64 runner 上重复完整测试。
 - Actions 不会自动操作交互式 RDP 窗口，最终按键冒烟测试仍需人在场完成。
 
 ## Actions 产物
 
-`Build Windows exes and validate Windows 10` 会上传 `trans_type-windows`
-artifact，包含：
+`Build Windows executables and validate Windows 10` 会上传两个 artifact：
 
-- `trans_type.exe`：原生 Win32 C 版本，体积最小。
-- `trans_type_cpp.exe`：复用同一实现的 C++ 版本。
-- `trans_type_py.exe`：Python + PyInstaller 单文件版本，体积较大。
-- README、构建脚本、源码和测试。
+- `qr-transfer-windows-x86`：只包含 x86 `trans_type.exe`。
+- `qr-transfer-windows-x64`：只包含 x64 `trans_type.exe`。
 
-artifact 默认保留 14 天，不是永久 Release。
+每个 artifact 的压缩包内只有一个可执行文件，默认保留 14 天，不是永久 Release。
 
-macOS workflow 还会上传 `trans-type-macos-universal`，其中的二进制同时包含
-`arm64` 和 `x86_64`，最低目标是 macOS 11。
+macOS workflow 还会上传 `qr-transfer-macos`，只包含 `trans_type_mac`。该二进制
+同时包含 `arm64` 和 `x86_64`，最低目标是 macOS 11。
 
 ## 推送仓库
 
@@ -64,12 +61,13 @@ gh auth login -h github.com
 ## 从网页运行
 
 1. 打开仓库的 **Actions** 页面。
-2. 选择 **Build Windows exes and validate Windows 10**。
+2. 选择 **Build Windows executables and validate Windows 10**。
 3. 点击 **Run workflow**，选择 `main`。
 4. 已注册 Windows 10 runner 时，保持 Windows 10 验证选项为选中。
 5. 只想构建时取消该选项，否则没有在线 runner 会一直 queued。
 6. 等待所有实际运行的步骤变绿。
-7. 打开本次 run，在 **Artifacts** 下载 `trans_type-windows`。
+7. 打开本次 run，在 **Artifacts** 下载 `qr-transfer-windows-x86` 或
+   `qr-transfer-windows-x64`。
 
 每次 push 到 `main` 都会自动运行托管构建；Windows 10 self-hosted job 只在手动
 workflow run 且勾选验证时运行。
@@ -93,7 +91,8 @@ gh workflow run build-windows.yml --ref main -f validate_windows_10=false
 下载指定 run 的产物：
 
 ```sh
-gh run download RUN_ID -n trans_type-windows -D artifacts/windows
+gh run download RUN_ID -n qr-transfer-windows-x86 -D artifacts/windows-x86
+gh run download RUN_ID -n qr-transfer-windows-x64 -D artifacts/windows-x64
 ```
 
 ## Windows workflow 实际检查
@@ -104,20 +103,17 @@ workflow 文件：
 .github/workflows/build-windows.yml
 ```
 
-托管 `Build Windows x64 artifacts` job 会执行：
+托管的 `Build Windows x86 executable` 和 `Build Windows x64 executable` 矩阵任务会执行：
 
 1. Python 语法检查和协议单元测试。
 2. Python 源码三种模式的 dry-run。
-3. MSVC x64 编译原生 C 和 C++ 版本，静态链接 C 运行库。
-4. 使用锁定版本的 PyInstaller 构建 Python 单文件 exe。
-5. 检查三个文件的 PE machine 都是 x64 (`0x8664`)。
-6. 确认三个 exe 的 simple 模式拒绝大写、`@` 和 Unicode。
-7. 让三个 exe 分别导出 `cmd-hex`、`zip-hex` 命令流。
-8. 检查命令流只有小写、数字和无需 Shift 的白名单字符。
-9. 在 Windows PowerShell 5.1 中真实执行命令流，并使用 `certutil` 解码。
-10. 对 UTF-8、UTF-8 BOM、preserve 三种输出逐字节比对。
-11. 实际执行小写相对目标和含空格/大写目标，确认后者通过 hex helper 恢复。
-12. 确认 `tt.hex`、`tt.zip`、`tt.out`、`tt.cmd.hex`、`tt.cmd` 不会在成功后残留。
+3. MSVC 分别以 x86 和 x64 环境编译原生 C 版本，静态链接 C 运行库。
+4. 读取 PE 头，确认 x86 machine 为 `0x014c`、x64 machine 为 `0x8664`。
+5. 确认对应 exe 的 simple 模式拒绝大写、`@` 和 Unicode。
+6. 导出 `cmd-hex`、`zip-hex` 命令流并检查无需 Shift 的字符白名单。
+7. 在 Windows PowerShell 5.1 中真实执行命令流，并使用 `certutil` 解码。
+8. 对 UTF-8、UTF-8 BOM、preserve 三种输出逐字节比对。
+9. 确认目标路径 helper 和 `tt.*` 临时文件清理行为。
 
 因此，Actions 不只是检查“程序能启动”，还会验证复杂协议确实恢复出相同字节。
 
@@ -126,8 +122,8 @@ workflow 文件：
 1. 等待 `[self-hosted, windows, x64, windows-10]` runner。
 2. 从操作系统读取 ProductType、版本和 build，拒绝 Windows Server/Windows 11。
 3. 检查 64 位系统、Windows PowerShell 5.1、`certutil` 和 `Expand-Archive`。
-4. 下载同一次 workflow 生成的 `trans_type-windows` artifact。
-5. 在真实 Windows 10 上再次执行三个 exe 的 simple、PE、压缩、编码和协议回读。
+4. 下载同一次 workflow 生成的 `qr-transfer-windows-x64` artifact。
+5. 在真实 Windows 10 上再次执行 x64 exe 的 simple、PE、压缩、编码和协议回读。
 
 注册 self-hosted runner 的完整步骤见 `WINDOWS10_ACTIONS.md`。不要把公开仓库的
 self-hosted runner 安装在生产服务器上，也不要让它保存生产凭据。
@@ -162,8 +158,6 @@ Windows PowerShell：
 
 ```powershell
 get-filehash .\trans_type.exe -algorithm sha256
-get-filehash .\trans_type_cpp.exe -algorithm sha256
-get-filehash .\trans_type_py.exe -algorithm sha256
 ```
 
 把哈希记录到内部发布单或变更记录。GitHub artifact 本身不会自动完成
@@ -212,8 +206,8 @@ AppLocker、WDAC、EDR 或组织策略可能阻止或告警。这种情况下应
 
 如果 Actions 失败，先打开失败步骤读取真实编译器/测试输出，再针对该错误修改：
 
-- MSVC 失败：查看 `Build native WinAPI exe` 或 `Build C++ wrapper exe`。
-- PyInstaller 失败：查看 `Build Python exe` 和依赖安装输出。
+- MSVC 失败：查看对应 x86/x64 job 的 `Build native WinAPI exe`。
+- 架构失败：查看 `Verify PE architecture`，不要把 x86 和 x64 artifact 混用。
 - 协议失败：查看 `Execute emitted protocols with Windows PowerShell 5.1`。
 - Windows 10 job 一直 queued：确认 runner 正在运行并带有 `windows-10` 标签。
 - Windows 10 系统断言失败：不要修改断言伪装版本，检查 runner 是否实际为

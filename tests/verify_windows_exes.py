@@ -1,3 +1,4 @@
+import argparse
 import re
 import subprocess
 import struct
@@ -25,7 +26,13 @@ def payload_from_commands(commands: str, destination: str = protocol.REMOTE_HEX)
     return bytes.fromhex("".join(chunks))
 
 
-def verify_pe_x64(executable: Path) -> None:
+PE_MACHINES = {
+    "x86": 0x014C,
+    "x64": 0x8664,
+}
+
+
+def verify_pe_architecture(executable: Path, expected_architecture: str) -> None:
     data = executable.read_bytes()
     if len(data) < 0x40 or data[:2] != b"MZ":
         raise AssertionError(f"{executable.name} is not a PE executable")
@@ -33,8 +40,12 @@ def verify_pe_x64(executable: Path) -> None:
     if pe_offset + 6 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\0\0":
         raise AssertionError(f"{executable.name} has an invalid PE header")
     machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
-    if machine != 0x8664:
-        raise AssertionError(f"{executable.name} is not x64 (PE machine 0x{machine:04x})")
+    expected_machine = PE_MACHINES[expected_architecture]
+    if machine != expected_machine:
+        raise AssertionError(
+            f"{executable.name} is not {expected_architecture} "
+            f"(expected PE machine 0x{expected_machine:04x}, got 0x{machine:04x})"
+        )
 
 
 def verify_help(executable: Path, root: Path) -> None:
@@ -331,9 +342,11 @@ def verify_directory_transfer(executable: Path, label: str, root: Path) -> None:
 
 
 def main() -> int:
-    executables = [Path(arg).resolve() for arg in sys.argv[1:]]
-    if not executables:
-        raise SystemExit("usage: verify_windows_exes.py EXE [EXE ...]")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected-arch", choices=tuple(PE_MACHINES), default="x64")
+    parser.add_argument("executables", metavar="EXE", type=Path, nargs="+")
+    args = parser.parse_args()
+    executables = [path.resolve() for path in args.executables]
     text = "\t123 @#$ 中文\n"
     utf8_source = text.encode("utf-8")
     preserve_source = b"\xff\xfe" + text.encode("utf-16-le")
@@ -349,7 +362,7 @@ def main() -> int:
         source_preserve.write_bytes(preserve_source)
         source_binary.write_bytes(binary_source)
         for index, executable in enumerate(executables):
-            verify_pe_x64(executable)
+            verify_pe_architecture(executable, args.expected_arch)
             verify_help(executable, root)
             verify_removed_options(executable, root)
             verify_argument_validation(executable, source_utf8, root)
